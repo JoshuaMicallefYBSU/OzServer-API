@@ -6,13 +6,23 @@ services:
       - path: .env
         required: false
     environment:
+      # environment: wins over env_file:, so a .env copied from .env.example - which is the local
+      # dev template and sets NODE_ENV=development - can't downgrade the container out of
+      # production mode on the VPS.
+      NODE_ENV: production
       DATABASE_URL: postgres://ozserver:${POSTGRES_PASSWORD}@postgres:5432/ozserver
     depends_on:
       postgres:
         condition: service_healthy
     ports:
       - "127.0.0.1:3000:3000"
-    networks: [internal]
+    # The API needs outbound internet: status.vatsim.net and data.vatsim.net for the maintenance
+    # loop's online-controller check, raw.githubusercontent.com for dataset:sync. On an
+    # internal-only network those fetches fail silently - getJson() swallows the error, so
+    # onlineControllers() returns null, which maintenance.ts reads as a VATSIM outage and skips
+    # the sweep, meaning sector ownerships would never expire after a disconnect. postgres is
+    # deliberately left off this network: it stays reachable only from `internal`.
+    networks: [egress, internal]
 
   postgres:
     image: postgres:17-alpine
@@ -31,6 +41,7 @@ services:
     networks: [internal]
 
 networks:
+  egress:
   internal:
     internal: true
 

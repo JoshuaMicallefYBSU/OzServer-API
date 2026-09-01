@@ -3,10 +3,10 @@
 The new API uses PostgreSQL and owns its database on the API VPS. The website reads operational
 data through HTTPS and does not connect to this database.
 
-The old cPanel MySQL database can be used remotely only if the hosting account allows remote MySQL,
-the Kamatera IP is allow-listed, and encrypted database connections are available. This is not the
-recommended production design: it preserves shared-host resource limits and adds cross-host latency
-to every API operation.
+The old cPanel MySQL database can be used remotely only if the hosting account allows remote
+MySQL, the OVHcloud VPS IP is allow-listed, and encrypted database connections are available. This
+is not the recommended production design: it preserves shared-host resource limits and adds
+cross-host latency to every API operation.
 
 For the production cutover:
 
