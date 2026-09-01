@@ -1,22 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { controllerIsOnline } from "./auth.js";
+import { parseControllerIdentity } from "./auth.js";
 
-const online = new Map<string, number>([
-  ["SY_APP", 1234567],
-  ["ML_CTR", 7654321]
-]);
-
-describe("controllerIsOnline", () => {
-  it("accepts an exact CID and callsign pair", () => {
-    expect(controllerIsOnline(online, 1234567, "SY_APP")).toBe(true);
-    expect(controllerIsOnline(online, 1234567, "sy_app")).toBe(true);
+describe("parseControllerIdentity", () => {
+  it("accepts any valid CID and callsign without an external verification lookup", () => {
+    expect(parseControllerIdentity({ controller_cid: "1234567", controller_callsign: "sy_app" }))
+      .toEqual({ cid: 1234567, callsign: "SY_APP" });
   });
 
-  it("rejects a CID borrowed from a different online controller", () => {
-    expect(controllerIsOnline(online, 7654321, "SY_APP")).toBe(false);
-  });
-
-  it("rejects an offline callsign", () => {
-    expect(controllerIsOnline(online, 1234567, "BN_APP")).toBe(false);
+  it("rejects missing or malformed operational identity fields", () => {
+    expect(parseControllerIdentity({ controller_cid: 1234567 })).toBeNull();
+    expect(parseControllerIdentity({ controller_cid: 0, controller_callsign: "SY_APP" })).toBeNull();
   });
 });
