@@ -3,6 +3,7 @@ import type pg from "pg";
 import { z } from "zod";
 import { config } from "../config.js";
 import { pool, transaction } from "../db.js";
+import { reassignFreedSectors } from "../grouping.js";
 import type { ControllerIdentity } from "../types.js";
 import { onlineControllers } from "../vatsim.js";
 
@@ -217,7 +218,14 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       `INSERT INTO resume_snapshots (controller_cid,controller_callsign,sectors,flights,created_at) VALUES ($1,$2,$3,$4,now())
        ON CONFLICT (controller_cid,controller_callsign) DO UPDATE SET sectors=$3,flights=$4,created_at=now()`,
       [request.controller.cid, request.controller.callsign, JSON.stringify(sectors), JSON.stringify(flights)]);
-    await client.query("DELETE FROM sector_ownerships WHERE controller_cid=$1 AND controller_callsign=$2", [request.controller.cid, request.controller.callsign]);
+    const freed = (await client.query(
+      "DELETE FROM sector_ownerships WHERE controller_cid=$1 AND controller_callsign=$2 RETURNING sector_id",
+      [request.controller.cid, request.controller.callsign])).rows.map(row => row.sector_id);
+    // Deliberately here and in the disconnect sweep, but NOT in releaseGroup. Those two are the
+    // controller leaving; releaseGroup is a deliberate release while still connected, and doing it
+    // there would bounce a sub-sector straight back to anyone who also holds its parent, making it
+    // impossible to free one by hand.
+    await reassignFreedSectors(client, freed);
     await client.query("DELETE FROM sector_requests WHERE requesting_cid=$1 OR target_cid=$1", [request.controller.cid]);
     await client.query("UPDATE flight_data_records SET controlling_cid=NULL,controlling_callsign=NULL WHERE controlling_cid=$1", [request.controller.cid]);
     return reply.code(204).send();
