@@ -319,17 +319,42 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       // a sector claimed by someone else in the meantime takes its aircraft with it. A flight whose
       // current_sector is NULL is not matched by IN either, which is the right default: an aircraft
       // that has not resolved into any known sector is not one to silently reassign.
-      restoredFlights.push(...(await client.query(
+      // Re-attach the tags this controller gave up. The controlling_cid test leaves a flight
+      // another controller picked up with them; the current_sector test leaves one that has flown
+      // out of the airspace they just took back.
+      await client.query(
         `UPDATE flight_data_records SET controlling_cid=$1,controlling_callsign=$2
           WHERE callsign=ANY($3)
-            AND (controlling_cid IS NULL OR controlling_cid=$1)
+            AND controlling_cid IS NULL
             AND current_sector IN (
                   SELECT s.name FROM sectors s
                     JOIN sector_ownerships o ON o.sector_id=s.id
-                   WHERE o.controller_cid=$1)
-         RETURNING callsign`,
-        [request.controller.cid, request.controller.callsign, snapshot.flights])).rows.map(row => row.callsign));
+                   WHERE o.controller_cid=$1)`,
+        [request.controller.cid, request.controller.callsign, snapshot.flights]);
     }
+
+    // Answered for BOTH kinds of reconnect, which is why it is outside the snapshot branch.
+    //
+    // A graceful disconnect wrote a snapshot and gave the sectors and tags up, so the block above
+    // has to put them back before this can see them.
+    //
+    // An ungraceful one - client closed, connection dropped - wrote nothing and gave nothing up.
+    // The ownership rows and the tag authority are still this controller's until the grace sweep
+    // takes them, so there is nothing to restore. But vatSys has come back with no jurisdiction at
+    // all, so the client still has to be *told* which tags are already its own, or it will offer
+    // the controller their own tags as incoming handovers - which is exactly what it was doing.
+    //
+    // One query serves both: every flight this controller now holds, inside a sector they now hold.
+    restoredFlights.push(...(await client.query(
+      `SELECT callsign FROM flight_data_records
+        WHERE controlling_cid=$1
+          AND current_sector IN (
+                SELECT s.name FROM sectors s
+                  JOIN sector_ownerships o ON o.sector_id=s.id
+                 WHERE o.controller_cid=$1)
+        ORDER BY callsign`,
+      [request.controller.cid])).rows.map(row => row.callsign));
+
     return { resumed, flights: restoredFlights, sync: await syncPayload(client, request.controller) };
   }));
 
