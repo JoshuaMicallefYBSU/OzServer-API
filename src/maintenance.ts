@@ -1,6 +1,7 @@
 import { config } from "./config.js";
 import { transaction } from "./db.js";
 import { publish } from "./events.js";
+import { reassignFreedSectors } from "./grouping.js";
 import { onlineControllers } from "./vatsim.js";
 
 export async function runMaintenance(): Promise<void> {
@@ -9,6 +10,10 @@ export async function runMaintenance(): Promise<void> {
   if (online === null) return;
   const releasedAny = await transaction(async client => {
     let released = false;
+    // Collected across every disconnected controller and handled after the loop: reassigning while
+    // other rows are still being deleted could hand a sub-sector to a controller who is, one
+    // iteration later, found to have dropped off as well.
+    const freed: string[] = [];
     const owners = (await client.query(
       "SELECT DISTINCT controller_cid,controller_callsign FROM sector_ownerships")).rows;
     for (const owner of owners) {
@@ -24,11 +29,15 @@ export async function runMaintenance(): Promise<void> {
         [owner.controller_cid, owner.controller_callsign, config.DISCONNECT_GRACE_MINUTES]);
       if (!removed.rowCount) continue;
       released = true;
+      freed.push(...removed.rows.map(row => row.sector_id));
       await client.query("DELETE FROM sector_requests WHERE sector_id=ANY($1)", [removed.rows.map(row => row.sector_id)]);
       const remains = await client.query("SELECT 1 FROM sector_ownerships WHERE controller_cid=$1 LIMIT 1", [owner.controller_cid]);
       if (!remains.rowCount) await client.query(
         "UPDATE flight_data_records SET controlling_cid=NULL,controlling_callsign=NULL WHERE controlling_cid=$1", [owner.controller_cid]);
     }
+    // Every disconnected controller's rows are gone by now, so a sub-sector left behind can be
+    // handed to whoever is still working the group above it.
+    await reassignFreedSectors(client, freed);
     await client.query(`DELETE FROM flight_data_records WHERE last_seen_at < now()-($1*interval '1 minute')`, [config.FDR_RETAIN_MINUTES]);
     await client.query(`DELETE FROM atis_broadcasts WHERE last_seen_at < now()-($1*interval '1 minute')`, [config.ATIS_RETAIN_MINUTES]);
     await client.query("DELETE FROM sector_requests WHERE rejected_at < now()-interval '1 day'");
