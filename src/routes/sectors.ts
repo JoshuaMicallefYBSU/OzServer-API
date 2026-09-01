@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type pg from "pg";
 import { z } from "zod";
@@ -118,7 +119,8 @@ async function requestsPayload(client: pg.Pool | pg.PoolClient, identity: Contro
        FROM sector_requests r JOIN sectors s ON s.id=r.sector_id
       WHERE r.requesting_cid=$1 OR r.target_cid=$1 ORDER BY r.created_at`, [identity.cid])).rows;
   const map = (row: Record<string, unknown>) => ({
-    id: Number(row.id), sector_id: Number(row.sector_id), requesting_cid: row.requesting_cid,
+    id: Number(row.id), sector_id: Number(row.sector_id), group_id: row.group_id,
+    requesting_cid: row.requesting_cid,
     requesting_callsign: row.requesting_callsign, target_cid: row.target_cid,
     target_callsign: row.target_callsign, rejected_at: row.rejected_at,
     sector: { id: Number(row.sector_id), name: row.sector_name, full_name: row.sector_full_name }
@@ -235,6 +237,11 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) return reply.code(422).send({ message: "Invalid sector commit.", errors: parsed.error.flatten() });
     return transaction(async client => {
       await lockMutations(client);
+      // Every request this Apply raises shares one group, so the controller on the other end is
+      // asked once about the whole thing rather than once per sector. Requests landing on different
+      // targets still share the id harmlessly - each target only ever sees their own rows, so each
+      // still gets exactly one decision to make.
+      const requestGroupId = randomUUID();
       const result = { claimed: [] as string[], released: [] as string[], requested: [] as string[], skipped: [] as string[], failed: [] as string[] };
       for (const name of parsed.data.release) (await releaseGroup(client, request.controller, name) ? result.released : result.failed).push(name);
       const online = await onlineControllers();
@@ -248,9 +255,9 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
         if (!sector || sector.controller_cid === request.controller.cid) { result.failed.push(name); continue; }
         await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid]);
         await client.query(
-          `INSERT INTO sector_requests (sector_id,requesting_cid,requesting_callsign,target_cid,target_callsign)
-           VALUES ($1,$2,$3,$4,$5) ON CONFLICT (sector_id,requesting_cid) DO NOTHING`,
-          [sector.id, request.controller.cid, request.controller.callsign, sector.controller_cid, sector.controller_callsign]);
+          `INSERT INTO sector_requests (sector_id,requesting_cid,requesting_callsign,target_cid,target_callsign,group_id)
+           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (sector_id,requesting_cid) DO NOTHING`,
+          [sector.id, request.controller.cid, request.controller.callsign, sector.controller_cid, sector.controller_callsign, requestGroupId]);
         result.requested.push(name);
       }
       return { result, sync: await syncPayload(client, request.controller) };
@@ -320,6 +327,15 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     }
     return { results, sync: await syncPayload(client, request.controller) };
   }));
+
+  // Mirrors accept-batch so declining a grouped request is one call rather than one per sector.
+  app.post<{ Body: { request_ids?: number[] } }>("/sector-requests/reject-batch", async request => {
+    const ids = request.body?.request_ids ?? [];
+    const changed = await pool.query(
+      "UPDATE sector_requests SET rejected_at=now() WHERE id=ANY($1) AND target_cid=$2 AND rejected_at IS NULL RETURNING id",
+      [ids, request.controller.cid]);
+    return { rejected: changed.rows.map(row => Number(row.id)), sync: await syncPayload(pool, request.controller) };
+  });
 
   app.post<{ Params: { id: string } }>("/sector-requests/:id/reject", async (request, reply) => {
     const changed = await pool.query("UPDATE sector_requests SET rejected_at=now() WHERE id=$1 AND target_cid=$2 AND rejected_at IS NULL RETURNING id", [request.params.id, request.controller.cid]);
