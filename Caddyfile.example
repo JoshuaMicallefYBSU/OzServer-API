@@ -1,15 +1,20 @@
 api.ozserver.org {
-    # encode must not touch the SSE stream at /api/v1/events. A compressor buffers until it has
-    # enough bytes to emit, which stalls events until that buffer happens to fill - the channel
-    # looks connected and simply delivers nothing, which is the worst way for this to fail. Caddy
-    # detects text/event-stream and streams the proxied response itself, so only the compressor
-    # needs excluding.
-    encode {
-        zstd
-        gzip
-        match {
-            not path /api/v1/events*
-        }
+    # /api/v1/events is a Server-Sent Events stream and must not be compressed: a compressor buffers
+    # until it has enough bytes to emit, so events stall until that buffer happens to fill. The
+    # channel then looks perfectly connected and simply delivers nothing, which is the worst way for
+    # it to fail.
+    #
+    # encode's own `match` takes RESPONSE matchers (status/header) and has no `not`, so the
+    # exclusion is done by routing instead - the SSE path gets its own handle block with no encode
+    # in it. Caddy already detects text/event-stream and streams the proxied response, so the
+    # compressor is the only thing that has to be kept away from it.
+    @sse path /api/v1/events*
+    handle @sse {
+        reverse_proxy 127.0.0.1:3000
     }
-    reverse_proxy 127.0.0.1:3000
+
+    handle {
+        encode zstd gzip
+        reverse_proxy 127.0.0.1:3000
+    }
 }
