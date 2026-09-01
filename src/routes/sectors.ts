@@ -25,16 +25,46 @@ async function lockMutations(client: pg.PoolClient): Promise<void> {
   await client.query("SELECT pg_advisory_xact_lock(684276)");
 }
 
+// Bounded the same way the plugin's own tree recursion is (PrimaryPosition.CollectDefaultSectors,
+// OzServerSectorsWindow.BuildOwnedSectorNode), against a cyclical grouping in the dataset.
+const MAX_GROUP_DEPTH = 8;
+
+// Everything claiming `name` covers: the sector itself plus its responsible sectors, all the way
+// down.
+//
+// This used to expand one level only, which silently disagreed with every client that assumes
+// otherwise. The plugin's PrimaryPosition is fully recursive and its comment says so explicitly,
+// citing the old backend's own recursive coveredSectors() - that recursion did not survive the
+// rewrite. 19 sectors in the current vatSys dataset are bundled by a group and bundle further
+// sub-sectors themselves, so a controller logging onto a top-level group got the full airspace on
+// their scope while OzServer recorded ownership one level down, leaving the deepest sub-sectors
+// unowned and sitting in Available.
 async function covered(client: pg.PoolClient, name: string): Promise<SectorRow[]> {
   const primary = await client.query<SectorRow>(
     `SELECT s.*, o.controller_cid, o.controller_callsign, o.last_seen_online_at
        FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name=$1`, [name]);
   const sector = primary.rows[0];
   if (!sector) return [];
-  const names = [sector.name, ...(sector.responsible_sectors ?? [])];
+
+  // Seeded with the sector's own name so that a sector which is both directly controllable and a
+  // group - and therefore lists itself among its own responsible sectors - terminates instead of
+  // expanding forever.
+  const names = new Set<string>([sector.name]);
+  let frontier = (sector.responsible_sectors ?? []).filter(child => !names.has(child));
+  for (const child of frontier) names.add(child);
+
+  for (let depth = 0; depth < MAX_GROUP_DEPTH && frontier.length > 0; depth++) {
+    const children = (await client.query<{ responsible_sectors: string[] | null }>(
+      "SELECT responsible_sectors FROM sectors WHERE name = ANY($1)", [frontier]))
+      .rows.flatMap(row => row.responsible_sectors ?? []);
+    frontier = [...new Set(children)].filter(child => !names.has(child));
+    for (const child of frontier) names.add(child);
+  }
+
   return (await client.query<SectorRow>(
     `SELECT s.*, o.controller_cid, o.controller_callsign, o.last_seen_online_at
-       FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name = ANY($1)`, [names])).rows;
+       FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name = ANY($1)`,
+    [[...names]])).rows;
 }
 
 function isWithinGrace(row: SectorRow): boolean {
@@ -140,6 +170,25 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
       [row.id, request.requesting_cid, request.requesting_callsign]);
   }
   await client.query("DELETE FROM sector_requests WHERE sector_id=ANY($1)", [rows.map(row => row.id)]);
+
+  // A sector changing hands has to take its aircraft with it, and this is what makes that possible.
+  //
+  // vatSys keeps tag jurisdiction per client, so nothing here can hand a tag over directly - what
+  // actually moves it is the receiving controller's own pickup, and TagOwnershipSync only picks up
+  // an aircraft sitting in a sector it owns that *nobody* is tracking. Releasing authority is what
+  // makes these aircraft nobody's, so that pickup can fire on the new owner's very next radar
+  // update. (Its own comment says exactly this: no explicit "gained" handling is needed because the
+  // controller who just gained a sector picks up whatever it leaves untracked.)
+  //
+  // It also unblocks the new owner's FDR pushes. upsert() refuses any update to a flight whose
+  // recorded authority is a different controller who is online and still holds sectors - so leaving
+  // the previous owner on the record meant every route, level and squawk change the new controller
+  // made was silently discarded with updated:false.
+  await client.query(
+    `UPDATE flight_data_records SET controlling_cid=NULL,controlling_callsign=NULL
+      WHERE current_sector = ANY($1) AND controlling_cid IS NOT NULL AND controlling_cid <> $2`,
+    [rows.map(row => row.name), request.requesting_cid]);
+
   return request.name;
 }
 
