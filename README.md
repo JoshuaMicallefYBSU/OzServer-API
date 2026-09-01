@@ -15,7 +15,7 @@ preserving the plugin-facing `/api/v1` contract.
 
 ## Local setup
 
-1. Copy `.env.example` to `.env` and provide a long random `PLUGIN_TOKEN`.
+1. Copy `.env.example` to `.env`.
 2. Set `POSTGRES_PASSWORD` and make the local `DATABASE_URL` use the same password. Docker Compose
    overrides the API container's database hostname to `postgres` automatically.
 3. Start PostgreSQL with `docker compose up -d postgres`.
@@ -40,7 +40,7 @@ Back up PostgreSQL off-server daily. A database backup is required before every 
 1. Deploy this API to a staging hostname.
 2. Run the schema migration and dataset sync.
 3. Exercise sector claiming, transfer, reconnect, FDR, ATIS and map behavior with staging builds.
-4. Set the production plugin token and point `api.ozserver.org` at the VPS.
+4. Point `api.ozserver.org` at the VPS.
 5. Deploy the website API-base change.
 6. Release a plugin build whose default base URL is `https://api.ozserver.org`.
 7. Keep the old `/api/v1` routes available temporarily for older plugin builds.
