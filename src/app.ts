@@ -3,8 +3,10 @@ import Fastify, { type FastifyError } from "fastify";
 import { config } from "./config.js";
 import { pluginAuth } from "./auth.js";
 import { pool } from "./db.js";
+import { publish } from "./events.js";
 import { protectedAtisRoutes, publicAtisRoutes } from "./routes/atis.js";
 import { flightRoutes } from "./routes/flights.js";
+import { eventRoutes } from "./routes/events.js";
 import { mapRoutes } from "./routes/map.js";
 import { sectorRoutes } from "./routes/sectors.js";
 
@@ -22,9 +24,27 @@ export async function buildApp() {
   await app.register(async publicApi => {
     await publicAtisRoutes(publicApi);
     await mapRoutes(publicApi);
+    await eventRoutes(publicApi);
   }, { prefix: "/api/v1" });
   await app.register(async pluginApi => {
     pluginApi.addHook("preHandler", pluginAuth);
+    // One hook rather than a publish() call inside every handler. What a subscriber needs to know
+    // is "something under this route group changed", which the route path already says, and a hook
+    // cannot be forgotten the way a per-handler call can when a mutation route is added later.
+    // onResponse (not onSend) so nothing is announced before its transaction has committed.
+    pluginApi.addHook("onResponse", async (request, reply) => {
+      if (request.method !== "POST" || reply.statusCode >= 400) return;
+      const route = request.routeOptions?.url ?? request.url;
+      if (route.startsWith("/api/v1/sectors") || route.startsWith("/api/v1/sector-requests")) {
+        // Deliberately one signal for both: /sectors/sync already returns owned, controlled and
+        // requests together, so a subscriber answers either with the same single call.
+        await publish({ type: "sectors" });
+      } else if (route.startsWith("/api/v1/fdr")) {
+        await publish({ type: "fdr" });
+      } else if (route.startsWith("/api/v1/atis")) {
+        await publish({ type: "atis" });
+      }
+    });
     await sectorRoutes(pluginApi);
     await flightRoutes(pluginApi);
     await protectedAtisRoutes(pluginApi);
