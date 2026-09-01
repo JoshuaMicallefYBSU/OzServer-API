@@ -307,9 +307,26 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       // was away is left with them. RETURNING reports only what was actually restored, so the
       // client can bring exactly those tags straight back instead of flashing every one it used to
       // hold and hoping.
+      // Three conditions, and all of them matter.
+      //
+      // The controlling_cid test keeps this honest about other controllers: a flight someone else
+      // picked up while this one was away stays with them.
+      //
+      // The current_sector test keeps it honest about geography. An aircraft that has flown out of
+      // this controller's airspace since they dropped is in someone else's sector now, and handing
+      // it back would put their name on a tag they cannot work - on the map, in /fdr/sync, and in
+      // the plugin's own pickup logic. Restricted to sectors they hold *after* the resume above, so
+      // a sector claimed by someone else in the meantime takes its aircraft with it. A flight whose
+      // current_sector is NULL is not matched by IN either, which is the right default: an aircraft
+      // that has not resolved into any known sector is not one to silently reassign.
       restoredFlights.push(...(await client.query(
         `UPDATE flight_data_records SET controlling_cid=$1,controlling_callsign=$2
-         WHERE callsign=ANY($3) AND (controlling_cid IS NULL OR controlling_cid=$1)
+          WHERE callsign=ANY($3)
+            AND (controlling_cid IS NULL OR controlling_cid=$1)
+            AND current_sector IN (
+                  SELECT s.name FROM sectors s
+                    JOIN sector_ownerships o ON o.sector_id=s.id
+                   WHERE o.controller_cid=$1)
          RETURNING callsign`,
         [request.controller.cid, request.controller.callsign, snapshot.flights])).rows.map(row => row.callsign));
     }
