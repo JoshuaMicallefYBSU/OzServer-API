@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { config } from "../config.js";
 import { addClient, clientCount } from "../events.js";
 
 // Idle intermediaries drop a connection that sends nothing. A comment frame is ignored by every
@@ -15,7 +16,11 @@ export async function eventRoutes(app: FastifyInstance): Promise<void> {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
-      "X-Accel-Buffering": "no"
+      "X-Accel-Buffering": "no",
+      // Set by hand because reply.hijack() takes this response out of Fastify's pipeline
+      // entirely - @fastify/cors never gets to add it, and without it the browser silently
+      // refuses the EventSource connection while curl sees a perfectly healthy stream.
+      "Access-Control-Allow-Origin": config.WEBSITE_ORIGIN
     });
     reply.raw.write(": connected\n\n");
 
