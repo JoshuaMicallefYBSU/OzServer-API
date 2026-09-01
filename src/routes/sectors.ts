@@ -293,6 +293,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       "DELETE FROM resume_snapshots WHERE controller_cid=$1 AND controller_callsign=$2 RETURNING *",
       [request.controller.cid, request.controller.callsign])).rows[0];
     const resumed: string[] = [];
+    const restoredFlights: string[] = [];
     if (snapshot && Date.now() - new Date(snapshot.created_at).getTime() <= config.RESUME_WINDOW_MINUTES * 60_000) {
       for (const name of snapshot.sectors as string[]) {
         const sector = (await client.query("SELECT id FROM sectors WHERE name=$1", [name])).rows[0];
@@ -302,12 +303,17 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
            VALUES ($1,$2,$3,now()) ON CONFLICT DO NOTHING RETURNING sector_id`, [sector.id, request.controller.cid, request.controller.callsign]);
         if (inserted.rows[0]) resumed.push(name);
       }
-      await client.query(
+      // The WHERE is what keeps this honest: a flight another controller picked up while this one
+      // was away is left with them. RETURNING reports only what was actually restored, so the
+      // client can bring exactly those tags straight back instead of flashing every one it used to
+      // hold and hoping.
+      restoredFlights.push(...(await client.query(
         `UPDATE flight_data_records SET controlling_cid=$1,controlling_callsign=$2
-         WHERE callsign=ANY($3) AND (controlling_cid IS NULL OR controlling_cid=$1)`,
-        [request.controller.cid, request.controller.callsign, snapshot.flights]);
+         WHERE callsign=ANY($3) AND (controlling_cid IS NULL OR controlling_cid=$1)
+         RETURNING callsign`,
+        [request.controller.cid, request.controller.callsign, snapshot.flights])).rows.map(row => row.callsign));
     }
-    return { resumed, sync: await syncPayload(client, request.controller) };
+    return { resumed, flights: restoredFlights, sync: await syncPayload(client, request.controller) };
   }));
 
   app.post<{ Params: { id: string } }>("/sector-requests/:id/accept", async (request, reply) => transaction(async client => {
