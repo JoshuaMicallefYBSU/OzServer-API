@@ -1,0 +1,31 @@
+{
+  "name": "ozserver-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "db:migrate": "tsx src/commands/migrate.ts",
+    "db:migrate:prod": "node dist/commands/migrate.js",
+    "dataset:sync": "tsx src/commands/sync-dataset.ts",
+    "dataset:sync:prod": "node dist/commands/sync-dataset.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "fast-xml-parser": "^5.2.5",
+    "fastify": "^5.6.0",
+    "pg": "^8.16.3",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
