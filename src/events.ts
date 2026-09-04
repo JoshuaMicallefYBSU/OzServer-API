@@ -6,7 +6,7 @@ import { pool } from "./db.js";
 // authenticated endpoint it already uses, which keeps this channel free of anything sensitive - so
 // it needs no auth of its own, and the browser map (whose EventSource cannot set an Authorization
 // header) can share it - and means no DTO is duplicated here to drift out of step with its route.
-export type OzEvent = { type: "sectors" | "fdr" | "atis" };
+export type OzEvent = { type: "sectors" | "fdr" | "atis" | "annotations" };
 
 const CHANNEL = "ozserver_events";
 
