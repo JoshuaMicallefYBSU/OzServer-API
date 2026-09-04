@@ -179,7 +179,23 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
   if (!request || request.target_cid !== identity.cid) return null;
   const owner = await client.query("SELECT controller_cid FROM sector_ownerships WHERE sector_id=$1 FOR UPDATE", [request.sector_id]);
   if (owner.rows[0]?.controller_cid !== identity.cid) return null;
-  const rows = await covered(client, request.name);
+  // Only what the accepting controller actually holds. A transfer is one controller giving another
+  // what they have, and it was instead handing over the requested sector's whole responsible-sectors
+  // closure outright - every sector in it, owned by them or not.
+  //
+  // Two things went wrong with that. A sector a *third* controller owned was silently taken off them
+  // by two other people agreeing a handover that had nothing to do with them. And an unowned sector
+  // was granted no matter who was logged on as it, which is how Melbourne Approach's sectors kept
+  // arriving with Benalla while ML_APP was online and working them: the claim path had already been
+  // taught not to take those (see claimGroup's exclusions), but accepting a request bypassed it
+  // entirely and put them straight back.
+  //
+  // Restricting to the giver's own rows fixes both without adding a second opinion about who is
+  // online. What is left unowned stays unowned, and is claimed through the ordinary path - which is
+  // the one place the staffing rule is applied, and the only place it can be applied correctly.
+  const rows = (await covered(client, request.name))
+    .filter(row => row.controller_cid === identity.cid);
+
   for (const row of rows) {
     await client.query(
       `INSERT INTO sector_ownerships (sector_id,controller_cid,controller_callsign,last_seen_online_at)
