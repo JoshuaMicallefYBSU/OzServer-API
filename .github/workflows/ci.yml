@@ -1,0 +1,36 @@
+name: CI
+
+# Every push and every pull request. The API is deployed straight from main by a timer on the VPS,
+# so a break on main is a break in production within a minute or two - this is the only thing
+# standing in front of that.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the Dockerfile's base image, so a thing that compiles here compiles there.
+          node-version: '22'
+          cache: npm
+
+      # ci, not install: builds from the lockfile exactly, which is the same guarantee the
+      # deployment relies on.
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      # Proves the image the VPS will actually build still builds, without pushing it anywhere.
+      # Catches a Dockerfile or dependency break before the deploy timer finds it in production.
+      - name: Build image
+        run: docker build -t ozserver-api:ci .
