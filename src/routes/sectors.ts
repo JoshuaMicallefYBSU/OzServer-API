@@ -17,7 +17,9 @@ type SectorRow = {
 const mutationSchema = z.object({
   claim: z.array(z.string()).default([]),
   release: z.array(z.string()).default([]),
-  request: z.array(z.string()).default([])
+  request: z.array(z.string()).default([]),
+  // Applied to every sector in `claim` - see claimGroup's `exclusions`.
+  exclude: z.array(z.string()).default([])
 });
 
 async function lockMutations(client: pg.PoolClient): Promise<void> {
@@ -73,6 +75,20 @@ function isWithinGrace(row: SectorRow): boolean {
     && Date.now() - new Date(row.last_seen_online_at).getTime() < config.DISCONNECT_GRACE_MINUTES * 60_000;
 }
 
+// exclusions are sectors the claimer has asked to be left out of the expansion entirely - not
+// taken, not conflict-checked, not reported.
+//
+// Two things send them. A client retrying after a 409 carves out whatever turned out to be owned by
+// somebody else, so one contested sub-sector does not fail the whole claim. And every claim carves
+// out the covered sectors somebody is currently logged on as - which is what stops an enroute
+// controller taking an approach controller's sectors top-down while that controller is online.
+//
+// That staffing check deliberately lives on the client (PrimaryPosition.StaffedCoveredSectors) and
+// not here, even though `online` is right there. This server's view of who is online is the public
+// VATSIM data feed, cached, and it lags a logon or logoff by up to about a minute - long enough to
+// hand over somebody's airspace on the way in, and to withhold it on the way out. The plugin reads
+// vatSys's own live ATC list instead, which reflects both within seconds. Answering it here as well
+// would only add a second, slower opinion for the two sides to disagree over.
 async function claimGroup(
   client: pg.PoolClient,
   identity: ControllerIdentity,
@@ -88,33 +104,6 @@ async function claimGroup(
   const conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }> = [];
 
   for (const row of rows) {
-    // Somebody is logged on as this sector itself, so it is not available to be covered - however
-    // much of it the claimer's own group nominally bundles.
-    //
-    // A claim expands through responsible_sectors, which is what "top down" means: Benalla bundles
-    // Melbourne Approach because Benalla works that airspace when nobody is on it. But the bundle
-    // says nothing about whether anybody IS on it, so an enroute controller logging on while
-    // Melbourne Approach was already online took MAE - and MDN, MDS, MAV and MAW behind it -
-    // straight off them. Nothing then gave them back: the sector was never in the enroute
-    // controller's own MMI (the plugin's PrimaryPosition already excludes a sector whose callsign
-    // is online), so no client-side release path ever looked at it.
-    //
-    // This is deliberately not a rule about TCUs. The dataset has no marker for one, and the
-    // relationship is the same wherever it appears - between two TCUs, or a TCU and a tower. The
-    // rule is simply that a sector belongs to whoever is logged on as it, which is also what vatSys
-    // itself does natively when it drops a sector from SectorsControlled on seeing its controller
-    // come online.
-    //
-    // Never applied to the sector actually being claimed, and never while the VATSIM feed is
-    // unavailable (online === null): an outage must not stop controllers claiming their own
-    // positions.
-    const ownCallsign = row.callsign?.toUpperCase();
-    if (row.name !== name && online !== null && ownCallsign
-      && ownCallsign !== identity.callsign.toUpperCase() && online.has(ownCallsign)) {
-      skipped.push(row.name);
-      continue;
-    }
-
     if (row.controller_cid === null || row.controller_cid === identity.cid
       || row.callsign?.toUpperCase() === identity.callsign.toUpperCase()) {
       takeable.push(row);
@@ -273,7 +262,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       for (const name of parsed.data.release) (await releaseGroup(client, request.controller, name) ? result.released : result.failed).push(name);
       const online = await onlineControllers();
       for (const name of parsed.data.claim) {
-        const claimed = await claimGroup(client, request.controller, name, online);
+        const claimed = await claimGroup(client, request.controller, name, online, parsed.data.exclude);
         if (claimed.missing) result.failed.push(name); else { result.claimed.push(...claimed.claimed); result.skipped.push(...claimed.skipped); }
       }
       for (const name of parsed.data.request) {
