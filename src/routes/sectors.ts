@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import type pg from "pg";
 import { z } from "zod";
 import { config } from "../config.js";
+import { writeDiagnosticLog } from "../diagnostics.js";
 import { pool, transaction } from "../db.js";
 import { reassignFreedSectors } from "../grouping.js";
 import type { ControllerIdentity } from "../types.js";
@@ -117,7 +118,21 @@ async function claimGroup(
     else takeable.push(row);
   }
 
-  if (allOrNothing && conflicts.length) return { claimed: [], skipped, conflicts, missing: false };
+  if (allOrNothing && conflicts.length) {
+    await writeDiagnosticLog(client, identity, "ServerSector", `Claim ${name} blocked by existing owner`, {
+      action: "claim_blocked",
+      sector: name,
+      skipped,
+      conflicts,
+      exclusions,
+      all_or_nothing: allOrNothing
+    });
+    return { claimed: [], skipped, conflicts, missing: false };
+  }
+
+  const previousOwners = takeable
+    .filter(row => row.controller_cid !== null && row.controller_cid !== identity.cid)
+    .map(row => ({ sector: row.name, cid: row.controller_cid, callsign: row.controller_callsign }));
 
   for (const row of takeable) {
     await client.query(
@@ -126,6 +141,20 @@ async function claimGroup(
        controller_cid=excluded.controller_cid, controller_callsign=excluded.controller_callsign,
        last_seen_online_at=now(), updated_at=now()`, [row.id, identity.cid, identity.callsign]);
   }
+
+  if (takeable.length > 0 || skipped.length > 0 || exclusions.length > 0) {
+    await writeDiagnosticLog(client, identity, "ServerSector", `Claim ${name}: ${takeable.length} claimed, ${skipped.length} skipped`, {
+      action: "claim",
+      sector: name,
+      claimed: takeable.map(row => row.name),
+      skipped,
+      conflicts,
+      exclusions,
+      previous_owners: previousOwners,
+      all_or_nothing: allOrNothing
+    });
+  }
+
   return { claimed: takeable.map(row => row.name), skipped, conflicts, missing: false };
 }
 
@@ -169,6 +198,11 @@ async function releaseGroup(client: pg.PoolClient, identity: ControllerIdentity,
   const ids = rows.map(row => row.id);
   await client.query("DELETE FROM sector_ownerships WHERE sector_id=ANY($1) AND controller_cid=$2", [ids, identity.cid]);
   await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND rejected_at IS NULL", [primary.id]);
+  await writeDiagnosticLog(client, identity, "ServerSector", `Released ${name}`, {
+    action: "release",
+    sector: name,
+    released: rows.filter(row => row.controller_cid === identity.cid).map(row => row.name)
+  });
   return true;
 }
 
@@ -218,10 +252,21 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
   // recorded authority is a different controller who is online and still holds sectors - so leaving
   // the previous owner on the record meant every route, level and squawk change the new controller
   // made was silently discarded with updated:false.
-  await client.query(
+  const clearedFlights = (await client.query(
     `UPDATE flight_data_records SET controlling_cid=NULL,controlling_callsign=NULL
-      WHERE current_sector = ANY($1) AND controlling_cid IS NOT NULL AND controlling_cid <> $2`,
-    [rows.map(row => row.name), request.requesting_cid]);
+      WHERE current_sector = ANY($1) AND controlling_cid IS NOT NULL AND controlling_cid <> $2
+      RETURNING callsign`,
+    [rows.map(row => row.name), request.requesting_cid])).rows.map(row => row.callsign);
+
+  await writeDiagnosticLog(client, identity, "ServerSector", `Accepted request #${id} for ${request.name}`, {
+    action: "request_accept",
+    request_id: id,
+    sector: request.name,
+    transferred: rows.map(row => row.name),
+    from: { cid: identity.cid, callsign: identity.callsign },
+    to: { cid: request.requesting_cid, callsign: request.requesting_callsign },
+    fdr_authority_cleared: clearedFlights
+  });
 
   return request.name;
 }
@@ -261,6 +306,13 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
        VALUES ($1,$2,$3,$4,$5) ON CONFLICT (sector_id,requesting_cid) DO NOTHING RETURNING *`,
       [sector.id, request.controller.cid, request.controller.callsign, sector.controller_cid, sector.controller_callsign]);
     if (!inserted.rows[0]) return reply.code(409).send({ message: "You already have a pending request for this sector." });
+    await writeDiagnosticLog(client, request.controller, "ServerSector", `Requested ${request.params.name} from ${sector.controller_callsign}`, {
+      action: "request_create",
+      request_id: Number(inserted.rows[0].id),
+      sector: request.params.name,
+      from: { cid: request.controller.cid, callsign: request.controller.callsign },
+      to: { cid: sector.controller_cid, callsign: sector.controller_callsign }
+    });
     return reply.code(201).send(inserted.rows[0]);
   }));
 
@@ -288,10 +340,19 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
         await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid]);
         await client.query(
           `INSERT INTO sector_requests (sector_id,requesting_cid,requesting_callsign,target_cid,target_callsign,group_id)
-           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (sector_id,requesting_cid) DO NOTHING`,
+           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (sector_id,requesting_cid) DO NOTHING RETURNING id`,
           [sector.id, request.controller.cid, request.controller.callsign, sector.controller_cid, sector.controller_callsign, requestGroupId]);
         result.requested.push(name);
       }
+      await writeDiagnosticLog(client, request.controller, "ServerSector", "Committed sector changes", {
+        action: "commit",
+        group_id: requestGroupId,
+        requested_input: parsed.data.request,
+        claim_input: parsed.data.claim,
+        release_input: parsed.data.release,
+        exclusions: parsed.data.exclude,
+        ...result
+      });
       return { result, sync: await syncPayload(client, request.controller) };
     });
   });
@@ -315,7 +376,15 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     // impossible to free one by hand.
     await reassignFreedSectors(client, freed);
     await client.query("DELETE FROM sector_requests WHERE requesting_cid=$1 OR target_cid=$1", [request.controller.cid]);
-    await client.query("UPDATE flight_data_records SET controlling_cid=NULL,controlling_callsign=NULL WHERE controlling_cid=$1", [request.controller.cid]);
+    const clearedFlights = (await client.query(
+      "UPDATE flight_data_records SET controlling_cid=NULL,controlling_callsign=NULL WHERE controlling_cid=$1 RETURNING callsign",
+      [request.controller.cid])).rows.map(row => row.callsign);
+    await writeDiagnosticLog(client, request.controller, "ServerSector", "Released all sectors", {
+      action: "release_all",
+      sectors,
+      sector_ids: freed,
+      fdr_authority_cleared: clearedFlights
+    });
     return reply.code(204).send();
   }));
 
@@ -387,6 +456,13 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
         ORDER BY callsign`,
       [request.controller.cid])).rows.map(row => row.callsign));
 
+    await writeDiagnosticLog(client, request.controller, "ServerSector", "Resume processed", {
+      action: "resume",
+      had_snapshot: Boolean(snapshot),
+      resumed,
+      restored_flights: restoredFlights
+    });
+
     return { resumed, flights: restoredFlights, sync: await syncPayload(client, request.controller) };
   }));
 
@@ -414,19 +490,39 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     const changed = await pool.query(
       "UPDATE sector_requests SET rejected_at=now() WHERE id=ANY($1) AND target_cid=$2 AND rejected_at IS NULL RETURNING id",
       [ids, request.controller.cid]);
+    await writeDiagnosticLog(pool, request.controller, "ServerSector", "Rejected request batch", {
+      action: "request_reject_batch",
+      request_ids: ids.map(String),
+      rejected: changed.rows.map(row => Number(row.id))
+    });
     return { rejected: changed.rows.map(row => Number(row.id)), sync: await syncPayload(pool, request.controller) };
   });
 
   app.post<{ Params: { id: string } }>("/sector-requests/:id/reject", async (request, reply) => {
     const changed = await pool.query("UPDATE sector_requests SET rejected_at=now() WHERE id=$1 AND target_cid=$2 AND rejected_at IS NULL RETURNING id", [request.params.id, request.controller.cid]);
+    if (changed.rowCount)
+      await writeDiagnosticLog(pool, request.controller, "ServerSector", `Rejected request #${request.params.id}`, {
+        action: "request_reject",
+        request_id: request.params.id
+      });
     return changed.rowCount ? { message: "Request rejected.", sync: await syncPayload(pool, request.controller) } : reply.code(403).send({ message: "This request cannot be rejected." });
   });
   app.post<{ Params: { id: string } }>("/sector-requests/:id/cancel", async (request, reply) => {
     const changed = await pool.query("DELETE FROM sector_requests WHERE id=$1 AND requesting_cid=$2 RETURNING id", [request.params.id, request.controller.cid]);
+    if (changed.rowCount)
+      await writeDiagnosticLog(pool, request.controller, "ServerSector", `Cancelled request #${request.params.id}`, {
+        action: "request_cancel",
+        request_id: request.params.id
+      });
     return changed.rowCount ? { message: "Request cancelled.", sync: await syncPayload(pool, request.controller) } : reply.code(403).send({ message: "This request cannot be cancelled." });
   });
   app.post<{ Params: { id: string } }>("/sector-requests/:id/acknowledge-rejection", async (request, reply) => {
     const changed = await pool.query("DELETE FROM sector_requests WHERE id=$1 AND requesting_cid=$2 AND rejected_at IS NOT NULL RETURNING id", [request.params.id, request.controller.cid]);
+    if (changed.rowCount)
+      await writeDiagnosticLog(pool, request.controller, "ServerSector", `Acknowledged rejected request #${request.params.id}`, {
+        action: "request_acknowledge_rejection",
+        request_id: request.params.id
+      });
     return changed.rowCount ? reply.code(204).send() : reply.code(404).send({ message: "Rejected request not found." });
   });
 }
