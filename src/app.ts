@@ -5,6 +5,7 @@ import { pluginAuth } from "./auth.js";
 import { pool } from "./db.js";
 import { publish } from "./events.js";
 import { annotationRoutes } from "./routes/annotations.js";
+import { clientLogRoutes } from "./routes/client-logs.js";
 import { protectedAtisRoutes, publicAtisRoutes } from "./routes/atis.js";
 import { flightRoutes } from "./routes/flights.js";
 import { eventRoutes } from "./routes/events.js";
@@ -44,6 +45,10 @@ export async function buildApp() {
         await publish({ type: "fdr" });
       } else if (route.startsWith("/api/v1/atis")) {
         await publish({ type: "atis" });
+      } else if (route.startsWith("/api/v1/client-logs")) {
+        // Deliberately silent: nothing subscribes to these, and every controller posts
+        // them continuously - announcing each batch would wake every client for nothing.
+        return;
       } else if (route.startsWith("/api/v1/annotations")) {
         await publish({ type: "annotations" });
       }
@@ -52,6 +57,7 @@ export async function buildApp() {
     await flightRoutes(pluginApi);
     await protectedAtisRoutes(pluginApi);
     await annotationRoutes(pluginApi);
+    await clientLogRoutes(pluginApi);
   }, { prefix: "/api/v1" });
   app.setErrorHandler((error: FastifyError, _request, reply) => {
     app.log.error(error);
