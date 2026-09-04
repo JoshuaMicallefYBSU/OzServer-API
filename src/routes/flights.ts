@@ -16,13 +16,19 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
   const online = await onlineControllers();
   return transaction(async client => {
     const cidsWithSectors = new Set((await client.query("SELECT DISTINCT controller_cid FROM sector_ownerships")).rows.map(row => row.controller_cid));
+    const callerOwnedSectors = new Set((await client.query(
+      `SELECT s.name FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
+        WHERE o.controller_cid=$1`, [identity.cid])).rows.map(row => row.name));
     const results: Array<{ callsign: string; updated: boolean }> = [];
     for (const flight of flights) {
       const existing = (await client.query(
         "SELECT controlling_cid,controlling_callsign,current_sector,data FROM flight_data_records WHERE callsign=$1 FOR UPDATE", [flight.callsign])).rows[0];
+      const updateSector = flight.current_sector ?? existing?.current_sector ?? null;
+      const callerOwnsCurrentSector = updateSector != null && callerOwnedSectors.has(updateSector);
       if (existing?.controlling_cid && existing.controlling_cid !== identity.cid
         && cidsWithSectors.has(existing.controlling_cid)
-        && online?.get(existing.controlling_callsign?.toUpperCase()) === existing.controlling_cid) {
+        && online?.get(existing.controlling_callsign?.toUpperCase()) === existing.controlling_cid
+        && !callerOwnsCurrentSector) {
         await writeDiagnosticLog(client, identity, "ServerFDR", `Rejected ${flight.callsign} update; authority is still ${existing.controlling_callsign}`, {
           action: "fdr_update_rejected",
           fdr_callsign: flight.callsign,
@@ -30,7 +36,9 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
           existing_authority: { cid: existing.controlling_cid, callsign: existing.controlling_callsign },
           attempted_authority: { cid: flight.controlling_cid ?? null, callsign: flight.controlling_callsign ?? null },
           attempted_state: flight.state ?? null,
-          attempted_current_sector: flight.current_sector ?? null
+          attempted_current_sector: flight.current_sector ?? null,
+          update_sector: updateSector,
+          caller_owns_current_sector: callerOwnsCurrentSector
         });
         results.push({ callsign: flight.callsign, updated: false });
         continue;

@@ -103,11 +103,25 @@ async function claimGroup(
   const takeable: SectorRow[] = [];
   const skipped: string[] = [];
   const conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }> = [];
+  const primary = rows.find(row => row.name === name);
+  const claimantIsNamedPrimary = primary?.callsign?.toUpperCase() === identity.callsign.toUpperCase();
+  const positionOwnersInClaim = new Set(rows
+    .filter(row => row.controller_callsign
+      && row.callsign?.toUpperCase() === row.controller_callsign.toUpperCase())
+    .map(row => row.controller_callsign!.toUpperCase()));
+  const overriddenTopDown: Array<{ sector: string; owner: { cid: number; callsign: string } }> = [];
 
   for (const row of rows) {
     if (row.controller_cid === null || row.controller_cid === identity.cid
       || row.callsign?.toUpperCase() === identity.callsign.toUpperCase()) {
       takeable.push(row);
+      continue;
+    }
+    const ownerIsLoggedOnForThisSector = row.callsign?.toUpperCase() === row.controller_callsign?.toUpperCase();
+    const ownerHasPositionInThisClaim = positionOwnersInClaim.has(row.controller_callsign?.toUpperCase() ?? "");
+    if (claimantIsNamedPrimary && !ownerIsLoggedOnForThisSector && !ownerHasPositionInThisClaim) {
+      takeable.push(row);
+      overriddenTopDown.push({ sector: row.name, owner: { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } });
       continue;
     }
     const ownerOnline = online?.get(row.controller_callsign?.toUpperCase() ?? "") === row.controller_cid;
@@ -125,6 +139,7 @@ async function claimGroup(
       skipped,
       conflicts,
       exclusions,
+      overridden_top_down: overriddenTopDown,
       all_or_nothing: allOrNothing
     });
     return { claimed: [], skipped, conflicts, missing: false };
@@ -150,6 +165,7 @@ async function claimGroup(
       skipped,
       conflicts,
       exclusions,
+      overridden_top_down: overriddenTopDown,
       previous_owners: previousOwners,
       all_or_nothing: allOrNothing
     });
@@ -239,24 +255,15 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
   }
   await client.query("DELETE FROM sector_requests WHERE sector_id=ANY($1)", [rows.map(row => row.id)]);
 
-  // A sector changing hands has to take its aircraft with it, and this is what makes that possible.
-  //
-  // vatSys keeps tag jurisdiction per client, so nothing here can hand a tag over directly - what
-  // actually moves it is the receiving controller's own pickup, and TagOwnershipSync only picks up
-  // an aircraft sitting in a sector it owns that *nobody* is tracking. Releasing authority is what
-  // makes these aircraft nobody's, so that pickup can fire on the new owner's very next radar
-  // update. (Its own comment says exactly this: no explicit "gained" handling is needed because the
-  // controller who just gained a sector picks up whatever it leaves untracked.)
-  //
-  // It also unblocks the new owner's FDR pushes. upsert() refuses any update to a flight whose
-  // recorded authority is a different controller who is online and still holds sectors - so leaving
-  // the previous owner on the record meant every route, level and squawk change the new controller
-  // made was silently discarded with updated:false.
-  const clearedFlights = (await client.query(
-    `UPDATE flight_data_records SET controlling_cid=NULL,controlling_callsign=NULL
+  // A sector changing hands has to take its aircraft with it. The plugin performs the actual vatSys
+  // jurisdiction handoff, but the server has to move the API authority in the same transaction;
+  // otherwise the accepting controller's immediate STATE_CONTROLLED push can be rejected because
+  // the previous controller is still online somewhere else.
+  const transferredFlights = (await client.query(
+    `UPDATE flight_data_records SET controlling_cid=$2,controlling_callsign=$3
       WHERE current_sector = ANY($1) AND controlling_cid IS NOT NULL AND controlling_cid <> $2
       RETURNING callsign`,
-    [rows.map(row => row.name), request.requesting_cid])).rows.map(row => row.callsign);
+    [rows.map(row => row.name), request.requesting_cid, request.requesting_callsign])).rows.map(row => row.callsign);
 
   await writeDiagnosticLog(client, identity, "ServerSector", `Accepted request #${id} for ${request.name}`, {
     action: "request_accept",
@@ -265,7 +272,7 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
     transferred: rows.map(row => row.name),
     from: { cid: identity.cid, callsign: identity.callsign },
     to: { cid: request.requesting_cid, callsign: request.requesting_callsign },
-    fdr_authority_cleared: clearedFlights
+    fdr_authority_transferred: transferredFlights
   });
 
   return request.name;
