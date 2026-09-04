@@ -88,6 +88,33 @@ async function claimGroup(
   const conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }> = [];
 
   for (const row of rows) {
+    // Somebody is logged on as this sector itself, so it is not available to be covered - however
+    // much of it the claimer's own group nominally bundles.
+    //
+    // A claim expands through responsible_sectors, which is what "top down" means: Benalla bundles
+    // Melbourne Approach because Benalla works that airspace when nobody is on it. But the bundle
+    // says nothing about whether anybody IS on it, so an enroute controller logging on while
+    // Melbourne Approach was already online took MAE - and MDN, MDS, MAV and MAW behind it -
+    // straight off them. Nothing then gave them back: the sector was never in the enroute
+    // controller's own MMI (the plugin's PrimaryPosition already excludes a sector whose callsign
+    // is online), so no client-side release path ever looked at it.
+    //
+    // This is deliberately not a rule about TCUs. The dataset has no marker for one, and the
+    // relationship is the same wherever it appears - between two TCUs, or a TCU and a tower. The
+    // rule is simply that a sector belongs to whoever is logged on as it, which is also what vatSys
+    // itself does natively when it drops a sector from SectorsControlled on seeing its controller
+    // come online.
+    //
+    // Never applied to the sector actually being claimed, and never while the VATSIM feed is
+    // unavailable (online === null): an outage must not stop controllers claiming their own
+    // positions.
+    const ownCallsign = row.callsign?.toUpperCase();
+    if (row.name !== name && online !== null && ownCallsign
+      && ownCallsign !== identity.callsign.toUpperCase() && online.has(ownCallsign)) {
+      skipped.push(row.name);
+      continue;
+    }
+
     if (row.controller_cid === null || row.controller_cid === identity.cid
       || row.callsign?.toUpperCase() === identity.callsign.toUpperCase()) {
       takeable.push(row);
