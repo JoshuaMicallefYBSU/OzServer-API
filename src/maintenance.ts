@@ -41,6 +41,9 @@ export async function runMaintenance(): Promise<void> {
     await client.query(`DELETE FROM flight_data_records WHERE last_seen_at < now()-($1*interval '1 minute')`, [config.FDR_RETAIN_MINUTES]);
     await client.query(`DELETE FROM atis_broadcasts WHERE last_seen_at < now()-($1*interval '1 minute')`, [config.ATIS_RETAIN_MINUTES]);
     await client.query("DELETE FROM sector_requests WHERE rejected_at < now()-interval '1 day'");
+    // Kept for a day. Long enough to look into something reported the next morning, short enough
+    // that a busy evening's worth of every controller's logs is not accumulated indefinitely.
+    await client.query("DELETE FROM client_logs WHERE logged_at < now()-interval '1 day'");
     // Shared notes and drawings outlive a momentary drop but not a sign-off, on the same grace the
     // sectors above use. Keyed off last_seen_online_at, which every read by the author refreshes -
     // so this only ever catches a controller whose client has actually stopped calling.
