@@ -5,7 +5,12 @@ import { z } from "zod";
 import { config } from "../config.js";
 import { writeDiagnosticLog } from "../diagnostics.js";
 import { pool, transaction } from "../db.js";
-import { reassignFreedSectors } from "../grouping.js";
+import {
+  clearFlightsWithoutCurrentSectorOwner,
+  reassignFreedSectors,
+  transferFlightsInSectorsToOwner,
+  transferFlightsToCurrentSectorOwners
+} from "../grouping.js";
 import type { ControllerIdentity } from "../types.js";
 import { onlineControllers } from "../vatsim.js";
 
@@ -86,10 +91,13 @@ function isWithinGrace(row: SectorRow): boolean {
 //
 // The client still sends fast, vatSys-live exclusions using PrimaryPosition.StaffedCoveredSectors.
 // This server also treats sectors already owned by a staffed child position inside the same claim
-// as "withheld", not conflicted. That protects against stale or incomplete client exclusions: an
+// as "withheld", not conflicted, while that child controller is actually online. That protects
+// against stale or incomplete client exclusions: an
 // enroute controller logging on over an already-online APP/TCU keeps the uncontested ENR sectors,
 // the APP/TCU keeps its sectors, and the client does not receive a 409 that would create a request
-// popup/error.
+// popup/error. Once the child drops offline, a parent/primary claim may take the sector immediately
+// rather than waiting out disconnect grace; otherwise tags/strips can be left with nobody able to
+// work them.
 async function claimGroup(
   client: pg.PoolClient,
   identity: ControllerIdentity,
@@ -126,11 +134,15 @@ async function claimGroup(
       continue;
     }
     const ownerOnline = online?.get(row.controller_callsign?.toUpperCase() ?? "") === row.controller_cid;
-    if (ownerOnline || isWithinGrace(row)) {
+    if (ownerOnline) {
       if (ownerHasPositionInThisClaim) {
         withheld.push(row.name);
         continue;
       }
+      skipped.push(row.name);
+      conflicts.push({ sector: row.name, owner: { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } });
+    }
+    else if (isWithinGrace(row) && !ownerHasPositionInThisClaim) {
       skipped.push(row.name);
       conflicts.push({ sector: row.name, owner: { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } });
     }
@@ -162,6 +174,10 @@ async function claimGroup(
        controller_cid=excluded.controller_cid, controller_callsign=excluded.controller_callsign,
        last_seen_online_at=now(), updated_at=now()`, [row.id, identity.cid, identity.callsign]);
   }
+  const transferredFlights = await transferFlightsInSectorsToOwner(
+    client,
+    takeable.map(row => ({ sector: row.name, cid: row.controller_cid, callsign: row.controller_callsign })),
+    identity);
 
   if (takeable.length > 0 || skipped.length > 0 || withheld.length > 0 || exclusions.length > 0) {
     await writeDiagnosticLog(client, identity, "ServerSector", `Claim ${name}: ${takeable.length} claimed, ${skipped.length} skipped, ${withheld.length} withheld`, {
@@ -174,6 +190,7 @@ async function claimGroup(
       exclusions,
       overridden_top_down: overriddenTopDown,
       previous_owners: previousOwners,
+      fdr_authority_transferred: transferredFlights,
       all_or_nothing: allOrNothing
     });
   }
@@ -376,7 +393,9 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     const sectors = (await client.query(
       `SELECT s.name FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
        WHERE o.controller_cid=$1 AND o.controller_callsign=$2`, [request.controller.cid, request.controller.callsign])).rows.map(row => row.name);
-    const flights = (await client.query("SELECT callsign FROM flight_data_records WHERE controlling_cid=$1", [request.controller.cid])).rows.map(row => row.callsign);
+    const flights = (await client.query(
+      "SELECT callsign FROM flight_data_records WHERE controlling_cid=$1 AND controlling_callsign=$2",
+      [request.controller.cid, request.controller.callsign])).rows.map(row => row.callsign);
     await client.query(
       `INSERT INTO resume_snapshots (controller_cid,controller_callsign,sectors,flights,created_at) VALUES ($1,$2,$3,$4,now())
        ON CONFLICT (controller_cid,controller_callsign) DO UPDATE SET sectors=$3,flights=$4,created_at=now()`,
@@ -390,13 +409,13 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     // impossible to free one by hand.
     await reassignFreedSectors(client, freed);
     await client.query("DELETE FROM sector_requests WHERE requesting_cid=$1 OR target_cid=$1", [request.controller.cid]);
-    const clearedFlights = (await client.query(
-      "UPDATE flight_data_records SET controlling_cid=NULL,controlling_callsign=NULL WHERE controlling_cid=$1 RETURNING callsign",
-      [request.controller.cid])).rows.map(row => row.callsign);
+    const transferredFlights = await transferFlightsToCurrentSectorOwners(client, request.controller);
+    const clearedFlights = await clearFlightsWithoutCurrentSectorOwner(client, request.controller);
     await writeDiagnosticLog(client, request.controller, "ServerSector", "Released all sectors", {
       action: "release_all",
       sectors,
       sector_ids: freed,
+      fdr_authority_transferred: transferredFlights,
       fdr_authority_cleared: clearedFlights
     });
     return reply.code(204).send();
