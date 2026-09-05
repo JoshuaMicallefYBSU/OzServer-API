@@ -1,4 +1,5 @@
 import type pg from "pg";
+import type { ControllerIdentity } from "./types.js";
 
 // A sub-sector whose controller drops off belongs back with whoever is working the group it sits
 // inside - not to nobody. Previously it simply went unowned until someone claimed it by hand, even
@@ -11,6 +12,12 @@ import type pg from "pg";
 const MAX_DEPTH = 8;
 
 type Owner = { controller_cid: number; controller_callsign: string };
+type FlightAuthorityTransfer = {
+  callsign: string;
+  current_sector: string | null;
+  from: ControllerIdentity;
+  to: ControllerIdentity;
+};
 
 async function findNearestGroupOwner(client: pg.PoolClient, name: string): Promise<Owner | null> {
   let frontier = [name];
@@ -71,4 +78,98 @@ export async function reassignFreedSectors(
   }
 
   return reassigned;
+}
+
+export async function transferFlightsInSectorsToOwner(
+  client: pg.PoolClient,
+  sectors: Array<{ sector: string; cid: number | null; callsign: string | null }>,
+  owner: ControllerIdentity
+): Promise<FlightAuthorityTransfer[]> {
+  if (sectors.length === 0) return [];
+
+  const transferred: FlightAuthorityTransfer[] = [];
+  for (const sector of sectors) {
+    const rows = (await client.query<{
+      callsign: string;
+      current_sector: string | null;
+      previous_cid: number | null;
+      previous_callsign: string | null;
+    }>(
+      `WITH previous AS (
+         SELECT callsign,current_sector,controlling_cid,controlling_callsign
+           FROM flight_data_records
+          WHERE current_sector=$1
+            AND (
+              ($2::integer IS NULL AND controlling_cid IS NULL)
+              OR (controlling_cid=$2 AND controlling_callsign IS NOT DISTINCT FROM $3)
+            )
+            AND (controlling_cid IS DISTINCT FROM $4 OR controlling_callsign IS DISTINCT FROM $5)
+       ),
+       updated AS (
+         UPDATE flight_data_records f
+            SET controlling_cid=$4,controlling_callsign=$5
+           FROM previous p
+          WHERE f.callsign=p.callsign
+          RETURNING f.callsign,f.current_sector,
+                    p.controlling_cid AS previous_cid,p.controlling_callsign AS previous_callsign
+       )
+       SELECT * FROM updated`,
+      [sector.sector, sector.cid, sector.callsign, owner.cid, owner.callsign])).rows;
+
+    transferred.push(...rows.map(row => ({
+      callsign: row.callsign,
+      current_sector: row.current_sector,
+      from: { cid: row.previous_cid ?? 0, callsign: row.previous_callsign ?? "" },
+      to: owner
+    })));
+  }
+
+  return transferred;
+}
+
+export async function transferFlightsToCurrentSectorOwners(
+  client: pg.PoolClient,
+  from: ControllerIdentity
+): Promise<FlightAuthorityTransfer[]> {
+  const rows = (await client.query<{
+    callsign: string;
+    current_sector: string | null;
+    to_cid: number;
+    to_callsign: string;
+  }>(
+    `UPDATE flight_data_records f
+        SET controlling_cid=o.controller_cid,controlling_callsign=o.controller_callsign
+       FROM sectors s
+       JOIN sector_ownerships o ON o.sector_id=s.id
+      WHERE f.controlling_cid=$1
+        AND f.controlling_callsign=$2
+        AND f.current_sector=s.name
+        AND (o.controller_cid IS DISTINCT FROM $1 OR o.controller_callsign IS DISTINCT FROM $2)
+      RETURNING f.callsign,f.current_sector,o.controller_cid AS to_cid,o.controller_callsign AS to_callsign`,
+    [from.cid, from.callsign])).rows;
+
+  return rows.map(row => ({
+    callsign: row.callsign,
+    current_sector: row.current_sector,
+    from,
+    to: { cid: row.to_cid, callsign: row.to_callsign }
+  }));
+}
+
+export async function clearFlightsWithoutCurrentSectorOwner(
+  client: pg.PoolClient,
+  from: ControllerIdentity
+): Promise<string[]> {
+  return (await client.query<{ callsign: string }>(
+    `UPDATE flight_data_records f
+        SET controlling_cid=NULL,controlling_callsign=NULL
+      WHERE f.controlling_cid=$1
+        AND f.controlling_callsign=$2
+        AND NOT EXISTS (
+          SELECT 1
+            FROM sectors s
+            JOIN sector_ownerships o ON o.sector_id=s.id
+           WHERE s.name=f.current_sector)
+      RETURNING callsign`,
+    [from.cid, from.callsign])).rows.map(row => row.callsign);
 }
