@@ -84,12 +84,12 @@ function isWithinGrace(row: SectorRow): boolean {
 // out the covered sectors somebody is currently logged on as - which is what stops an enroute
 // controller taking an approach controller's sectors top-down while that controller is online.
 //
-// That staffing check deliberately lives on the client (PrimaryPosition.StaffedCoveredSectors) and
-// not here, even though `online` is right there. This server's view of who is online is the public
-// VATSIM data feed, cached, and it lags a logon or logoff by up to about a minute - long enough to
-// hand over somebody's airspace on the way in, and to withhold it on the way out. The plugin reads
-// vatSys's own live ATC list instead, which reflects both within seconds. Answering it here as well
-// would only add a second, slower opinion for the two sides to disagree over.
+// The client still sends fast, vatSys-live exclusions using PrimaryPosition.StaffedCoveredSectors.
+// This server also treats sectors already owned by a staffed child position inside the same claim
+// as "withheld", not conflicted. That protects against stale or incomplete client exclusions: an
+// enroute controller logging on over an already-online APP/TCU keeps the uncontested ENR sectors,
+// the APP/TCU keeps its sectors, and the client does not receive a 409 that would create a request
+// popup/error.
 async function claimGroup(
   client: pg.PoolClient,
   identity: ControllerIdentity,
