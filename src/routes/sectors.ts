@@ -97,11 +97,12 @@ async function claimGroup(
   online: Map<string, number> | null,
   exclusions: string[] = [],
   allOrNothing = false
-): Promise<{ claimed: string[]; skipped: string[]; conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }>; missing: boolean }> {
+): Promise<{ claimed: string[]; skipped: string[]; withheld: string[]; conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }>; missing: boolean }> {
   const rows = (await covered(client, name)).filter(row => !exclusions.includes(row.name));
-  if (rows.length === 0) return { claimed: [], skipped: [], conflicts: [], missing: true };
+  if (rows.length === 0) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: true };
   const takeable: SectorRow[] = [];
   const skipped: string[] = [];
+  const withheld: string[] = [];
   const conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }> = [];
   const primary = rows.find(row => row.name === name);
   const claimantIsNamedPrimary = primary?.callsign?.toUpperCase() === identity.callsign.toUpperCase();
@@ -126,6 +127,10 @@ async function claimGroup(
     }
     const ownerOnline = online?.get(row.controller_callsign?.toUpperCase() ?? "") === row.controller_cid;
     if (ownerOnline || isWithinGrace(row)) {
+      if (ownerHasPositionInThisClaim) {
+        withheld.push(row.name);
+        continue;
+      }
       skipped.push(row.name);
       conflicts.push({ sector: row.name, owner: { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } });
     }
@@ -137,12 +142,13 @@ async function claimGroup(
       action: "claim_blocked",
       sector: name,
       skipped,
+      withheld,
       conflicts,
       exclusions,
       overridden_top_down: overriddenTopDown,
       all_or_nothing: allOrNothing
     });
-    return { claimed: [], skipped, conflicts, missing: false };
+    return { claimed: [], skipped, withheld, conflicts, missing: false };
   }
 
   const previousOwners = takeable
@@ -157,12 +163,13 @@ async function claimGroup(
        last_seen_online_at=now(), updated_at=now()`, [row.id, identity.cid, identity.callsign]);
   }
 
-  if (takeable.length > 0 || skipped.length > 0 || exclusions.length > 0) {
-    await writeDiagnosticLog(client, identity, "ServerSector", `Claim ${name}: ${takeable.length} claimed, ${skipped.length} skipped`, {
+  if (takeable.length > 0 || skipped.length > 0 || withheld.length > 0 || exclusions.length > 0) {
+    await writeDiagnosticLog(client, identity, "ServerSector", `Claim ${name}: ${takeable.length} claimed, ${skipped.length} skipped, ${withheld.length} withheld`, {
       action: "claim",
       sector: name,
       claimed: takeable.map(row => row.name),
       skipped,
+      withheld,
       conflicts,
       exclusions,
       overridden_top_down: overriddenTopDown,
@@ -171,7 +178,7 @@ async function claimGroup(
     });
   }
 
-  return { claimed: takeable.map(row => row.name), skipped, conflicts, missing: false };
+  return { claimed: takeable.map(row => row.name), skipped, withheld, conflicts, missing: false };
 }
 
 async function requestsPayload(client: pg.Pool | pg.PoolClient, identity: ControllerIdentity) {
@@ -333,12 +340,12 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       // targets still share the id harmlessly - each target only ever sees their own rows, so each
       // still gets exactly one decision to make.
       const requestGroupId = randomUUID();
-      const result = { claimed: [] as string[], released: [] as string[], requested: [] as string[], skipped: [] as string[], failed: [] as string[] };
+      const result = { claimed: [] as string[], released: [] as string[], requested: [] as string[], skipped: [] as string[], withheld: [] as string[], failed: [] as string[] };
       for (const name of parsed.data.release) (await releaseGroup(client, request.controller, name) ? result.released : result.failed).push(name);
       const online = await onlineControllers();
       for (const name of parsed.data.claim) {
         const claimed = await claimGroup(client, request.controller, name, online, parsed.data.exclude);
-        if (claimed.missing) result.failed.push(name); else { result.claimed.push(...claimed.claimed); result.skipped.push(...claimed.skipped); }
+        if (claimed.missing) result.failed.push(name); else { result.claimed.push(...claimed.claimed); result.skipped.push(...claimed.skipped); result.withheld.push(...claimed.withheld); }
       }
       for (const name of parsed.data.request) {
         const sector = (await client.query(

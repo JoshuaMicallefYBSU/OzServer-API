@@ -71,7 +71,7 @@ export async function clientLogRoutes(app: FastifyInstance): Promise<void> {
             AND ($4::text IS NULL OR session_id = $4)
             AND ($5::text IS NULL OR context->>'sector' = $5 OR context->'sectors' ? $5
                  OR context->'claimed' ? $5 OR context->'released' ? $5 OR context->'requested' ? $5
-                 OR context->'skipped' ? $5 OR context->'transferred' ? $5)
+                 OR context->'skipped' ? $5 OR context->'withheld' ? $5 OR context->'transferred' ? $5)
             AND ($6::text IS NULL OR context->>'fdr_callsign' = $6 OR context->>'callsign' = $6)
             AND ($7::text IS NULL OR context->>'request_id' = $7 OR context->'request_ids' ? $7)
           ORDER BY logged_at, created_at, id
