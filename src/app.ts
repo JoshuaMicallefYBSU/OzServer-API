@@ -30,6 +30,23 @@ export async function buildApp() {
   }, { prefix: "/api/v1" });
   await app.register(async pluginApi => {
     pluginApi.addHook("preHandler", pluginAuth);
+    // Refreshes this controller's own presence on every authenticated call, not only the ones that
+    // touch sector_ownerships directly. This is what runMaintenance's disconnect sweep now ages a
+    // row against instead of VATSIM's public datafeed (see its own comment for why) - every
+    // connected client already calls this API every few seconds on its own polling regardless of
+    // what it's actually doing, which is a faster, purely internal presence signal than a
+    // third-party feed with its own separate publish lag in both directions. Runs before the route
+    // itself so it cannot be skipped by an early return, and is a no-op (0 rows matched) for a
+    // controller who owns nothing yet, so it's safe unconditionally.
+    pluginApi.addHook("preHandler", async request => {
+      try {
+        await pool.query(
+          "UPDATE sector_ownerships SET last_seen_online_at=now() WHERE controller_cid=$1 AND controller_callsign=$2",
+          [request.controller.cid, request.controller.callsign]);
+      } catch (error) {
+        app.log.warn(error, "Could not refresh controller heartbeat.");
+      }
+    });
     // One hook rather than a publish() call inside every handler. What a subscriber needs to know
     // is "something under this route group changed", which the route path already says, and a hook
     // cannot be forgotten the way a per-handler call can when a mutation route is added later.

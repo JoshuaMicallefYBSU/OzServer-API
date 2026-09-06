@@ -8,12 +8,8 @@ import {
   transferFlightsToCurrentSectorOwners
 } from "./grouping.js";
 import type { ControllerIdentity } from "./types.js";
-import { onlineControllers } from "./vatsim.js";
 
 export async function runMaintenance(): Promise<void> {
-  const online = await onlineControllers();
-  // A VATSIM outage must never be interpreted as every controller disconnecting.
-  if (online === null) return;
   const releasedAny = await transaction(async client => {
     let released = false;
     // Collected across every disconnected controller and handled after the loop: reassigning while
@@ -24,25 +20,23 @@ export async function runMaintenance(): Promise<void> {
     const owners = (await client.query(
       "SELECT DISTINCT controller_cid,controller_callsign FROM sector_ownerships")).rows;
     for (const owner of owners) {
-      if (online.get(owner.controller_callsign.toUpperCase()) === owner.controller_cid) {
-        await client.query(
-          "UPDATE sector_ownerships SET last_seen_online_at=now() WHERE controller_cid=$1 AND controller_callsign=$2",
-          [owner.controller_cid, owner.controller_callsign]);
-        continue;
-      }
       const identity = { cid: Number(owner.controller_cid), callsign: String(owner.controller_callsign) };
-      // Grace-gated, not immediate: the online map comes from the VATSIM public datafeed, which can
-      // lag a real connection by the better part of a minute (see PrimaryPosition.cs on the plugin
-      // side for the same lag, measured against the same feed). Dropping an online-lookup miss
-      // straight into this DELETE - as this briefly did - reads a controller who only just connected,
-      // and whose own claim has not appeared in the feed yet, as gone, and deletes the sectors they
-      // just claimed out from under them. last_seen_online_at is exactly the timestamp that already
-      // exists to guard against that: it is only ever refreshed while a controller IS found online
-      // (above), so a genuinely-present-but-not-yet-published controller still has a recent value to
-      // fall back on. Requiring it to be older than the grace window before deleting restores the
-      // tolerance every other consumer of this column already gets (annotations, below) without
-      // giving up the immediate reassignment this sweep now does for a controller who really has
-      // dropped.
+      // Aged against last_seen_online_at alone, not against VATSIM's public datafeed - this used to
+      // cross-check "is this callsign/cid pair listed online right now" against that feed before
+      // trusting the age of the row at all, refreshing it only on a match. That feed is a
+      // third-party's own view, fetched here through a 15s cache stacked on top of VATSIM's own
+      // publish interval, and it lags a real connection in BOTH directions: slow to show an arrival
+      // (a controller who had just claimed sectors could look entirely absent from it, and lose
+      // those sectors to this very sweep before the feed ever caught up) and no faster to show a
+      // departure than this grace window already is on its own.
+      //
+      // last_seen_online_at is refreshed on every authenticated request a controller's own client
+      // makes - see the heartbeat hook in app.ts - which every connected client already does every
+      // couple of seconds regardless of what it's doing, independent of any outside feed's own
+      // schedule. That is a strictly faster and more direct "are they still here" signal than
+      // anything a third party can report about a connection this server isn't even part of, and it
+      // is entirely this plugin's and this server's own doing - nothing external to keep in sync
+      // with, and no separate "the feed itself is down" case to special-case around.
       const removed = await client.query<{ sector_id: string; name: string }>(
         `WITH deleted AS (
            DELETE FROM sector_ownerships

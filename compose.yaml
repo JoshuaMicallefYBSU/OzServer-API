@@ -16,12 +16,14 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:3000:3000"
-    # The API needs outbound internet: status.vatsim.net and data.vatsim.net for the maintenance
-    # loop's online-controller check, raw.githubusercontent.com for dataset:sync. On an
-    # internal-only network those fetches fail silently - getJson() swallows the error, so
-    # onlineControllers() returns null, which maintenance.ts reads as a VATSIM outage and skips
-    # the sweep, meaning sector ownerships would never expire after a disconnect. postgres is
-    # deliberately left off this network: it stays reachable only from `internal`.
+    # The API needs outbound internet: status.vatsim.net and data.vatsim.net for claimGroup's
+    # staffed-conflict check (whether a covered sub-sector's default owner - who may not even be
+    # running this plugin - is online), and raw.githubusercontent.com for dataset:sync. The
+    # maintenance loop's disconnect sweep does NOT depend on this egress any more: it ages
+    # sector_ownerships purely off last_seen_online_at, refreshed by every controller's own
+    # authenticated request (see app.ts's heartbeat hook) rather than by cross-checking a feed that
+    # lags a real connection by tens of seconds in both directions. postgres is deliberately left
+    # off this network: it stays reachable only from `internal`.
     networks: [egress, internal]
 
   postgres:
