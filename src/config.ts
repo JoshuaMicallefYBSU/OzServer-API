@@ -14,15 +14,15 @@ const schema = z.object({
   // How long without a request from a controller's own client before claimGroup stops treating
   // their sector_ownerships row as still actively held, for the purpose of letting someone ELSE
   // claim it outright. As close to instant as is actually safe, not a moment longer: the plugin's
-  // idle poll (OzServerOwnershipTracker.PollInterval) is every 10s, so anything at or below that
+  // idle poll (OzServerOwnershipTracker.PollInterval) is every 3s, so anything at or below that
   // would let a claim snipe a genuinely-connected, idle controller's sector just because their own
-  // poll happened to land a little late - a worse bug than the one this fixes. 15s is that 10s
-  // floor plus a small margin for network jitter or one slow response, nothing more. A controller
-  // who actually crashed or dropped should not keep a sector another controller wants to pick up
-  // right now locked to them for the full DISCONNECT_GRACE_MINUTES - that window exists to
-  // eventually hand an unclaimed sector to a covering parent and to protect resume, not to block a
-  // direct claim.
-  PRESENCE_TIMEOUT_SECONDS: z.coerce.number().positive().default(15),
+  // poll happened to land a little late - a worse bug than the one this fixes. 6s is that 3s floor
+  // doubled for network jitter or one slow response, nothing more - keep this at roughly 2x
+  // PollInterval if that ever changes again. A controller who actually crashed or dropped should
+  // not keep a sector another controller wants to pick up right now locked to them for the full
+  // DISCONNECT_GRACE_MINUTES - that window exists to eventually hand an unclaimed sector to a
+  // covering parent and to protect resume, not to block a direct claim.
+  PRESENCE_TIMEOUT_SECONDS: z.coerce.number().positive().default(6),
   RESUME_WINDOW_MINUTES: z.coerce.number().positive().default(5),
   FDR_RETAIN_MINUTES: z.coerce.number().positive().default(15),
   ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(90)
