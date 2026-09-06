@@ -14,7 +14,7 @@ export async function runMaintenance(): Promise<void> {
   // See presence.ts: skip the disconnect sweep entirely until this process has been up for a full
   // grace window, so a restart of this server is never read as every controller disconnecting at
   // once - every real client gets that same window to make a request and refresh its own row first.
-  const withinStartupGrace = isWithinStartupGrace();
+  const withinStartupGrace = isWithinStartupGrace(config.DISCONNECT_GRACE_MINUTES * 60_000);
   const releasedAny = await transaction(async client => {
     let released = false;
     // Collected across every disconnected controller and handled after the loop: reassigning while

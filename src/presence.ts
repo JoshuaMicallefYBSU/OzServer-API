@@ -1,5 +1,3 @@
-import { config } from "./config.js";
-
 // When this process started. Every check that ages a row against last_seen_online_at needs this,
 // because that column can only ever be refreshed by a request actually reaching this process (the
 // heartbeat hook in app.ts, and the claim/accept/resume/request-accept handlers it backs up) - so
@@ -11,15 +9,24 @@ import { config } from "./config.js";
 // needs this instead.
 const startedAt = Date.now();
 
-// True until this process has been up for one full disconnect-grace window. Every place that would
-// otherwise treat a stale-looking last_seen_online_at as "gone" - runMaintenance's disconnect sweep,
-// and claimGroup's staffed-conflict check - has to also ask this first, and treat "we can't tell
-// yet" the same as "still there": the alternative is a mass sector release, or a claim taking
-// someone's sector out from under them, triggered by an outage of *this server's*, not a disconnect
-// of theirs. A normal deploy's downtime is seconds (the VPS's own rollout is health-check gated), so
-// this costs nothing in the ordinary case; a row that was genuinely stale before the outage still
-// gets exactly DISCONNECT_GRACE_MINUTES; it is just measured from whenever this process actually
+// True until this process has been up for one full `windowMs`. Every place that would otherwise
+// treat a stale-looking last_seen_online_at as "gone" - runMaintenance's disconnect sweep, and
+// claimGroup's presence check - has to also ask this first, passing its OWN threshold, and treat
+// "we can't tell yet" the same as "still there": the alternative is a mass sector release, or a
+// claim taking someone's sector out from under them, triggered by an outage of *this server's*, not
+// a disconnect of theirs.
+//
+// The window has to match whatever threshold the caller is about to apply, not one fixed value for
+// everyone: passing DISCONNECT_GRACE_MINUTES here unconditionally - as this once did - meant
+// claimGroup's own, much shorter PRESENCE_TIMEOUT_SECONDS was overridden by this for the full five
+// minutes after every single restart, silently reverting fast claim-takeover to the old
+// wait-out-the-full-grace behaviour it was built to replace, on every deploy. A live test against a
+// freshly-restarted instance is exactly what caught this - it looked correct by inspection alone.
+//
+// A normal deploy's downtime is seconds (the VPS's own rollout is health-check gated), so this
+// costs nothing in the ordinary case either way; a row that was genuinely stale before the outage
+// still gets exactly its caller's usual window, just measured from whenever this process actually
 // came back up able to observe it, rather than from whenever its owner actually left.
-export function isWithinStartupGrace(): boolean {
-  return Date.now() - startedAt < config.DISCONNECT_GRACE_MINUTES * 60_000;
+export function isWithinStartupGrace(windowMs: number): boolean {
+  return Date.now() - startedAt < windowMs;
 }

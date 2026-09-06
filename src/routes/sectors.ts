@@ -90,7 +90,14 @@ function isPresent(row: SectorRow): boolean {
   // that as "gone" here would let a claim take a still-connected controller's sector away because
   // of an outage of ours, not a disconnect of theirs - so during that window this always answers as
   // if the owner were present, the same way runMaintenance holds off deleting their row at all.
-  if (isWithinStartupGrace()) return true;
+  //
+  // Passed PRESENCE_TIMEOUT_SECONDS here, deliberately not DISCONNECT_GRACE_MINUTES: this check
+  // runs on the same few-second timescale it always does, so it only needs enough startup grace for
+  // one real poll cycle to land, not the full five minutes runMaintenance's own, much slower sweep
+  // needs. Passing the longer window here once silently overrode fast claim-takeover back to a
+  // five-minute wait for the first five minutes after every restart - caught by actually running
+  // this against a freshly-started instance, not by reading the code.
+  if (isWithinStartupGrace(config.PRESENCE_TIMEOUT_SECONDS * 1000)) return true;
   return row.last_seen_online_at !== null
     && Date.now() - new Date(row.last_seen_online_at).getTime() < config.PRESENCE_TIMEOUT_SECONDS * 1000;
 }
