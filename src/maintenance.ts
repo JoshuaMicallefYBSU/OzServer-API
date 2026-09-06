@@ -31,16 +31,29 @@ export async function runMaintenance(): Promise<void> {
         continue;
       }
       const identity = { cid: Number(owner.controller_cid), callsign: String(owner.controller_callsign) };
+      // Grace-gated, not immediate: the online map comes from the VATSIM public datafeed, which can
+      // lag a real connection by the better part of a minute (see PrimaryPosition.cs on the plugin
+      // side for the same lag, measured against the same feed). Dropping an online-lookup miss
+      // straight into this DELETE - as this briefly did - reads a controller who only just connected,
+      // and whose own claim has not appeared in the feed yet, as gone, and deletes the sectors they
+      // just claimed out from under them. last_seen_online_at is exactly the timestamp that already
+      // exists to guard against that: it is only ever refreshed while a controller IS found online
+      // (above), so a genuinely-present-but-not-yet-published controller still has a recent value to
+      // fall back on. Requiring it to be older than the grace window before deleting restores the
+      // tolerance every other consumer of this column already gets (annotations, below) without
+      // giving up the immediate reassignment this sweep now does for a controller who really has
+      // dropped.
       const removed = await client.query<{ sector_id: string; name: string }>(
         `WITH deleted AS (
            DELETE FROM sector_ownerships
             WHERE controller_cid=$1 AND controller_callsign=$2
+              AND last_seen_online_at <= now()-($3*interval '1 minute')
           RETURNING sector_id
          )
          SELECT d.sector_id,s.name
            FROM deleted d
            JOIN sectors s ON s.id=d.sector_id`,
-        [identity.cid, identity.callsign]);
+        [identity.cid, identity.callsign, config.DISCONNECT_GRACE_MINUTES]);
       if (!removed.rowCount) continue;
       released = true;
       freed.push(...removed.rows.map(row => row.sector_id));
