@@ -5,6 +5,7 @@ import { z } from "zod";
 import { config } from "../config.js";
 import { writeDiagnosticLog } from "../diagnostics.js";
 import { pool, transaction } from "../db.js";
+import { isWithinStartupGrace } from "../presence.js";
 import {
   clearFlightsWithoutCurrentSectorOwner,
   reassignFreedSectors,
@@ -12,7 +13,6 @@ import {
   transferFlightsToCurrentSectorOwners
 } from "../grouping.js";
 import type { ControllerIdentity } from "../types.js";
-import { onlineControllers } from "../vatsim.js";
 
 type SectorRow = {
   id: string; name: string; full_name: string; callsign: string | null;
@@ -76,9 +76,23 @@ async function covered(client: pg.PoolClient, name: string): Promise<SectorRow[]
     [[...names]])).rows;
 }
 
-function isWithinGrace(row: SectorRow): boolean {
+// Whether this row's owner is still actively connected, for the narrow purpose of deciding whether
+// a DIFFERENT controller may claim their sector outright right now. Deliberately measured in
+// PRESENCE_TIMEOUT_SECONDS, not DISCONNECT_GRACE_MINUTES: those answer different questions. This
+// one is "is anyone actively there to object", and it has to be short - a controller whose
+// connection just dropped should not keep a sector another controller wants locked to them for
+// minutes on end. DISCONNECT_GRACE_MINUTES answers a slower, different question for a sector
+// nobody has stepped up to claim at all - runMaintenance still uses that one to eventually hand an
+// unclaimed sector to a covering parent position, and it is untouched by this.
+function isPresent(row: SectorRow): boolean {
+  // See presence.ts: right after this process starts, every row looks exactly as stale as this
+  // process's own downtime was long, regardless of whether its owner ever actually left. Treating
+  // that as "gone" here would let a claim take a still-connected controller's sector away because
+  // of an outage of ours, not a disconnect of theirs - so during that window this always answers as
+  // if the owner were present, the same way runMaintenance holds off deleting their row at all.
+  if (isWithinStartupGrace()) return true;
   return row.last_seen_online_at !== null
-    && Date.now() - new Date(row.last_seen_online_at).getTime() < config.DISCONNECT_GRACE_MINUTES * 60_000;
+    && Date.now() - new Date(row.last_seen_online_at).getTime() < config.PRESENCE_TIMEOUT_SECONDS * 1000;
 }
 
 // exclusions are sectors the claimer has asked to be left out of the expansion entirely - not
@@ -91,18 +105,27 @@ function isWithinGrace(row: SectorRow): boolean {
 //
 // The client still sends fast, vatSys-live exclusions using PrimaryPosition.StaffedCoveredSectors.
 // This server also treats sectors already owned by a staffed child position inside the same claim
-// as "withheld", not conflicted, while that child controller is actually online. That protects
-// against stale or incomplete client exclusions: an
-// enroute controller logging on over an already-online APP/TCU keeps the uncontested ENR sectors,
-// the APP/TCU keeps its sectors, and the client does not receive a 409 that would create a request
-// popup/error. Once the child drops offline, a parent/primary claim may take the sector immediately
-// rather than waiting out disconnect grace; otherwise tags/strips can be left with nobody able to
-// work them.
+// as "withheld", not conflicted, while that child controller is still actively present (isPresent,
+// below) - not, as this used to also require, confirmed online through VATSIM's public datafeed.
+// That extra confirmation was never needed for this specific case: the child position is in
+// sector_ownerships because it claimed through this same plugin, and last_seen_online_at is kept
+// current by every request that plugin makes, refreshed the instant they claimed and continuously
+// afterwards - a strictly faster and more direct signal than a third-party feed with its own publish
+// lag could ever be for a controller this server already has a direct relationship with. This still
+// protects against stale or incomplete client exclusions: an enroute controller logging on over an
+// already-online APP/TCU keeps the uncontested ENR sectors, the APP/TCU keeps its sectors, and the
+// client does not receive a 409 that would create a request popup/error.
+//
+// isPresent's own window (PRESENCE_TIMEOUT_SECONDS) is short, not DISCONNECT_GRACE_MINUTES: once
+// the child controller's connection actually drops, a parent/primary claim - or any other direct
+// claim - may take the sector back within seconds, not minutes. A dropped connection is not a
+// reservation; the slower DISCONNECT_GRACE_MINUTES window still applies afterwards, but only to the
+// separate question of when runMaintenance eventually hands an unclaimed sector to a covering
+// parent on its own, for whenever nobody claims it directly at all.
 async function claimGroup(
   client: pg.PoolClient,
   identity: ControllerIdentity,
   name: string,
-  online: Map<string, number> | null,
   exclusions: string[] = [],
   allOrNothing = false
 ): Promise<{ claimed: string[]; skipped: string[]; withheld: string[]; conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }>; missing: boolean }> {
@@ -133,16 +156,21 @@ async function claimGroup(
       overriddenTopDown.push({ sector: row.name, owner: { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } });
       continue;
     }
-    const ownerOnline = online?.get(row.controller_callsign?.toUpperCase() ?? "") === row.controller_cid;
-    if (ownerOnline) {
+    // last_seen_online_at alone answers whether this row's owner is still actively present - see
+    // isPresent. This used to be a fallback, only consulted when the VATSIM public datafeed didn't
+    // already confirm the owner online, and gated on the much longer DISCONNECT_GRACE_MINUTES; both
+    // are gone now (see flights.ts and maintenance.ts for the same datafeed change, and why isPresent
+    // for its own reasoning on the shorter window). A controller's connection dropping should not
+    // lock their sector to them for minutes on end against someone who wants to claim it right now -
+    // sector_ownerships keeps the row around, and TagResumeRecovery/PrimaryPosition's own claim on
+    // reconnect naturally picks it back up if nobody else has taken it in the meantime, but nothing
+    // here should make another controller wait out a reservation to take over a sector that isn't
+    // actively being worked any more.
+    if (isPresent(row)) {
       if (ownerHasPositionInThisClaim) {
         withheld.push(row.name);
         continue;
       }
-      skipped.push(row.name);
-      conflicts.push({ sector: row.name, owner: { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } });
-    }
-    else if (isWithinGrace(row) && !ownerHasPositionInThisClaim) {
       skipped.push(row.name);
       conflicts.push({ sector: row.name, owner: { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } });
     }
@@ -311,7 +339,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { name: string }; Body: { exclude?: string[] } }>("/sectors/:name/claim", async (request, reply) => {
     const result = await transaction(async client => {
       await lockMutations(client);
-      return claimGroup(client, request.controller, request.params.name, await onlineControllers(), request.body?.exclude ?? [], true);
+      return claimGroup(client, request.controller, request.params.name, request.body?.exclude ?? [], true);
     });
     if (result.missing) return reply.code(404).send({ message: "Sector not found." });
     if (result.skipped.length) return reply.code(409).send({ message: "Some of these sectors are already owned.", conflicts: result.conflicts });
@@ -359,9 +387,8 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       const requestGroupId = randomUUID();
       const result = { claimed: [] as string[], released: [] as string[], requested: [] as string[], skipped: [] as string[], withheld: [] as string[], failed: [] as string[] };
       for (const name of parsed.data.release) (await releaseGroup(client, request.controller, name) ? result.released : result.failed).push(name);
-      const online = await onlineControllers();
       for (const name of parsed.data.claim) {
-        const claimed = await claimGroup(client, request.controller, name, online, parsed.data.exclude);
+        const claimed = await claimGroup(client, request.controller, name, parsed.data.exclude);
         if (claimed.missing) result.failed.push(name); else { result.claimed.push(...claimed.claimed); result.skipped.push(...claimed.skipped); result.withheld.push(...claimed.withheld); }
       }
       for (const name of parsed.data.request) {

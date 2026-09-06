@@ -7,9 +7,14 @@ import {
   reassignFreedSectors,
   transferFlightsToCurrentSectorOwners
 } from "./grouping.js";
+import { isWithinStartupGrace } from "./presence.js";
 import type { ControllerIdentity } from "./types.js";
 
 export async function runMaintenance(): Promise<void> {
+  // See presence.ts: skip the disconnect sweep entirely until this process has been up for a full
+  // grace window, so a restart of this server is never read as every controller disconnecting at
+  // once - every real client gets that same window to make a request and refresh its own row first.
+  const withinStartupGrace = isWithinStartupGrace();
   const releasedAny = await transaction(async client => {
     let released = false;
     // Collected across every disconnected controller and handled after the loop: reassigning while
@@ -17,7 +22,7 @@ export async function runMaintenance(): Promise<void> {
     // iteration later, found to have dropped off as well.
     const freed: string[] = [];
     const droppedOwners: Array<ControllerIdentity & { released_sectors: string[]; released_sector_ids: string[] }> = [];
-    const owners = (await client.query(
+    const owners = withinStartupGrace ? [] : (await client.query(
       "SELECT DISTINCT controller_cid,controller_callsign FROM sector_ownerships")).rows;
     for (const owner of owners) {
       const identity = { cid: Number(owner.controller_cid), callsign: String(owner.controller_callsign) };
