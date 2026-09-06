@@ -270,13 +270,14 @@ async function releaseGroup(client: pg.PoolClient, identity: ControllerIdentity,
   const rows = await covered(client, name);
   const primary = rows.find(row => row.name === name);
   if (!primary || primary.controller_cid !== identity.cid) return false;
-  const ids = rows.map(row => row.id);
-  await client.query("DELETE FROM sector_ownerships WHERE sector_id=ANY($1) AND controller_cid=$2", [ids, identity.cid]);
-  await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND rejected_at IS NULL", [primary.id]);
+  const released = rows.filter(row => row.controller_cid === identity.cid);
+  const releasedIds = released.map(row => row.id);
+  await client.query("DELETE FROM sector_ownerships WHERE sector_id=ANY($1) AND controller_cid=$2", [releasedIds, identity.cid]);
+  await client.query("DELETE FROM sector_requests WHERE sector_id=ANY($1) AND rejected_at IS NULL", [releasedIds]);
   await writeDiagnosticLog(client, identity, "ServerSector", `Released ${name}`, {
     action: "release",
     sector: name,
-    released: rows.filter(row => row.controller_cid === identity.cid).map(row => row.name)
+    released: released.map(row => row.name)
   });
   return true;
 }
@@ -320,9 +321,12 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
   // the previous controller is still online somewhere else.
   const transferredFlights = (await client.query(
     `UPDATE flight_data_records SET controlling_cid=$2,controlling_callsign=$3
-      WHERE current_sector = ANY($1) AND controlling_cid IS NOT NULL AND controlling_cid <> $2
+      WHERE current_sector = ANY($1)
+        AND controlling_cid=$4
+        AND controlling_callsign IS NOT DISTINCT FROM $5
+        AND (controlling_cid IS DISTINCT FROM $2 OR controlling_callsign IS DISTINCT FROM $3)
       RETURNING callsign`,
-    [rows.map(row => row.name), request.requesting_cid, request.requesting_callsign])).rows.map(row => row.callsign);
+    [rows.map(row => row.name), request.requesting_cid, request.requesting_callsign, identity.cid, identity.callsign])).rows.map(row => row.callsign);
 
   await writeDiagnosticLog(client, identity, "ServerSector", `Accepted request #${id} for ${request.name}`, {
     action: "request_accept",
@@ -403,11 +407,11 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
           `SELECT s.id,o.controller_cid,o.controller_callsign FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name=$1`, [name])).rows[0];
         if (!sector || sector.controller_cid === request.controller.cid) { result.failed.push(name); continue; }
         await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid]);
-        await client.query(
+        const inserted = await client.query(
           `INSERT INTO sector_requests (sector_id,requesting_cid,requesting_callsign,target_cid,target_callsign,group_id)
            VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (sector_id,requesting_cid) DO NOTHING RETURNING id`,
           [sector.id, request.controller.cid, request.controller.callsign, sector.controller_cid, sector.controller_callsign, requestGroupId]);
-        result.requested.push(name);
+        (inserted.rows[0] ? result.requested : result.failed).push(name);
       }
       await writeDiagnosticLog(client, request.controller, "ServerSector", "Committed sector changes", {
         action: "commit",

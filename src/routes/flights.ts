@@ -11,6 +11,10 @@ const flightSchema = z.object({
   current_sector: z.string().max(32).nullable().optional()
 }).passthrough();
 
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: ControllerIdentity) {
   return transaction(async client => {
     const cidsWithSectors = new Set((await client.query("SELECT DISTINCT controller_cid FROM sector_ownerships")).rows.map(row => row.controller_cid));
@@ -21,7 +25,22 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
     for (const flight of flights) {
       const existing = (await client.query(
         "SELECT controlling_cid,controlling_callsign,current_sector,data FROM flight_data_records WHERE callsign=$1 FOR UPDATE", [flight.callsign])).rows[0];
-      const updateSector = flight.current_sector ?? existing?.current_sector ?? null;
+
+      // Optional means "this partial push did not know", not "clear the existing value". Explicit
+      // null still clears. FdrSync deliberately omits current_sector when SectorLocator cannot
+      // resolve one, so treating omission as null erased the last good sector and broke the resume
+      // and reassignment decisions that depend on it.
+      const controlling_cid = hasOwn(flight, "controlling_cid")
+        ? flight.controlling_cid ?? null
+        : existing?.controlling_cid ?? null;
+      const controlling_callsign = hasOwn(flight, "controlling_callsign")
+        ? flight.controlling_callsign ?? null
+        : existing?.controlling_callsign ?? null;
+      const current_sector = hasOwn(flight, "current_sector")
+        ? flight.current_sector ?? null
+        : existing?.current_sector ?? null;
+
+      const updateSector = current_sector;
       const callerOwnsCurrentSector = updateSector != null && callerOwnedSectors.has(updateSector);
       // Whether the recorded authority is still worth protecting is answered entirely from our own
       // sector_ownerships bookkeeping (cidsWithSectors) - not, as this used to also require, from
@@ -68,8 +87,15 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
         results.push({ callsign: flight.callsign, updated: false });
         continue;
       }
-      const { callsign, controlling_cid = null, controlling_callsign = null, current_sector = null,
-        controller_cid: _callerCid, controller_callsign: _callerCallsign, ...data } = flight;
+      const callsign = flight.callsign;
+      const data: Record<string, unknown> = { ...flight };
+      delete data.callsign;
+      delete data.controlling_cid;
+      delete data.controlling_callsign;
+      delete data.current_sector;
+      delete data.controller_cid;
+      delete data.controller_callsign;
+
       const previousData = existing?.data ?? {};
       const previousState = previousData.state ?? null;
       const nextState = data.state ?? previousState;
