@@ -23,6 +23,11 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     [config.FDR_RETAIN_MINUTES])).rows.map(row => ({ ...row.data, callsign: row.callsign,
       controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
       current_sector: row.current_sector, last_seen_at: row.last_seen_at })));
+  // Every sector's static geometry, regardless of staffing - unlike /map/sectors (staffed-only, with
+  // live ownership/online status), this is what the website's home page decorative map needs: every
+  // sector's shape whether or not anyone currently holds it.
+  app.get("/map/sector-shapes", async () => (await pool.query(
+    "SELECT name,full_name,type,callsign,responsible_sectors,boundary FROM sectors ORDER BY name")).rows);
   app.get("/map/atis", async () => (await pool.query(
     `SELECT a.*,p.default_lat AS lat,p.default_lon AS lon FROM atis_broadcasts a JOIN positions p ON p.asmgcs_airport=a.icao
       WHERE a.last_seen_at >= now()-($1*interval '1 minute')`, [config.ATIS_RETAIN_MINUTES])).rows);

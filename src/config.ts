@@ -25,7 +25,7 @@ const schema = z.object({
   PRESENCE_TIMEOUT_SECONDS: z.coerce.number().positive().default(6),
   RESUME_WINDOW_MINUTES: z.coerce.number().positive().default(5),
   FDR_RETAIN_MINUTES: z.coerce.number().positive().default(15),
-  ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(90)
+  ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(60)
 });
 
 export const config = schema.parse(process.env);
