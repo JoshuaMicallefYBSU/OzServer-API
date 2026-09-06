@@ -3,7 +3,6 @@ import { z } from "zod";
 import { writeDiagnosticLog } from "../diagnostics.js";
 import { pool, transaction } from "../db.js";
 import type { ControllerIdentity } from "../types.js";
-import { onlineControllers } from "../vatsim.js";
 
 const flightSchema = z.object({
   callsign: z.string().trim().min(1).max(20),
@@ -13,7 +12,6 @@ const flightSchema = z.object({
 }).passthrough();
 
 async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: ControllerIdentity) {
-  const online = await onlineControllers();
   return transaction(async client => {
     const cidsWithSectors = new Set((await client.query("SELECT DISTINCT controller_cid FROM sector_ownerships")).rows.map(row => row.controller_cid));
     const callerOwnedSectors = new Set((await client.query(
@@ -25,14 +23,41 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
         "SELECT controlling_cid,controlling_callsign,current_sector,data FROM flight_data_records WHERE callsign=$1 FOR UPDATE", [flight.callsign])).rows[0];
       const updateSector = flight.current_sector ?? existing?.current_sector ?? null;
       const callerOwnsCurrentSector = updateSector != null && callerOwnedSectors.has(updateSector);
+      // Whether the recorded authority is still worth protecting is answered entirely from our own
+      // sector_ownerships bookkeeping (cidsWithSectors) - not, as this used to also require, from
+      // the live VATSIM datafeed. That extra check was a second, independent lag source stacked on
+      // top of a race that only needs seconds to matter:
+      //
+      // FdrSync queues a DTO the instant a give-away starts (OnFdrUpdate sees IsTrackedByMe still
+      // true for the brief window between MMI.HandoffJurisdiction and the handoff PDU actually being
+      // accepted), stamped with the giving controller's own identity - see FillAuthority. Nothing
+      // ever revisits that queued DTO before it goes out on the next flush tick (every subsequent
+      // update for that callsign is skipped by ShouldPush once IsTrackedByMe flips false), so every
+      // ordinary give-away sends the giver's own stale self-authority claim 0-5 seconds later,
+      // whether or not this rejection guard is even watching for it.
+      //
+      // Whether that stale claim lands harmlessly or clobbers the new authority used to depend on
+      // whether online.get(existingCallsign) had caught up to the *new* authority yet - and the
+      // public VATSIM datafeed, refreshed here through a 15s cache on top of VATSIM's own publish
+      // interval, routinely takes tens of seconds to list a connection that only just claimed. A
+      // transfer to a controller who had been online under a minute - exactly a claim-then-immediate
+      // handoff, the ordinary shape of testing this - reliably lost the race: RCL14's authority
+      // handed to BN-INL_CTR at :38 was silently overwritten by BN-MNN_CTR's stale give-away push at
+      // :42, because online.get("BN-INL_CTR") still came back empty at that point despite BN-INL_CTR
+      // being genuinely, currently connected and owning the sector outright.
+      //
+      // sector_ownerships has no such lag: last_seen_online_at is written by our own claim/accept/
+      // resume/request-accept handlers the moment they run, not by an external feed on its own
+      // schedule, so cidsWithSectors reflects a claim within the same request that made it - and it
+      // is already grace-gated against a real drop by runMaintenance's disconnect sweep. Nothing
+      // this guard actually needs was unique to the datafeed check; it only added a way to fail.
       if (existing?.controlling_cid && existing.controlling_cid !== identity.cid
         && cidsWithSectors.has(existing.controlling_cid)
-        && online?.get(existing.controlling_callsign?.toUpperCase()) === existing.controlling_cid
         && !callerOwnsCurrentSector) {
         await writeDiagnosticLog(client, identity, "ServerFDR", `Rejected ${flight.callsign} update; authority is still ${existing.controlling_callsign}`, {
           action: "fdr_update_rejected",
           fdr_callsign: flight.callsign,
-          reason: "existing_authority_online",
+          reason: "existing_authority_holds_sectors",
           existing_authority: { cid: existing.controlling_cid, callsign: existing.controlling_callsign },
           attempted_authority: { cid: flight.controlling_cid ?? null, callsign: flight.controlling_callsign ?? null },
           attempted_state: flight.state ?? null,
