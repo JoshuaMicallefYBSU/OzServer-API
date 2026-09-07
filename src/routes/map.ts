@@ -72,12 +72,21 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
 
     // A sweatbox/localhost connection never appears on VATSIM's real public datafeed, so for
     // anything but `live` this reads straight from our own ownership ledger instead - the only
-    // record of who is actually staffing what on those 3 servers. Same response shape as the live
+    // record of who is actually staffing what on those servers. Same response shape as the live
     // branch below, so the website's rendering code needs no changes, only its fetch URL.
+    //
+    // One row per CONTROLLER, not per sector they own: a controller who claimed a group (e.g. KPL
+    // owning 5 sectors) has one sector_ownerships row per covered sub-sector, but should show up
+    // once, on their own primary frequency - exactly what the live branch below already does by
+    // matching a connected controller's own callsign to a sector. Matching `s.callsign =
+    // o.controller_callsign` is the same rule applied to the ownership table instead of the VATSIM
+    // datafeed: only the one sector whose own callsign IS this controller's callsign - their "home"
+    // position - contributes a row.
     if (server !== "live") {
       const rows = (await pool.query(
         `SELECT s.name AS sector_name, s.type, s.frequency, o.controller_cid AS cid, o.controller_callsign AS callsign
-           FROM sector_ownerships o JOIN sectors s ON s.id=o.sector_id WHERE o.server=$1`, [server])).rows;
+           FROM sector_ownerships o JOIN sectors s ON s.id=o.sector_id
+          WHERE o.server=$1 AND s.callsign=o.controller_callsign`, [server])).rows;
       return rows.map(row => ({
         cid: row.cid, callsign: row.callsign,
         frequencies: row.frequency ? [Number(row.frequency)] : [],

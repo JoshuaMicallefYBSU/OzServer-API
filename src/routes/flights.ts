@@ -154,4 +154,17 @@ export async function flightRoutes(app: FastifyInstance): Promise<void> {
        FROM flight_data_records WHERE server=$1 ORDER BY callsign`, [request.controller.server])).rows.map(row => ({ ...row.data, callsign: row.callsign,
          controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
          current_sector: row.current_sector, last_seen_at: row.last_seen_at })));
+  // One flight's current record - for a client that just gained jurisdiction over a tag (a sector
+  // transfer) and needs the clearance data (CFL in particular) the previous controller had already
+  // entered, which nothing about accepting jurisdiction itself carries: MMI.AcceptJurisdiction only
+  // ever moves who is tracking the tag, never any of vatSys's own local FDR fields.
+  app.get<{ Params: { callsign: string } }>("/fdr/:callsign", async (request, reply) => {
+    const row = (await pool.query(
+      `SELECT callsign,controlling_cid,controlling_callsign,current_sector,last_seen_at,data
+         FROM flight_data_records WHERE server=$1 AND callsign=$2`,
+      [request.controller.server, request.params.callsign])).rows[0];
+    if (!row) return reply.code(404).send({ message: "No record for this callsign." });
+    return { ...row.data, callsign: row.callsign, controlling_cid: row.controlling_cid,
+      controlling_callsign: row.controlling_callsign, current_sector: row.current_sector, last_seen_at: row.last_seen_at };
+  });
 }
