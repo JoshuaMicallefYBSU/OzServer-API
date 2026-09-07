@@ -15,17 +15,21 @@ export async function runMaintenance(): Promise<void> {
   // grace window, so a restart of this server is never read as every controller disconnecting at
   // once - every real client gets that same window to make a request and refresh its own row first.
   const withinStartupGrace = isWithinStartupGrace(config.DISCONNECT_GRACE_MINUTES * 60_000);
-  const releasedAny = await transaction(async client => {
-    let released = false;
-    // Collected across every disconnected controller and handled after the loop: reassigning while
-    // other rows are still being deleted could hand a sub-sector to a controller who is, one
-    // iteration later, found to have dropped off as well.
-    const freed: string[] = [];
+  const affectedServers = await transaction(async client => {
+    // Grouped by server, not pooled into one flat list: ownership is now per-server, a single
+    // sweep pass can span multiple servers' disconnects at once, and reassignFreedSectors needs to
+    // know which server's sector_ownerships to search for each freed id - a reassignment must
+    // never cross servers.
+    const freedByServer = new Map<string, string[]>();
     const droppedOwners: Array<ControllerIdentity & { released_sectors: string[]; released_sector_ids: string[] }> = [];
     const owners = withinStartupGrace ? [] : (await client.query(
-      "SELECT DISTINCT controller_cid,controller_callsign FROM sector_ownerships")).rows;
+      "SELECT DISTINCT controller_cid,controller_callsign,server FROM sector_ownerships")).rows;
     for (const owner of owners) {
-      const identity = { cid: Number(owner.controller_cid), callsign: String(owner.controller_callsign) };
+      const identity = {
+        cid: Number(owner.controller_cid),
+        callsign: String(owner.controller_callsign),
+        server: String(owner.server)
+      } as ControllerIdentity;
       // Aged against last_seen_online_at alone, not against VATSIM's public datafeed - this used to
       // cross-check "is this callsign/cid pair listed online right now" against that feed before
       // trusting the age of the row at all, refreshing it only on a match. That feed is a
@@ -45,28 +49,34 @@ export async function runMaintenance(): Promise<void> {
       const removed = await client.query<{ sector_id: string; name: string }>(
         `WITH deleted AS (
            DELETE FROM sector_ownerships
-            WHERE controller_cid=$1 AND controller_callsign=$2
+            WHERE controller_cid=$1 AND controller_callsign=$2 AND server=$4
               AND last_seen_online_at <= now()-($3*interval '1 minute')
           RETURNING sector_id
          )
          SELECT d.sector_id,s.name
            FROM deleted d
            JOIN sectors s ON s.id=d.sector_id`,
-        [identity.cid, identity.callsign, config.DISCONNECT_GRACE_MINUTES]);
+        [identity.cid, identity.callsign, config.DISCONNECT_GRACE_MINUTES, identity.server]);
       if (!removed.rowCount) continue;
-      released = true;
+      const freed = freedByServer.get(identity.server) ?? [];
       freed.push(...removed.rows.map(row => row.sector_id));
+      freedByServer.set(identity.server, freed);
       droppedOwners.push({
         ...identity,
         released_sectors: removed.rows.map(row => row.name),
         released_sector_ids: removed.rows.map(row => row.sector_id)
       });
-      await client.query("DELETE FROM sector_requests WHERE sector_id=ANY($1) OR requesting_cid=$2 OR target_cid=$2",
-        [removed.rows.map(row => row.sector_id), identity.cid]);
+      await client.query(
+        "DELETE FROM sector_requests WHERE (sector_id=ANY($1) OR requesting_cid=$2 OR target_cid=$2) AND server=$3",
+        [removed.rows.map(row => row.sector_id), identity.cid, identity.server]);
     }
     // Every disconnected controller's rows are gone by now, so a sub-sector left behind can be
-    // handed to whoever is still working the group above it.
-    const reassigned = await reassignFreedSectors(client, freed);
+    // handed to whoever is still working the group above it - one pass per server, since a
+    // reassignment must never cross servers.
+    const reassigned: string[] = [];
+    for (const [server, ids] of freedByServer) {
+      reassigned.push(...await reassignFreedSectors(client, ids, server));
+    }
     for (const owner of droppedOwners) {
       const transferredFlights = await transferFlightsToCurrentSectorOwners(client, owner);
       const clearedFlights = await clearFlightsWithoutCurrentSectorOwner(client, owner);
@@ -92,9 +102,11 @@ export async function runMaintenance(): Promise<void> {
       "DELETE FROM annotations WHERE last_seen_online_at < now()-($1*interval '1 minute')",
       [config.DISCONNECT_GRACE_MINUTES]);
     await client.query("DELETE FROM resume_snapshots WHERE created_at < now()-($1*interval '1 minute')", [config.RESUME_WINDOW_MINUTES]);
-    return released;
+    return [...new Set(droppedOwners.map(owner => owner.server))];
   });
   // A disconnect sweep frees sectors without any request having been made, so nothing else would
-  // announce it - subscribers would sit on a stale picture until their own fallback poll.
-  if (releasedAny) await publish({ type: "sectors" });
+  // announce it - subscribers would sit on a stale picture until their own fallback poll. Published
+  // once per server actually affected by this pass, never a single unscoped event: one sweep can
+  // release sectors on more than one server at a time, and a subscriber only watches one.
+  for (const server of affectedServers) await publish({ type: "sectors", server });
 }

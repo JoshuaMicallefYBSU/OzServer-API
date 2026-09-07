@@ -3,12 +3,13 @@ import { z } from "zod";
 import { pool } from "../db.js";
 
 // Shared notes and freehand drawing (issue #9). One controller marks up the radar picture, everyone
-// sees it.
+// on the same server sees it - scoped per `server` (migrations/006_server_isolation.sql) so a note
+// drawn during a SweatBox exercise never bleeds onto the live map or another exercise's.
 //
-// Reads return every annotation rather than filtering by area or by sector. The whole set is a few
-// dozen rows of small geometry, the plugin needs all of it to draw anything, and a filter would have
-// to be recomputed on every pan and zoom - which is a round trip per scroll wheel notch to save
-// nothing.
+// Reads return every annotation on this server rather than filtering by area or by sector. The
+// whole set is a few dozen rows of small geometry, the plugin needs all of it to draw anything, and
+// a filter would have to be recomputed on every pan and zoom - which is a round trip per scroll
+// wheel notch to save nothing.
 //
 // Only the author may change or delete their own annotation. Shared visibility is not shared
 // ownership: a note is a statement by a particular controller, and letting anyone edit it would make
@@ -81,11 +82,11 @@ export async function annotationRoutes(app: FastifyInstance): Promise<void> {
     // each annotations signal. That keeps the author's work alive for exactly as long as their
     // client is running, without needing a second keep-alive endpoint to call.
     await pool.query(
-      "UPDATE annotations SET last_seen_online_at=now() WHERE author_cid=$1 AND author_callsign=$2",
-      [request.controller.cid, request.controller.callsign]);
+      "UPDATE annotations SET last_seen_online_at=now() WHERE author_cid=$1 AND author_callsign=$2 AND server=$3",
+      [request.controller.cid, request.controller.callsign, request.controller.server]);
 
     return (await pool.query<AnnotationRow>(
-      "SELECT * FROM annotations ORDER BY created_at")).rows.map(toDto);
+      "SELECT * FROM annotations WHERE server=$1 ORDER BY created_at", [request.controller.server])).rows.map(toDto);
   });
 
   app.post("/annotations", async (request, reply) => {
@@ -98,9 +99,9 @@ export async function annotationRoutes(app: FastifyInstance): Promise<void> {
     const body = kind === "note" ? parsed.data.body : null;
 
     const inserted = await pool.query<AnnotationRow>(
-      `INSERT INTO annotations (kind,author_cid,author_callsign,body,points,colour)
-       VALUES ($1,$2,$3,$4,$5::jsonb,$6) RETURNING *`,
-      [kind, request.controller.cid, request.controller.callsign, body, JSON.stringify(points), colour ?? null]);
+      `INSERT INTO annotations (kind,author_cid,author_callsign,body,points,colour,server)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7) RETURNING *`,
+      [kind, request.controller.cid, request.controller.callsign, body, JSON.stringify(points), colour ?? null, request.controller.server]);
 
     return reply.code(201).send(toDto(inserted.rows[0]!));
   });
@@ -116,14 +117,16 @@ export async function annotationRoutes(app: FastifyInstance): Promise<void> {
     //
     // The author predicate is in the WHERE, not checked beforehand: a separate SELECT would leave a
     // gap in which the row could change hands or be deleted, and there is nothing to report
-    // differently anyway - not yours and not there are the same answer to the caller.
+    // differently anyway - not yours and not there are the same answer to the caller. `server` is
+    // added the same way for uniform isolation semantics, even though the uuid id itself cannot
+    // collide across servers on its own.
     const updated = await pool.query<AnnotationRow>(
       `UPDATE annotations SET body=COALESCE($1,body), points=COALESCE($2::jsonb,points), updated_at=now(),
               last_seen_online_at=now()
-        WHERE id=$3 AND author_cid=$4 AND author_callsign=$5 RETURNING *`,
+        WHERE id=$3 AND author_cid=$4 AND author_callsign=$5 AND server=$6 RETURNING *`,
       [parsed.data.body ?? null,
        parsed.data.points ? JSON.stringify(parsed.data.points) : null,
-       request.params.id, request.controller.cid, request.controller.callsign]);
+       request.params.id, request.controller.cid, request.controller.callsign, request.controller.server]);
 
     return updated.rows[0]
       ? reply.send(toDto(updated.rows[0]))
@@ -132,8 +135,8 @@ export async function annotationRoutes(app: FastifyInstance): Promise<void> {
 
   app.post<{ Params: { id: string } }>("/annotations/:id/delete", async (request, reply) => {
     const deleted = await pool.query(
-      "DELETE FROM annotations WHERE id=$1 AND author_cid=$2 AND author_callsign=$3",
-      [request.params.id, request.controller.cid, request.controller.callsign]);
+      "DELETE FROM annotations WHERE id=$1 AND author_cid=$2 AND author_callsign=$3 AND server=$4",
+      [request.params.id, request.controller.cid, request.controller.callsign, request.controller.server]);
 
     return deleted.rowCount
       ? reply.code(204).send()
@@ -141,11 +144,12 @@ export async function annotationRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // Clearing up after yourself in one call, for a controller signing off. Deliberately scoped to the
-  // caller's own rows - there is no endpoint that clears somebody else's markup.
+  // caller's own rows on their current server - without the server predicate, signing off on one
+  // environment would also wipe the same controller's leftover markup on every other one.
   app.post("/annotations/clear-mine", async (request, reply) => {
     await pool.query(
-      "DELETE FROM annotations WHERE author_cid=$1 AND author_callsign=$2",
-      [request.controller.cid, request.controller.callsign]);
+      "DELETE FROM annotations WHERE author_cid=$1 AND author_callsign=$2 AND server=$3",
+      [request.controller.cid, request.controller.callsign, request.controller.server]);
 
     return reply.code(204).send();
   });

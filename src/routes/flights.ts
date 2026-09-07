@@ -17,14 +17,14 @@ function hasOwn(value: object, key: string): boolean {
 
 async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: ControllerIdentity) {
   return transaction(async client => {
-    const cidsWithSectors = new Set((await client.query("SELECT DISTINCT controller_cid FROM sector_ownerships")).rows.map(row => row.controller_cid));
+    const cidsWithSectors = new Set((await client.query("SELECT DISTINCT controller_cid FROM sector_ownerships WHERE server=$1", [identity.server])).rows.map(row => row.controller_cid));
     const callerOwnedSectors = new Set((await client.query(
       `SELECT s.name FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
-        WHERE o.controller_cid=$1`, [identity.cid])).rows.map(row => row.name));
+        WHERE o.controller_cid=$1 AND o.server=$2`, [identity.cid, identity.server])).rows.map(row => row.name));
     const results: Array<{ callsign: string; updated: boolean }> = [];
     for (const flight of flights) {
       const existing = (await client.query(
-        "SELECT controlling_cid,controlling_callsign,current_sector,data FROM flight_data_records WHERE callsign=$1 FOR UPDATE", [flight.callsign])).rows[0];
+        "SELECT controlling_cid,controlling_callsign,current_sector,data FROM flight_data_records WHERE callsign=$1 AND server=$2 FOR UPDATE", [flight.callsign, identity.server])).rows[0];
 
       // Optional means "this partial push did not know", not "clear the existing value". Explicit
       // null still clears. FdrSync deliberately omits current_sector when SectorLocator cannot
@@ -95,16 +95,17 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
       delete data.current_sector;
       delete data.controller_cid;
       delete data.controller_callsign;
+      delete data.server;
 
       const previousData = existing?.data ?? {};
       const previousState = previousData.state ?? null;
       const nextState = data.state ?? previousState;
       await client.query(
-        `INSERT INTO flight_data_records (callsign,controlling_cid,controlling_callsign,current_sector,data,last_seen_at)
-         VALUES ($1,$2,$3,$4,$5,now()) ON CONFLICT (callsign) DO UPDATE SET
+        `INSERT INTO flight_data_records (callsign,controlling_cid,controlling_callsign,current_sector,data,last_seen_at,server)
+         VALUES ($1,$2,$3,$4,$5,now(),$6) ON CONFLICT (callsign, server) DO UPDATE SET
          controlling_cid=excluded.controlling_cid,controlling_callsign=excluded.controlling_callsign,
          current_sector=excluded.current_sector,data=flight_data_records.data || excluded.data,last_seen_at=now()`,
-        [callsign, controlling_cid, controlling_callsign, current_sector, JSON.stringify(data)]);
+        [callsign, controlling_cid, controlling_callsign, current_sector, JSON.stringify(data), identity.server]);
 
       const changed = !existing
         || existing.controlling_cid !== controlling_cid
@@ -148,9 +149,9 @@ export async function flightRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) return reply.code(422).send({ message: "Invalid flight batch.", errors: parsed.error.flatten() });
     return { results: await upsert(parsed.data.flights, request.controller) };
   });
-  app.get("/fdr/sync", async () => (await pool.query(
+  app.get("/fdr/sync", async request => (await pool.query(
     `SELECT callsign,controlling_cid,controlling_callsign,current_sector,last_seen_at,data
-       FROM flight_data_records ORDER BY callsign`)).rows.map(row => ({ ...row.data, callsign: row.callsign,
+       FROM flight_data_records WHERE server=$1 ORDER BY callsign`, [request.controller.server])).rows.map(row => ({ ...row.data, callsign: row.callsign,
          controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
          current_sector: row.current_sector, last_seen_at: row.last_seen_at })));
 }

@@ -28,10 +28,12 @@ const mutationSchema = z.object({
   exclude: z.array(z.string()).default([])
 });
 
-async function lockMutations(client: pg.PoolClient): Promise<void> {
+async function lockMutations(client: pg.PoolClient, server: string): Promise<void> {
   // Sector groups overlap. One transaction-wide lock makes the complete check-and-write operation
-  // atomic, including claims involving responsible sectors and batch commits.
-  await client.query("SELECT pg_advisory_xact_lock(684276)");
+  // atomic, including claims involving responsible sectors and batch commits. Keyed per server
+  // (hashtext into Postgres's two-int-arg advisory lock overload) so a live commit and a sweatbox
+  // commit never wait on each other for no reason - they touch entirely disjoint rows.
+  await client.query("SELECT pg_advisory_xact_lock(684276, hashtext($1))", [server]);
 }
 
 // Bounded the same way the plugin's own tree recursion is (PrimaryPosition.CollectDefaultSectors,
@@ -48,10 +50,17 @@ const MAX_GROUP_DEPTH = 8;
 // sub-sectors themselves, so a controller logging onto a top-level group got the full airspace on
 // their scope while OzServer recorded ownership one level down, leaving the deepest sub-sectors
 // unowned and sitting in Available.
-async function covered(client: pg.PoolClient, name: string): Promise<SectorRow[]> {
+//
+// `sectors` itself is shared across every server (it is static airspace geometry, not
+// per-controller state - see migrations/006_server_isolation.sql), so only the ownership join is
+// scoped to `server`, and it is scoped in the join condition rather than a WHERE filter: a WHERE
+// filter would turn this into an inner join and silently drop a sector nobody has claimed yet on
+// this server, instead of returning it with a null owner the way an unowned sector should read.
+async function covered(client: pg.PoolClient, name: string, server: string): Promise<SectorRow[]> {
   const primary = await client.query<SectorRow>(
     `SELECT s.*, o.controller_cid, o.controller_callsign, o.last_seen_online_at
-       FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name=$1`, [name]);
+       FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.name=$1`,
+    [name, server]);
   const sector = primary.rows[0];
   if (!sector) return [];
 
@@ -72,8 +81,8 @@ async function covered(client: pg.PoolClient, name: string): Promise<SectorRow[]
 
   return (await client.query<SectorRow>(
     `SELECT s.*, o.controller_cid, o.controller_callsign, o.last_seen_online_at
-       FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name = ANY($1)`,
-    [[...names]])).rows;
+       FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.name = ANY($1)`,
+    [[...names], server])).rows;
 }
 
 // Whether this row's owner is still actively connected, for the narrow purpose of deciding whether
@@ -136,7 +145,7 @@ async function claimGroup(
   exclusions: string[] = [],
   allOrNothing = false
 ): Promise<{ claimed: string[]; skipped: string[]; withheld: string[]; conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }>; missing: boolean }> {
-  const rows = (await covered(client, name)).filter(row => !exclusions.includes(row.name));
+  const rows = (await covered(client, name, identity.server)).filter(row => !exclusions.includes(row.name));
   if (rows.length === 0) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: true };
   const takeable: SectorRow[] = [];
   const skipped: string[] = [];
@@ -204,10 +213,10 @@ async function claimGroup(
 
   for (const row of takeable) {
     await client.query(
-      `INSERT INTO sector_ownerships (sector_id, controller_cid, controller_callsign, last_seen_online_at)
-       VALUES ($1,$2,$3,now()) ON CONFLICT (sector_id) DO UPDATE SET
+      `INSERT INTO sector_ownerships (sector_id, controller_cid, controller_callsign, last_seen_online_at, server)
+       VALUES ($1,$2,$3,now(),$4) ON CONFLICT (sector_id, server) DO UPDATE SET
        controller_cid=excluded.controller_cid, controller_callsign=excluded.controller_callsign,
-       last_seen_online_at=now(), updated_at=now()`, [row.id, identity.cid, identity.callsign]);
+       last_seen_online_at=now(), updated_at=now()`, [row.id, identity.cid, identity.callsign, identity.server]);
   }
   const transferredFlights = await transferFlightsInSectorsToOwner(
     client,
@@ -237,7 +246,8 @@ async function requestsPayload(client: pg.Pool | pg.PoolClient, identity: Contro
   const rows = (await client.query(
     `SELECT r.*, s.name AS sector_name, s.full_name AS sector_full_name
        FROM sector_requests r JOIN sectors s ON s.id=r.sector_id
-      WHERE r.requesting_cid=$1 OR r.target_cid=$1 ORDER BY r.created_at`, [identity.cid])).rows;
+      WHERE (r.requesting_cid=$1 OR r.target_cid=$1) AND r.server=$2 ORDER BY r.created_at`,
+    [identity.cid, identity.server])).rows;
   const map = (row: Record<string, unknown>) => ({
     id: Number(row.id), sector_id: Number(row.sector_id), group_id: row.group_id,
     requesting_cid: row.requesting_cid,
@@ -255,11 +265,11 @@ async function requestsPayload(client: pg.Pool | pg.PoolClient, identity: Contro
 async function syncPayload(client: pg.Pool | pg.PoolClient, identity: ControllerIdentity) {
   const mine = (await client.query(
     `SELECT s.id,s.name,s.full_name FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
-      WHERE o.controller_cid=$1 ORDER BY s.name`, [identity.cid])).rows.map(row => ({ ...row, id: Number(row.id) }));
+      WHERE o.controller_cid=$1 AND o.server=$2 ORDER BY s.name`, [identity.cid, identity.server])).rows.map(row => ({ ...row, id: Number(row.id) }));
   const controlled = (await client.query(
     `SELECT s.name,s.full_name,s.type,s.callsign,s.frequency,o.controller_cid AS cid,o.controller_callsign AS owner_callsign
        FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
-      WHERE o.controller_cid<>$1 ORDER BY s.name`, [identity.cid])).rows.map(row => ({
+      WHERE o.controller_cid<>$1 AND o.server=$2 ORDER BY s.name`, [identity.cid, identity.server])).rows.map(row => ({
         name: row.name, full_name: row.full_name, type: row.type, callsign: row.callsign,
         frequency: row.frequency, owner: { cid: row.cid, callsign: row.owner_callsign }
       }));
@@ -267,13 +277,13 @@ async function syncPayload(client: pg.Pool | pg.PoolClient, identity: Controller
 }
 
 async function releaseGroup(client: pg.PoolClient, identity: ControllerIdentity, name: string): Promise<boolean> {
-  const rows = await covered(client, name);
+  const rows = await covered(client, name, identity.server);
   const primary = rows.find(row => row.name === name);
   if (!primary || primary.controller_cid !== identity.cid) return false;
   const released = rows.filter(row => row.controller_cid === identity.cid);
   const releasedIds = released.map(row => row.id);
-  await client.query("DELETE FROM sector_ownerships WHERE sector_id=ANY($1) AND controller_cid=$2", [releasedIds, identity.cid]);
-  await client.query("DELETE FROM sector_requests WHERE sector_id=ANY($1) AND rejected_at IS NULL", [releasedIds]);
+  await client.query("DELETE FROM sector_ownerships WHERE sector_id=ANY($1) AND controller_cid=$2 AND server=$3", [releasedIds, identity.cid, identity.server]);
+  await client.query("DELETE FROM sector_requests WHERE sector_id=ANY($1) AND rejected_at IS NULL AND server=$2", [releasedIds, identity.server]);
   await writeDiagnosticLog(client, identity, "ServerSector", `Released ${name}`, {
     action: "release",
     sector: name,
@@ -284,10 +294,11 @@ async function releaseGroup(client: pg.PoolClient, identity: ControllerIdentity,
 
 async function transferRequest(client: pg.PoolClient, identity: ControllerIdentity, id: number): Promise<string | null> {
   const result = await client.query(
-    `SELECT r.*,s.name FROM sector_requests r JOIN sectors s ON s.id=r.sector_id WHERE r.id=$1 FOR UPDATE`, [id]);
+    `SELECT r.*,s.name FROM sector_requests r JOIN sectors s ON s.id=r.sector_id WHERE r.id=$1 AND r.server=$2 FOR UPDATE`,
+    [id, identity.server]);
   const request = result.rows[0];
   if (!request || request.target_cid !== identity.cid) return null;
-  const owner = await client.query("SELECT controller_cid FROM sector_ownerships WHERE sector_id=$1 FOR UPDATE", [request.sector_id]);
+  const owner = await client.query("SELECT controller_cid FROM sector_ownerships WHERE sector_id=$1 AND server=$2 FOR UPDATE", [request.sector_id, identity.server]);
   if (owner.rows[0]?.controller_cid !== identity.cid) return null;
   // Only what the accepting controller actually holds. A transfer is one controller giving another
   // what they have, and it was instead handing over the requested sector's whole responsible-sectors
@@ -303,17 +314,17 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
   // Restricting to the giver's own rows fixes both without adding a second opinion about who is
   // online. What is left unowned stays unowned, and is claimed through the ordinary path - which is
   // the one place the staffing rule is applied, and the only place it can be applied correctly.
-  const rows = (await covered(client, request.name))
+  const rows = (await covered(client, request.name, identity.server))
     .filter(row => row.controller_cid === identity.cid);
 
   for (const row of rows) {
     await client.query(
-      `INSERT INTO sector_ownerships (sector_id,controller_cid,controller_callsign,last_seen_online_at)
-       VALUES ($1,$2,$3,now()) ON CONFLICT (sector_id) DO UPDATE SET controller_cid=$2,
+      `INSERT INTO sector_ownerships (sector_id,controller_cid,controller_callsign,last_seen_online_at,server)
+       VALUES ($1,$2,$3,now(),$4) ON CONFLICT (sector_id, server) DO UPDATE SET controller_cid=$2,
        controller_callsign=$3,last_seen_online_at=now(),updated_at=now()`,
-      [row.id, request.requesting_cid, request.requesting_callsign]);
+      [row.id, request.requesting_cid, request.requesting_callsign, identity.server]);
   }
-  await client.query("DELETE FROM sector_requests WHERE sector_id=ANY($1)", [rows.map(row => row.id)]);
+  await client.query("DELETE FROM sector_requests WHERE sector_id=ANY($1) AND server=$2", [rows.map(row => row.id), identity.server]);
 
   // A sector changing hands has to take its aircraft with it. The plugin performs the actual vatSys
   // jurisdiction handoff, but the server has to move the API authority in the same transaction;
@@ -322,11 +333,12 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
   const transferredFlights = (await client.query(
     `UPDATE flight_data_records SET controlling_cid=$2,controlling_callsign=$3
       WHERE current_sector = ANY($1)
+        AND server=$6
         AND controlling_cid=$4
         AND controlling_callsign IS NOT DISTINCT FROM $5
         AND (controlling_cid IS DISTINCT FROM $2 OR controlling_callsign IS DISTINCT FROM $3)
       RETURNING callsign`,
-    [rows.map(row => row.name), request.requesting_cid, request.requesting_callsign, identity.cid, identity.callsign])).rows.map(row => row.callsign);
+    [rows.map(row => row.name), request.requesting_cid, request.requesting_callsign, identity.cid, identity.callsign, identity.server])).rows.map(row => row.callsign);
 
   await writeDiagnosticLog(client, identity, "ServerSector", `Accepted request #${id} for ${request.name}`, {
     action: "request_accept",
@@ -349,7 +361,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
 
   app.post<{ Params: { name: string }; Body: { exclude?: string[] } }>("/sectors/:name/claim", async (request, reply) => {
     const result = await transaction(async client => {
-      await lockMutations(client);
+      await lockMutations(client, request.controller.server);
       return claimGroup(client, request.controller, request.params.name, request.body?.exclude ?? [], true);
     });
     if (result.missing) return reply.code(404).send({ message: "Sector not found." });
@@ -358,23 +370,23 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post<{ Params: { name: string } }>("/sectors/:name/release", async (request, reply) => {
-    const released = await transaction(async client => { await lockMutations(client); return releaseGroup(client, request.controller, request.params.name); });
+    const released = await transaction(async client => { await lockMutations(client, request.controller.server); return releaseGroup(client, request.controller, request.params.name); });
     return released ? reply.code(204).send() : reply.code(403).send({ message: "Only the current owner may release this sector." });
   });
 
   app.post<{ Params: { name: string } }>("/sectors/:name/request", async (request, reply) => transaction(async client => {
-    await lockMutations(client);
+    await lockMutations(client, request.controller.server);
     const sector = (await client.query(
-      `SELECT s.id,o.controller_cid,o.controller_callsign FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name=$1`,
-      [request.params.name])).rows[0];
+      `SELECT s.id,o.controller_cid,o.controller_callsign FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.name=$1`,
+      [request.params.name, request.controller.server])).rows[0];
     if (!sector) return reply.code(404).send({ message: "Sector not found." });
     if (!sector.controller_cid) return reply.code(400).send({ message: "Sector is unclaimed - claim it directly instead of requesting it." });
     if (sector.controller_cid === request.controller.cid) return reply.code(400).send({ message: "You already own this sector." });
-    await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid]);
+    await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND server=$3 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid, request.controller.server]);
     const inserted = await client.query(
-      `INSERT INTO sector_requests (sector_id,requesting_cid,requesting_callsign,target_cid,target_callsign)
-       VALUES ($1,$2,$3,$4,$5) ON CONFLICT (sector_id,requesting_cid) DO NOTHING RETURNING *`,
-      [sector.id, request.controller.cid, request.controller.callsign, sector.controller_cid, sector.controller_callsign]);
+      `INSERT INTO sector_requests (sector_id,requesting_cid,requesting_callsign,target_cid,target_callsign,server)
+       VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (sector_id,requesting_cid,server) DO NOTHING RETURNING *`,
+      [sector.id, request.controller.cid, request.controller.callsign, sector.controller_cid, sector.controller_callsign, request.controller.server]);
     if (!inserted.rows[0]) return reply.code(409).send({ message: "You already have a pending request for this sector." });
     await writeDiagnosticLog(client, request.controller, "ServerSector", `Requested ${request.params.name} from ${sector.controller_callsign}`, {
       action: "request_create",
@@ -390,7 +402,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     const parsed = mutationSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(422).send({ message: "Invalid sector commit.", errors: parsed.error.flatten() });
     return transaction(async client => {
-      await lockMutations(client);
+      await lockMutations(client, request.controller.server);
       // Every request this Apply raises shares one group, so the controller on the other end is
       // asked once about the whole thing rather than once per sector. Requests landing on different
       // targets still share the id harmlessly - each target only ever sees their own rows, so each
@@ -404,13 +416,14 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       }
       for (const name of parsed.data.request) {
         const sector = (await client.query(
-          `SELECT s.id,o.controller_cid,o.controller_callsign FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name=$1`, [name])).rows[0];
+          `SELECT s.id,o.controller_cid,o.controller_callsign FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name=$1 AND o.server=$2`,
+          [name, request.controller.server])).rows[0];
         if (!sector || sector.controller_cid === request.controller.cid) { result.failed.push(name); continue; }
-        await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid]);
+        await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND server=$3 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid, request.controller.server]);
         const inserted = await client.query(
-          `INSERT INTO sector_requests (sector_id,requesting_cid,requesting_callsign,target_cid,target_callsign,group_id)
-           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (sector_id,requesting_cid) DO NOTHING RETURNING id`,
-          [sector.id, request.controller.cid, request.controller.callsign, sector.controller_cid, sector.controller_callsign, requestGroupId]);
+          `INSERT INTO sector_requests (sector_id,requesting_cid,requesting_callsign,target_cid,target_callsign,group_id,server)
+           VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (sector_id,requesting_cid,server) DO NOTHING RETURNING id`,
+          [sector.id, request.controller.cid, request.controller.callsign, sector.controller_cid, sector.controller_callsign, requestGroupId, request.controller.server]);
         (inserted.rows[0] ? result.requested : result.failed).push(name);
       }
       await writeDiagnosticLog(client, request.controller, "ServerSector", "Committed sector changes", {
@@ -427,26 +440,27 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/sectors/release-all", async (request, reply) => transaction(async client => {
-    await lockMutations(client);
+    await lockMutations(client, request.controller.server);
     const sectors = (await client.query(
       `SELECT s.name FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
-       WHERE o.controller_cid=$1 AND o.controller_callsign=$2`, [request.controller.cid, request.controller.callsign])).rows.map(row => row.name);
+       WHERE o.controller_cid=$1 AND o.controller_callsign=$2 AND o.server=$3`,
+      [request.controller.cid, request.controller.callsign, request.controller.server])).rows.map(row => row.name);
     const flights = (await client.query(
-      "SELECT callsign FROM flight_data_records WHERE controlling_cid=$1 AND controlling_callsign=$2",
-      [request.controller.cid, request.controller.callsign])).rows.map(row => row.callsign);
+      "SELECT callsign FROM flight_data_records WHERE controlling_cid=$1 AND controlling_callsign=$2 AND server=$3",
+      [request.controller.cid, request.controller.callsign, request.controller.server])).rows.map(row => row.callsign);
     await client.query(
-      `INSERT INTO resume_snapshots (controller_cid,controller_callsign,sectors,flights,created_at) VALUES ($1,$2,$3,$4,now())
-       ON CONFLICT (controller_cid,controller_callsign) DO UPDATE SET sectors=$3,flights=$4,created_at=now()`,
-      [request.controller.cid, request.controller.callsign, JSON.stringify(sectors), JSON.stringify(flights)]);
+      `INSERT INTO resume_snapshots (controller_cid,controller_callsign,sectors,flights,created_at,server) VALUES ($1,$2,$3,$4,now(),$5)
+       ON CONFLICT (controller_cid,controller_callsign,server) DO UPDATE SET sectors=$3,flights=$4,created_at=now()`,
+      [request.controller.cid, request.controller.callsign, JSON.stringify(sectors), JSON.stringify(flights), request.controller.server]);
     const freed = (await client.query(
-      "DELETE FROM sector_ownerships WHERE controller_cid=$1 AND controller_callsign=$2 RETURNING sector_id",
-      [request.controller.cid, request.controller.callsign])).rows.map(row => row.sector_id);
+      "DELETE FROM sector_ownerships WHERE controller_cid=$1 AND controller_callsign=$2 AND server=$3 RETURNING sector_id",
+      [request.controller.cid, request.controller.callsign, request.controller.server])).rows.map(row => row.sector_id);
     // Deliberately here and in the disconnect sweep, but NOT in releaseGroup. Those two are the
     // controller leaving; releaseGroup is a deliberate release while still connected, and doing it
     // there would bounce a sub-sector straight back to anyone who also holds its parent, making it
     // impossible to free one by hand.
-    await reassignFreedSectors(client, freed);
-    await client.query("DELETE FROM sector_requests WHERE requesting_cid=$1 OR target_cid=$1", [request.controller.cid]);
+    await reassignFreedSectors(client, freed, request.controller.server);
+    await client.query("DELETE FROM sector_requests WHERE (requesting_cid=$1 OR target_cid=$1) AND server=$2", [request.controller.cid, request.controller.server]);
     const transferredFlights = await transferFlightsToCurrentSectorOwners(client, request.controller);
     const clearedFlights = await clearFlightsWithoutCurrentSectorOwner(client, request.controller);
     await writeDiagnosticLog(client, request.controller, "ServerSector", "Released all sectors", {
@@ -460,10 +474,10 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
   }));
 
   app.post("/sectors/resume", async request => transaction(async client => {
-    await lockMutations(client);
+    await lockMutations(client, request.controller.server);
     const snapshot = (await client.query(
-      "DELETE FROM resume_snapshots WHERE controller_cid=$1 AND controller_callsign=$2 RETURNING *",
-      [request.controller.cid, request.controller.callsign])).rows[0];
+      "DELETE FROM resume_snapshots WHERE controller_cid=$1 AND controller_callsign=$2 AND server=$3 RETURNING *",
+      [request.controller.cid, request.controller.callsign, request.controller.server])).rows[0];
     const resumed: string[] = [];
     const restoredFlights: string[] = [];
     if (snapshot && Date.now() - new Date(snapshot.created_at).getTime() <= config.RESUME_WINDOW_MINUTES * 60_000) {
@@ -471,8 +485,9 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
         const sector = (await client.query("SELECT id FROM sectors WHERE name=$1", [name])).rows[0];
         if (!sector) continue;
         const inserted = await client.query(
-          `INSERT INTO sector_ownerships (sector_id,controller_cid,controller_callsign,last_seen_online_at)
-           VALUES ($1,$2,$3,now()) ON CONFLICT DO NOTHING RETURNING sector_id`, [sector.id, request.controller.cid, request.controller.callsign]);
+          `INSERT INTO sector_ownerships (sector_id,controller_cid,controller_callsign,last_seen_online_at,server)
+           VALUES ($1,$2,$3,now(),$4) ON CONFLICT (sector_id,server) DO NOTHING RETURNING sector_id`,
+          [sector.id, request.controller.cid, request.controller.callsign, request.controller.server]);
         if (inserted.rows[0]) resumed.push(name);
       }
       // The WHERE is what keeps this honest: a flight another controller picked up while this one
@@ -497,12 +512,13 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       await client.query(
         `UPDATE flight_data_records SET controlling_cid=$1,controlling_callsign=$2
           WHERE callsign=ANY($3)
+            AND server=$4
             AND controlling_cid IS NULL
             AND current_sector IN (
                   SELECT s.name FROM sectors s
                     JOIN sector_ownerships o ON o.sector_id=s.id
-                   WHERE o.controller_cid=$1)`,
-        [request.controller.cid, request.controller.callsign, snapshot.flights]);
+                   WHERE o.controller_cid=$1 AND o.server=$4)`,
+        [request.controller.cid, request.controller.callsign, snapshot.flights, request.controller.server]);
     }
 
     // Answered for BOTH kinds of reconnect, which is why it is outside the snapshot branch.
@@ -520,12 +536,13 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     restoredFlights.push(...(await client.query(
       `SELECT callsign FROM flight_data_records
         WHERE controlling_cid=$1
+          AND server=$2
           AND current_sector IN (
                 SELECT s.name FROM sectors s
                   JOIN sector_ownerships o ON o.sector_id=s.id
-                 WHERE o.controller_cid=$1)
+                 WHERE o.controller_cid=$1 AND o.server=$2)
         ORDER BY callsign`,
-      [request.controller.cid])).rows.map(row => row.callsign));
+      [request.controller.cid, request.controller.server])).rows.map(row => row.callsign));
 
     await writeDiagnosticLog(client, request.controller, "ServerSector", "Resume processed", {
       action: "resume",
@@ -538,14 +555,14 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
   }));
 
   app.post<{ Params: { id: string } }>("/sector-requests/:id/accept", async (request, reply) => transaction(async client => {
-    await lockMutations(client);
+    await lockMutations(client, request.controller.server);
     const sector = await transferRequest(client, request.controller, Number(request.params.id));
     return sector ? { message: "Ownership transferred.", sync: await syncPayload(client, request.controller) }
       : reply.code(403).send({ message: "Only the sector's current owner may accept this request." });
   }));
 
   app.post<{ Body: { request_ids?: number[] } }>("/sector-requests/accept-batch", async request => transaction(async client => {
-    await lockMutations(client);
+    await lockMutations(client, request.controller.server);
     const results = [];
     for (const id of request.body?.request_ids ?? []) {
       const sector = await transferRequest(client, request.controller, id);
@@ -559,8 +576,8 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Body: { request_ids?: number[] } }>("/sector-requests/reject-batch", async request => {
     const ids = request.body?.request_ids ?? [];
     const changed = await pool.query(
-      "UPDATE sector_requests SET rejected_at=now() WHERE id=ANY($1) AND target_cid=$2 AND rejected_at IS NULL RETURNING id",
-      [ids, request.controller.cid]);
+      "UPDATE sector_requests SET rejected_at=now() WHERE id=ANY($1) AND target_cid=$2 AND server=$3 AND rejected_at IS NULL RETURNING id",
+      [ids, request.controller.cid, request.controller.server]);
     await writeDiagnosticLog(pool, request.controller, "ServerSector", "Rejected request batch", {
       action: "request_reject_batch",
       request_ids: ids.map(String),
@@ -570,7 +587,9 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post<{ Params: { id: string } }>("/sector-requests/:id/reject", async (request, reply) => {
-    const changed = await pool.query("UPDATE sector_requests SET rejected_at=now() WHERE id=$1 AND target_cid=$2 AND rejected_at IS NULL RETURNING id", [request.params.id, request.controller.cid]);
+    const changed = await pool.query(
+      "UPDATE sector_requests SET rejected_at=now() WHERE id=$1 AND target_cid=$2 AND server=$3 AND rejected_at IS NULL RETURNING id",
+      [request.params.id, request.controller.cid, request.controller.server]);
     if (changed.rowCount)
       await writeDiagnosticLog(pool, request.controller, "ServerSector", `Rejected request #${request.params.id}`, {
         action: "request_reject",
@@ -579,7 +598,9 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     return changed.rowCount ? { message: "Request rejected.", sync: await syncPayload(pool, request.controller) } : reply.code(403).send({ message: "This request cannot be rejected." });
   });
   app.post<{ Params: { id: string } }>("/sector-requests/:id/cancel", async (request, reply) => {
-    const changed = await pool.query("DELETE FROM sector_requests WHERE id=$1 AND requesting_cid=$2 RETURNING id", [request.params.id, request.controller.cid]);
+    const changed = await pool.query(
+      "DELETE FROM sector_requests WHERE id=$1 AND requesting_cid=$2 AND server=$3 RETURNING id",
+      [request.params.id, request.controller.cid, request.controller.server]);
     if (changed.rowCount)
       await writeDiagnosticLog(pool, request.controller, "ServerSector", `Cancelled request #${request.params.id}`, {
         action: "request_cancel",
@@ -588,7 +609,9 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     return changed.rowCount ? { message: "Request cancelled.", sync: await syncPayload(pool, request.controller) } : reply.code(403).send({ message: "This request cannot be cancelled." });
   });
   app.post<{ Params: { id: string } }>("/sector-requests/:id/acknowledge-rejection", async (request, reply) => {
-    const changed = await pool.query("DELETE FROM sector_requests WHERE id=$1 AND requesting_cid=$2 AND rejected_at IS NOT NULL RETURNING id", [request.params.id, request.controller.cid]);
+    const changed = await pool.query(
+      "DELETE FROM sector_requests WHERE id=$1 AND requesting_cid=$2 AND server=$3 AND rejected_at IS NOT NULL RETURNING id",
+      [request.params.id, request.controller.cid, request.controller.server]);
     if (changed.rowCount)
       await writeDiagnosticLog(pool, request.controller, "ServerSector", `Acknowledged rejected request #${request.params.id}`, {
         action: "request_acknowledge_rejection",

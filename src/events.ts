@@ -1,16 +1,21 @@
 import pg from "pg";
 import { config } from "./config.js";
 import { pool } from "./db.js";
+import type { Server } from "./auth.js";
 
 // Clients are told *that* something changed, never what. Every client re-reads through the
 // authenticated endpoint it already uses, which keeps this channel free of anything sensitive - so
 // it needs no auth of its own, and the browser map (whose EventSource cannot set an Authorization
 // header) can share it - and means no DTO is duplicated here to drift out of step with its route.
-export type OzEvent = { type: "sectors" | "fdr" | "atis" | "annotations" };
+// `server` is the one exception, and a deliberate one: it is a routing dimension (which
+// subscribers this fans out to), not payload data about what changed, so it does not weaken that
+// guarantee - a client still has to re-read to find out anything more than "something on my server
+// changed".
+export type OzEvent = { type: "sectors" | "fdr" | "atis" | "annotations"; server: Server };
 
 const CHANNEL = "ozserver_events";
 
-type Client = { write: (chunk: string) => void };
+type Client = { write: (chunk: string) => void; server: Server };
 const clients = new Set<Client>();
 
 export function addClient(client: Client): () => void {
@@ -25,6 +30,7 @@ export function clientCount(): number {
 function fanOut(event: OzEvent): void {
   const frame = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
   for (const client of clients) {
+    if (client.server !== event.server) continue;
     try {
       client.write(frame);
     } catch {

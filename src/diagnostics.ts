@@ -10,7 +10,7 @@ export async function writeDiagnosticLog(
 ): Promise<void> {
   await client.query(
     `INSERT INTO client_logs
-       (controller_cid,controller_callsign,category,message,logged_at,plugin_version,context)
-     VALUES ($1,$2,$3,$4,now(),'server',$5)`,
-    [identity.cid, identity.callsign, category, message, JSON.stringify(context)]);
+       (controller_cid,controller_callsign,server,category,message,logged_at,plugin_version,context)
+     VALUES ($1,$2,$3,$4,$5,now(),'server',$6)`,
+    [identity.cid, identity.callsign, identity.server, category, message, JSON.stringify(context)]);
 }

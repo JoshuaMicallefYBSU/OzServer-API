@@ -1,4 +1,6 @@
-export type ControllerIdentity = { cid: number; callsign: string };
+import type { Server } from "./auth.js";
+
+export type ControllerIdentity = { cid: number; callsign: string; server: Server };
 
 declare module "fastify" {
   interface FastifyRequest {

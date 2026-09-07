@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { parseServer } from "../auth.js";
 import { config } from "../config.js";
 import { addClient, clientCount } from "../events.js";
 
@@ -7,7 +8,10 @@ import { addClient, clientCount } from "../events.js";
 const HEARTBEAT_MS = 20_000;
 
 export async function eventRoutes(app: FastifyInstance): Promise<void> {
-  app.get("/events", (request, reply) => {
+  app.get<{ Querystring: { server?: string } }>("/events", (request, reply) => {
+    const server = parseServer(request.query.server);
+    if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
+
     // Fastify must be told to stop managing this response, or it will try to send its own on top
     // of the stream we are about to write by hand.
     reply.hijack();
@@ -24,7 +28,7 @@ export async function eventRoutes(app: FastifyInstance): Promise<void> {
     });
     reply.raw.write(": connected\n\n");
 
-    const remove = addClient({ write: chunk => reply.raw.write(chunk) });
+    const remove = addClient({ write: chunk => reply.raw.write(chunk), server });
     const heartbeat = setInterval(() => {
       try {
         reply.raw.write(": ping\n\n");

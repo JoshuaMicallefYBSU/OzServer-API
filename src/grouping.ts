@@ -19,7 +19,12 @@ type FlightAuthorityTransfer = {
   to: ControllerIdentity;
 };
 
-async function findNearestGroupOwner(client: pg.PoolClient, name: string): Promise<Owner | null> {
+// `sectors` is shared across every server (static airspace geometry, not per-controller state -
+// see migrations/006_server_isolation.sql), so only the `sector_ownerships` side of this join is
+// scoped to `server`, and scoped in the join condition rather than a WHERE filter: a WHERE filter
+// would turn this into an inner join and drop a parent that exists but is unowned on this server,
+// which is exactly the "keep climbing" case this function relies on.
+async function findNearestGroupOwner(client: pg.PoolClient, name: string, server: string): Promise<Owner | null> {
   let frontier = [name];
   const seen = new Set(frontier);
 
@@ -27,10 +32,10 @@ async function findNearestGroupOwner(client: pg.PoolClient, name: string): Promi
     const parents = (await client.query<{ name: string; controller_cid: number | null; controller_callsign: string | null }>(
       `SELECT p.name, o.controller_cid, o.controller_callsign
          FROM sectors p
-         LEFT JOIN sector_ownerships o ON o.sector_id = p.id
+         LEFT JOIN sector_ownerships o ON o.sector_id = p.id AND o.server = $2
         WHERE p.responsible_sectors ?| $1::text[]
         ORDER BY jsonb_array_length(p.responsible_sectors), p.name`,
-      [frontier])).rows;
+      [frontier, server])).rows;
 
     // Most specific group first, courtesy of the ORDER BY - a sector bundled by both a small group
     // and a large one should follow the small one.
@@ -51,7 +56,8 @@ async function findNearestGroupOwner(client: pg.PoolClient, name: string): Promi
 // giving it up.
 export async function reassignFreedSectors(
   client: pg.PoolClient,
-  freedSectorIds: Array<string | number>
+  freedSectorIds: Array<string | number>,
+  server: string
 ): Promise<string[]> {
   if (freedSectorIds.length === 0) return [];
 
@@ -62,17 +68,17 @@ export async function reassignFreedSectors(
 
   for (const sector of freed) {
     // Somebody claimed it in the meantime - leave it with them rather than overriding a live claim.
-    if ((await client.query("SELECT 1 FROM sector_ownerships WHERE sector_id=$1", [sector.id])).rowCount) {
+    if ((await client.query("SELECT 1 FROM sector_ownerships WHERE sector_id=$1 AND server=$2", [sector.id, server])).rowCount) {
       continue;
     }
 
-    const owner = await findNearestGroupOwner(client, sector.name);
+    const owner = await findNearestGroupOwner(client, sector.name, server);
     if (!owner) continue;
 
     await client.query(
-      `INSERT INTO sector_ownerships (sector_id,controller_cid,controller_callsign,last_seen_online_at)
-       VALUES ($1,$2,$3,now()) ON CONFLICT (sector_id) DO NOTHING`,
-      [sector.id, owner.controller_cid, owner.controller_callsign]);
+      `INSERT INTO sector_ownerships (sector_id,controller_cid,controller_callsign,last_seen_online_at,server)
+       VALUES ($1,$2,$3,now(),$4) ON CONFLICT (sector_id, server) DO NOTHING`,
+      [sector.id, owner.controller_cid, owner.controller_callsign, server]);
 
     reassigned.push(sector.name);
   }
@@ -99,6 +105,7 @@ export async function transferFlightsInSectorsToOwner(
          SELECT callsign,current_sector,controlling_cid,controlling_callsign
            FROM flight_data_records
           WHERE current_sector=$1
+            AND server=$6
             AND (
               ($2::integer IS NULL AND controlling_cid IS NULL)
               OR (controlling_cid=$2 AND controlling_callsign IS NOT DISTINCT FROM $3)
@@ -109,17 +116,17 @@ export async function transferFlightsInSectorsToOwner(
          UPDATE flight_data_records f
             SET controlling_cid=$4,controlling_callsign=$5
            FROM previous p
-          WHERE f.callsign=p.callsign
+          WHERE f.callsign=p.callsign AND f.server=$6
           RETURNING f.callsign,f.current_sector,
                     p.controlling_cid AS previous_cid,p.controlling_callsign AS previous_callsign
        )
        SELECT * FROM updated`,
-      [sector.sector, sector.cid, sector.callsign, owner.cid, owner.callsign])).rows;
+      [sector.sector, sector.cid, sector.callsign, owner.cid, owner.callsign, owner.server])).rows;
 
     transferred.push(...rows.map(row => ({
       callsign: row.callsign,
       current_sector: row.current_sector,
-      from: { cid: row.previous_cid ?? 0, callsign: row.previous_callsign ?? "" },
+      from: { cid: row.previous_cid ?? 0, callsign: row.previous_callsign ?? "", server: owner.server },
       to: owner
     })));
   }
@@ -140,19 +147,20 @@ export async function transferFlightsToCurrentSectorOwners(
     `UPDATE flight_data_records f
         SET controlling_cid=o.controller_cid,controlling_callsign=o.controller_callsign
        FROM sectors s
-       JOIN sector_ownerships o ON o.sector_id=s.id
+       JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$3
       WHERE f.controlling_cid=$1
         AND f.controlling_callsign=$2
+        AND f.server=$3
         AND f.current_sector=s.name
         AND (o.controller_cid IS DISTINCT FROM $1 OR o.controller_callsign IS DISTINCT FROM $2)
       RETURNING f.callsign,f.current_sector,o.controller_cid AS to_cid,o.controller_callsign AS to_callsign`,
-    [from.cid, from.callsign])).rows;
+    [from.cid, from.callsign, from.server])).rows;
 
   return rows.map(row => ({
     callsign: row.callsign,
     current_sector: row.current_sector,
     from,
-    to: { cid: row.to_cid, callsign: row.to_callsign }
+    to: { cid: row.to_cid, callsign: row.to_callsign, server: from.server }
   }));
 }
 
@@ -165,11 +173,12 @@ export async function clearFlightsWithoutCurrentSectorOwner(
         SET controlling_cid=NULL,controlling_callsign=NULL
       WHERE f.controlling_cid=$1
         AND f.controlling_callsign=$2
+        AND f.server=$3
         AND NOT EXISTS (
           SELECT 1
             FROM sectors s
-            JOIN sector_ownerships o ON o.sector_id=s.id
+            JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$3
            WHERE s.name=f.current_sector)
       RETURNING callsign`,
-    [from.cid, from.callsign])).rows.map(row => row.callsign);
+    [from.cid, from.callsign, from.server])).rows.map(row => row.callsign);
 }

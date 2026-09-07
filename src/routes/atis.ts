@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { parseServer } from "../auth.js";
 import { pool } from "../db.js";
 
 const atisSchema = z.object({
@@ -15,13 +16,16 @@ export async function protectedAtisRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) return reply.code(422).send({ message: "Invalid ATIS.", errors: parsed.error.flatten() });
     const value = parsed.data;
     return (await pool.query(
-      `INSERT INTO atis_broadcasts (icao,atis_letter,content,frequency,last_seen_at) VALUES ($1,$2,$3,$4,now())
-       ON CONFLICT (icao) DO UPDATE SET atis_letter=$2,content=$3,frequency=$4,last_seen_at=now() RETURNING *`,
-      [value.icao, value.atis_letter, JSON.stringify(value.content), value.frequency ?? null])).rows[0];
+      `INSERT INTO atis_broadcasts (icao,atis_letter,content,frequency,last_seen_at,server) VALUES ($1,$2,$3,$4,now(),$5)
+       ON CONFLICT (icao, server) DO UPDATE SET atis_letter=$2,content=$3,frequency=$4,last_seen_at=now() RETURNING *`,
+      [value.icao, value.atis_letter, JSON.stringify(value.content), value.frequency ?? null, request.controller.server])).rows[0];
   });
 }
 
 export async function publicAtisRoutes(app: FastifyInstance): Promise<void> {
-  app.get<{ Params: { icao: string } }>("/atis/:icao", async request =>
-    (await pool.query("SELECT * FROM atis_broadcasts WHERE icao=$1", [request.params.icao.toUpperCase()])).rows[0] ?? null);
+  app.get<{ Params: { icao: string }; Querystring: { server?: string } }>("/atis/:icao", async (request, reply) => {
+    const server = parseServer(request.query.server);
+    if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
+    return (await pool.query("SELECT * FROM atis_broadcasts WHERE icao=$1 AND server=$2", [request.params.icao.toUpperCase(), server])).rows[0] ?? null;
+  });
 }

@@ -10,6 +10,7 @@ import { protectedAtisRoutes, publicAtisRoutes } from "./routes/atis.js";
 import { flightRoutes } from "./routes/flights.js";
 import { eventRoutes } from "./routes/events.js";
 import { mapRoutes } from "./routes/map.js";
+import { serverRoutes } from "./routes/servers.js";
 import { sectorRoutes } from "./routes/sectors.js";
 
 export async function buildApp() {
@@ -27,6 +28,7 @@ export async function buildApp() {
     await publicAtisRoutes(publicApi);
     await mapRoutes(publicApi);
     await eventRoutes(publicApi);
+    await serverRoutes(publicApi);
   }, { prefix: "/api/v1" });
   await app.register(async pluginApi => {
     pluginApi.addHook("preHandler", pluginAuth);
@@ -41,8 +43,8 @@ export async function buildApp() {
     pluginApi.addHook("preHandler", async request => {
       try {
         await pool.query(
-          "UPDATE sector_ownerships SET last_seen_online_at=now() WHERE controller_cid=$1 AND controller_callsign=$2",
-          [request.controller.cid, request.controller.callsign]);
+          "UPDATE sector_ownerships SET last_seen_online_at=now() WHERE controller_cid=$1 AND controller_callsign=$2 AND server=$3",
+          [request.controller.cid, request.controller.callsign, request.controller.server]);
       } catch (error) {
         app.log.warn(error, "Could not refresh controller heartbeat.");
       }
@@ -54,20 +56,21 @@ export async function buildApp() {
     pluginApi.addHook("onResponse", async (request, reply) => {
       if (request.method !== "POST" || reply.statusCode >= 400) return;
       const route = request.routeOptions?.url ?? request.url;
+      const server = request.controller.server;
       if (route.startsWith("/api/v1/sectors") || route.startsWith("/api/v1/sector-requests")) {
         // Deliberately one signal for both: /sectors/sync already returns owned, controlled and
         // requests together, so a subscriber answers either with the same single call.
-        await publish({ type: "sectors" });
+        await publish({ type: "sectors", server });
       } else if (route.startsWith("/api/v1/fdr")) {
-        await publish({ type: "fdr" });
+        await publish({ type: "fdr", server });
       } else if (route.startsWith("/api/v1/atis")) {
-        await publish({ type: "atis" });
+        await publish({ type: "atis", server });
       } else if (route.startsWith("/api/v1/client-logs")) {
         // Deliberately silent: nothing subscribes to these, and every controller posts
         // them continuously - announcing each batch would wake every client for nothing.
         return;
       } else if (route.startsWith("/api/v1/annotations")) {
-        await publish({ type: "annotations" });
+        await publish({ type: "annotations", server });
       }
     });
     await sectorRoutes(pluginApi);
