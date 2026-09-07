@@ -5,7 +5,7 @@ import { pluginAuth } from "./auth.js";
 import { pool } from "./db.js";
 import { publish } from "./events.js";
 import { annotationRoutes } from "./routes/annotations.js";
-import { clientLogRoutes } from "./routes/client-logs.js";
+import { protectedClientLogRoutes, publicClientLogRoutes } from "./routes/client-logs.js";
 import { protectedAtisRoutes, publicAtisRoutes } from "./routes/atis.js";
 import { flightRoutes } from "./routes/flights.js";
 import { eventRoutes } from "./routes/events.js";
@@ -29,6 +29,7 @@ export async function buildApp() {
     await mapRoutes(publicApi);
     await eventRoutes(publicApi);
     await serverRoutes(publicApi);
+    await publicClientLogRoutes(publicApi);
   }, { prefix: "/api/v1" });
   await app.register(async pluginApi => {
     pluginApi.addHook("preHandler", pluginAuth);
@@ -77,7 +78,7 @@ export async function buildApp() {
     await flightRoutes(pluginApi);
     await protectedAtisRoutes(pluginApi);
     await annotationRoutes(pluginApi);
-    await clientLogRoutes(pluginApi);
+    await protectedClientLogRoutes(pluginApi);
   }, { prefix: "/api/v1" });
   app.setErrorHandler((error: FastifyError, _request, reply) => {
     app.log.error(error);

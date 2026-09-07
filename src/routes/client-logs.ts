@@ -24,7 +24,8 @@ const batchSchema = z.object({
   })).min(1).max(MaxLinesPerBatch)
 });
 
-export async function clientLogRoutes(app: FastifyInstance): Promise<void> {
+// The real, plugin-authenticated ingestion path - stays under pluginAuth like every other write.
+export async function protectedClientLogRoutes(app: FastifyInstance): Promise<void> {
   app.post("/client-logs", async (request, reply) => {
     const parsed = batchSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -52,17 +53,29 @@ export async function clientLogRoutes(app: FastifyInstance): Promise<void> {
 
     return reply.code(204).send();
   });
+}
 
+// The read side - deliberately public, not under pluginAuth. This is a human-driven diagnostics
+// tool ("everything around a moment across all controllers", used both by hand for an
+// investigation and by /console for a live tail), not an operation any controller identity needs
+// to stand behind. It used to sit in the same pluginAuth-gated group as the write side above,
+// which meant `server` was never actually optional in the way the query logic below assumes:
+// pluginAuth demands a valid server for the caller's own identity before this handler is ever
+// reached, so a request that tried to omit it (to search across every server at once, exactly the
+// cross-server investigation case this endpoint exists for) was rejected outright with 401 -
+// caught by the console page's own first live request, not by reading the code. Moving it out to
+// the public group, alongside map.ts's own read endpoints, removes that requirement entirely: the
+// `server` query parameter below is now the only thing controlling it, genuinely optional, exactly
+// as the comment on it already claimed.
+export async function publicClientLogRoutes(app: FastifyInstance): Promise<void> {
   // Reading them back. Ordered oldest-first because these are read as a narrative, and defaulting
   // to a recent window rather than the whole table - the interesting question is almost always
   // "what were all of them doing when this happened".
   //
-  // `server` is deliberately optional here, unlike everywhere else server touches this API: this
-  // is a human-driven diagnostics tool ("everything around a moment across all controllers"), not
-  // live operational state, and a real investigation sometimes legitimately spans servers (a
-  // controller reproducing on a SweatBox, then again on live). A required filter would split
-  // exactly that narrative in two. Included in the response columns so a row stays
-  // self-describing whenever the filter is left off.
+  // `server` is deliberately optional here, unlike everywhere else server touches this API: a real
+  // investigation sometimes legitimately spans servers (a controller reproducing on a SweatBox,
+  // then again on live). A required filter would split exactly that narrative in two. Included in
+  // the response columns so a row stays self-describing whenever the filter is left off.
   app.get<{ Querystring: {
     since?: string; callsign?: string; category?: string; limit?: string;
     sector?: string; fdr_callsign?: string; request_id?: string; session_id?: string; server?: string;
