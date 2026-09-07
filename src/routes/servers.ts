@@ -8,8 +8,7 @@ import { SERVERS } from "../auth.js";
 const LABELS: Record<string, string> = {
   live: "Live VATSIM",
   sb1: "SweatBox 1",
-  sb2: "SweatBox 2",
-  newsb: "LocalHost"
+  sb2: "SweatBox 2"
 };
 
 export async function serverRoutes(app: FastifyInstance): Promise<void> {

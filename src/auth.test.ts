@@ -19,6 +19,8 @@ describe("parseControllerIdentity", () => {
   it("rejects a server outside the allowlist", () => {
     expect(parseControllerIdentity({ controller_cid: 1234567, controller_callsign: "SY_APP", server: "sb3" })).toBeNull();
     expect(parseControllerIdentity({ controller_cid: 1234567, controller_callsign: "SY_APP", server: "production" })).toBeNull();
+    // LocalHost is deliberately unsupported, not its own environment - see NetworkServer.cs.
+    expect(parseControllerIdentity({ controller_cid: 1234567, controller_callsign: "SY_APP", server: "newsb" })).toBeNull();
   });
 
   it("is case-sensitive about the server slug", () => {
@@ -26,7 +28,7 @@ describe("parseControllerIdentity", () => {
   });
 
   it("accepts every allowlisted server", () => {
-    for (const server of ["live", "sb1", "sb2", "newsb"]) {
+    for (const server of ["live", "sb1", "sb2"]) {
       expect(parseControllerIdentity({ controller_cid: 1234567, controller_callsign: "SY_APP", server }))
         .toEqual({ cid: 1234567, callsign: "SY_APP", server });
     }

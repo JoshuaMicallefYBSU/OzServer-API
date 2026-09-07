@@ -1,11 +1,13 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
-// The 4 fully isolated vatSys connection targets this API distinguishes between. See
-// NetworkServer.cs in the plugin for how a client determines its own value; a 5th server is a
-// one-line addition here, not a migration - server is stored as free text (migrations/
-// 006_server_isolation.sql), validated only at this application layer.
-export const SERVERS = ["live", "sb1", "sb2", "newsb"] as const;
+// The 3 fully isolated vatSys connection targets this API distinguishes between. See
+// NetworkServer.cs in the plugin for how a client determines its own value; a new server is a
+// one-line change here, not a migration - server is stored as free text (migrations/
+// 006_server_isolation.sql), validated only at this application layer. LocalHost is deliberately
+// not one of these - OzServer does not operate there at all (NetworkServer.Current is null for
+// it), so it never appears as a value a client could send.
+export const SERVERS = ["live", "sb1", "sb2"] as const;
 export type Server = typeof SERVERS[number];
 
 const identitySchema = z.object({
