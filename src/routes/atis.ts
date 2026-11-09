@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { parseServer } from "../auth.js";
 import { pool } from "../db.js";
+import { ATIS_SECTIONS } from "../network-atis.js";
 
 const atisSchema = z.object({
   icao: z.string().trim().length(4).transform(value => value.toUpperCase()),
@@ -34,10 +35,14 @@ export async function publicAtisRoutes(app: FastifyInstance): Promise<void> {
   // content is the ATIS split into its sections (see network-atis.ts's atisContent) - every section
   // is always present, null when the broadcast doesn't include it.
   const networkAtisQuery = "SELECT icao,atis_code AS atis_letter,content,last_updated FROM network_atis";
+  // jsonb does not keep key order (it stores them shortest-first), so content is rebuilt here in the
+  // order the sections appear in the vatSys ATIS editor.
+  const inEditorOrder = (rows: Array<{ content: Partial<Record<string, string | null>> }>) =>
+    rows.map(row => ({ ...row, content: Object.fromEntries(ATIS_SECTIONS.map(section => [section, row.content[section] ?? null])) }));
 
   app.get("/vatsim/atis", async () =>
-    (await pool.query(`${networkAtisQuery} ORDER BY icao,callsign`)).rows);
+    inEditorOrder((await pool.query(`${networkAtisQuery} ORDER BY icao,callsign`)).rows));
 
   app.get<{ Params: { icao: string } }>("/vatsim/atis/:icao", async request =>
-    (await pool.query(`${networkAtisQuery} WHERE icao=$1 ORDER BY callsign`, [request.params.icao.toUpperCase()])).rows);
+    inEditorOrder((await pool.query(`${networkAtisQuery} WHERE icao=$1 ORDER BY callsign`, [request.params.icao.toUpperCase()])).rows));
 }
