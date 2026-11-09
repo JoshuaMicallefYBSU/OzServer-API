@@ -46,7 +46,7 @@ export function atisContent(lines: readonly string[]): AtisContent {
   const text = lines.join(" ");
   const tags = [...text.matchAll(tagPattern)];
   tags.forEach((tag, index) => {
-    const section = ATIS_SECTIONS.find(name => name === normaliseTag(tag[1]));
+    const section = ATIS_SECTIONS.find(name => name === normaliseTag(tag[1] ?? ""));
     if (!section) return;
     const end = tags[index + 1]?.index ?? text.length;
     const value = text.slice((tag.index ?? 0) + tag[0].length, end).replace(/\s+/g, " ").trim();
