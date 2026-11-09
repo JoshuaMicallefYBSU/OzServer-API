@@ -31,16 +31,13 @@ export async function publicAtisRoutes(app: FastifyInstance): Promise<void> {
 
   // Every VATPAC ATIS connected to the live VATSIM network, plugin user or not - mirrored from the
   // datafeed by network-atis-sync.ts. No ?server=: the datafeed only describes the live network.
-  // lat/lon come from the airport's first vatSys dataset position, if it has one (null otherwise).
-  const networkAtisQuery = `
-    SELECT a.callsign,a.icao,a.atis_code,a.frequency,a.text_atis,a.cid,a.name,a.logon_time,a.last_updated,
-           a.synced_at,p.default_lat AS lat,p.default_lon AS lon
-      FROM network_atis a
-      LEFT JOIN LATERAL (SELECT default_lat,default_lon FROM positions WHERE asmgcs_airport=a.icao ORDER BY name LIMIT 1) p ON true`;
+  // content is the ATIS split into its sections (see network-atis.ts's atisContent) - every section
+  // is always present, null when the broadcast doesn't include it.
+  const networkAtisQuery = "SELECT icao,atis_code AS atis_letter,content,last_updated FROM network_atis";
 
   app.get("/vatsim/atis", async () =>
-    (await pool.query(`${networkAtisQuery} ORDER BY a.icao,a.callsign`)).rows);
+    (await pool.query(`${networkAtisQuery} ORDER BY icao,callsign`)).rows);
 
   app.get<{ Params: { icao: string } }>("/vatsim/atis/:icao", async request =>
-    (await pool.query(`${networkAtisQuery} WHERE a.icao=$1 ORDER BY a.callsign`, [request.params.icao.toUpperCase()])).rows);
+    (await pool.query(`${networkAtisQuery} WHERE icao=$1 ORDER BY callsign`, [request.params.icao.toUpperCase()])).rows);
 }

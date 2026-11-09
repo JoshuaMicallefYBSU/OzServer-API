@@ -22,14 +22,14 @@ export async function syncNetworkAtis(): Promise<void> {
       // The WHERE on the update is what makes the row count mean "something actually changed", so
       // a sync that found the same broadcasts as last time announces nothing.
       const result = await client.query(
-        `INSERT INTO network_atis (callsign,icao,atis_code,frequency,text_atis,cid,name,logon_time,last_updated,synced_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())
+        `INSERT INTO network_atis (callsign,icao,atis_code,frequency,text_atis,cid,name,logon_time,last_updated,content,synced_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now())
          ON CONFLICT (callsign) DO UPDATE SET icao=$2,atis_code=$3,frequency=$4,text_atis=$5,cid=$6,name=$7,
-           logon_time=$8,last_updated=$9,synced_at=now()
-         WHERE (network_atis.atis_code,network_atis.frequency,network_atis.text_atis,network_atis.cid)
-           IS DISTINCT FROM ($3::varchar,$4::varchar,$5::text[],$6::integer)`,
+           logon_time=$8,last_updated=$9,content=$10,synced_at=now()
+         WHERE (network_atis.atis_code,network_atis.frequency,network_atis.text_atis,network_atis.cid,network_atis.content)
+           IS DISTINCT FROM ($3::varchar,$4::varchar,$5::text[],$6::integer,$10::jsonb)`,
         [atis.callsign, atis.icao, atis.atis_code, atis.frequency, atis.text_atis, atis.cid, atis.name,
-          atis.logon_time, atis.last_updated]);
+          atis.logon_time, atis.last_updated, JSON.stringify(atis.content)]);
       count += result.rowCount ?? 0;
     }
     const removed = await client.query("DELETE FROM network_atis WHERE NOT (callsign=ANY($1))",
