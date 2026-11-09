@@ -72,3 +72,10 @@ describe("atisContent", () => {
     expect(content.SIGWX).toBe("WIND SHEAR WARNING, A320 REPORTED MODERATE OVERSHOOT");
   });
 });
+
+describe("ZULU ATIS", () => {
+  it("keeps the raw text as content instead of splitting it into sections", () => {
+    const [zulu] = vatpacAtis([entry("YSSY_ATIS", { atis_code: "Z", text_atis: ["ATIS YSSY ZULU", "[RWY] NOT A SECTION, JUST TEXT"] })], new Set());
+    expect(zulu?.content).toBe("ATIS YSSY ZULU [RWY] NOT A SECTION, JUST TEXT");
+  });
+});

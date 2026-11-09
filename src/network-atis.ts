@@ -19,7 +19,9 @@ export type NetworkAtis = {
   atis_code: string | null;
   frequency: string;
   text_atis: string[];
-  content: AtisContent;
+  // The ATIS split into its sections, or - for a ZULU ATIS, which is free text with no sections -
+  // the raw broadcast text as-is.
+  content: AtisContent | string;
   cid: number;
   name: string | null;
   logon_time: string | null;
@@ -84,7 +86,7 @@ export function vatpacAtis(entries: readonly VatsimAtis[], datasetAirports: Read
       atis_code: code && code.length === 1 ? code : null,
       frequency: String(entry.frequency),
       text_atis: textAtis,
-      content: atisContent(textAtis),
+      content: code === "Z" ? textAtis.join(" ").trim() : atisContent(textAtis),
       cid: Number(entry.cid),
       name: entry.name ?? null,
       logon_time: entry.logon_time ?? null,

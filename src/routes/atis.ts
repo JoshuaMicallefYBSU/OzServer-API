@@ -36,9 +36,14 @@ export async function publicAtisRoutes(app: FastifyInstance): Promise<void> {
   // is always present, null when the broadcast doesn't include it.
   const networkAtisQuery = "SELECT icao,atis_code AS atis_letter,content,last_updated FROM network_atis";
   // jsonb does not keep key order (it stores them shortest-first), so content is rebuilt here in the
-  // order the sections appear in the vatSys ATIS editor.
-  const inEditorOrder = (rows: Array<{ content: Partial<Record<string, string | null>> }>) =>
-    rows.map(row => ({ ...row, content: Object.fromEntries(ATIS_SECTIONS.map(section => [section, row.content[section] ?? null])) }));
+  // order the sections appear in the vatSys ATIS editor. A ZULU ATIS's content is its raw text (a
+  // plain string), passed through untouched.
+  const inEditorOrder = (rows: Array<{ content: string | Partial<Record<string, string | null>> }>) =>
+    rows.map(row => {
+      const content = row.content;
+      return typeof content === "string" ? row
+        : { ...row, content: Object.fromEntries(ATIS_SECTIONS.map(section => [section, content[section] ?? null])) };
+    });
 
   app.get("/vatsim/atis", async () =>
     inEditorOrder((await pool.query(`${networkAtisQuery} ORDER BY icao,callsign`)).rows));
