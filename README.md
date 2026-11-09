@@ -11,6 +11,9 @@ preserving the plugin-facing `/api/v1` contract.
   groups from being claimed concurrently
 - Compact JSONB storage for flight data, avoiding a schema migration for every vatSys FDR field
 - Direct, short-lived caching of the VATSIM data and AFV transceiver feeds
+- Every VATPAC airport ATIS on the live network mirrored from the VATSIM datafeed into
+  `network_atis` every `NETWORK_ATIS_SYNC_SECONDS`, served publicly at `GET /api/v1/vatsim/atis`
+  and `GET /api/v1/vatsim/atis/:icao`
 - Docker deployment behind Caddy on `api.ozserver.org`
 
 ## Local setup

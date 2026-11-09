@@ -25,7 +25,10 @@ const schema = z.object({
   PRESENCE_TIMEOUT_SECONDS: z.coerce.number().positive().default(6),
   RESUME_WINDOW_MINUTES: z.coerce.number().positive().default(5),
   FDR_RETAIN_MINUTES: z.coerce.number().positive().default(15),
-  ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(60)
+  ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(60),
+  // How often network_atis is re-synced from the VATSIM datafeed (network-atis-sync.ts). The feed
+  // itself only republishes every ~15s and vatsim.ts caches it for 15s, so going lower buys nothing.
+  NETWORK_ATIS_SYNC_SECONDS: z.coerce.number().positive().default(30)
 });
 
 export const config = schema.parse(process.env);

@@ -13,8 +13,13 @@
 // the request heartbeat in app.ts already keep current in real time. If you're tempted to reach for
 // this module to answer "is controller X still around" for something OzServer already tracks
 // ownership of, don't - that question belongs to sector_ownerships.last_seen_online_at instead.
+//
+// The one other reader is network-atis-sync.ts, which mirrors every VATPAC ATIS on the network into
+// network_atis - again a question about the network as a whole, not about an OzServer controller.
+import type { VatsimAtis } from "./network-atis.js";
+
 type Controller = { cid: number; callsign: string; frequency?: string };
-type VatsimData = { controllers?: Controller[] };
+type VatsimData = { controllers?: Controller[]; atis?: VatsimAtis[] };
 type TransceiverEntry = { callsign: string; transceivers?: Array<{ frequency: number }> };
 
 const CACHE_MS = 15_000;
