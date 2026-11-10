@@ -59,9 +59,11 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     for (const name of (await readdir(directory)).filter(file => file.endsWith(".sql")).sort()) {
       await db.query(await readFile(resolve(directory, name), "utf8"));
     }
+    // name and full_name are separate parameters on purpose: the columns are varchar and text, and
+    // Postgres refuses to infer one parameter as both.
     const sector = (name: string, callsign: string | null, responsible: string[]) => db.query(
-      "INSERT INTO sectors (name,full_name,callsign,type,responsible_sectors) VALUES ($1,$1,$2,'CTR',$3)",
-      [name, callsign, JSON.stringify(responsible)]);
+      "INSERT INTO sectors (name,full_name,callsign,type,responsible_sectors) VALUES ($1,$2,$3,'CTR',$4)",
+      [name, name, callsign, JSON.stringify(responsible)]);
     await sector("GRP", "XX-GRP_CTR", ["INA", "OUT"]);
     await sector("INA", "XX-INA_CTR", []);
     await sector("OUT", "XX-OUT_APP", []);
