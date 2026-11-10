@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { parseServer } from "../auth.js";
 import { config } from "../config.js";
-import { addClient, clientCount } from "../events.js";
+import { addClient, canAddClient, clientCount } from "../events.js";
 
 // Idle intermediaries drop a connection that sends nothing. A comment frame is ignored by every
 // SSE client but keeps the socket alive.
@@ -11,6 +11,12 @@ export async function eventRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Querystring: { server?: string } }>("/events", (request, reply) => {
     const server = parseServer(request.query.server);
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
+
+    // See canAddClient: a subscriber that is turned away keeps working off its own fallback poll,
+    // so refusing one costs latency and nothing else.
+    if (!canAddClient(request.ip)) {
+      return reply.code(503).header("Retry-After", "30").send({ message: "Too many event subscribers." });
+    }
 
     // Fastify must be told to stop managing this response, or it will try to send its own on top
     // of the stream we are about to write by hand.
@@ -28,7 +34,12 @@ export async function eventRoutes(app: FastifyInstance): Promise<void> {
     });
     reply.raw.write(": connected\n\n");
 
-    const remove = addClient({ write: chunk => reply.raw.write(chunk), server });
+    const remove = addClient({
+      write: chunk => reply.raw.write(chunk),
+      end: () => reply.raw.end(),
+      server,
+      ip: request.ip
+    });
     const heartbeat = setInterval(() => {
       try {
         reply.raw.write(": ping\n\n");
@@ -43,6 +54,7 @@ export async function eventRoutes(app: FastifyInstance): Promise<void> {
     };
     request.raw.on("close", close);
     request.raw.on("error", close);
+    reply.raw.on("close", close);
   });
 
   app.get("/events/status", async () => ({ subscribers: clientCount() }));

@@ -16,6 +16,36 @@ import { sectorRoutes } from "./routes/sectors.js";
 export async function buildApp() {
   const app = Fastify({ logger: true, trustProxy: true, bodyLimit: 2 * 1024 * 1024 });
   await app.register(cors, { origin: config.WEBSITE_ORIGIN, methods: ["GET"] });
+
+  // A fixed ten second window per address, held in memory. Nothing here authenticates a caller, so
+  // this is the only thing between a script in a loop and the database: without it one client could
+  // fill client_logs, hold the sector lock busy, or simply crowd every controller's poll out of the
+  // connection pool. Deliberately generous (see RATE_LIMIT_PER_10S) - a controller wrongly turned
+  // away stops heartbeating, which costs them far more than an abuser being let through costs us.
+  // Per process, which is right for the single container this runs as; behind Caddy on the same
+  // host, request.ip is the real client address (trustProxy above).
+  const RATE_WINDOW_MS = 10_000;
+  const hits = new Map<string, { count: number; resetAt: number }>();
+  const sweepHits = setInterval(() => {
+    const now = Date.now();
+    for (const [ip, entry] of hits) if (entry.resetAt <= now) hits.delete(ip);
+  }, 60_000);
+  sweepHits.unref();
+  app.addHook("onClose", async () => clearInterval(sweepHits));
+  app.addHook("onRequest", async (request, reply) => {
+    if (request.url === "/health") return;
+    const now = Date.now();
+    let entry = hits.get(request.ip);
+    if (!entry || entry.resetAt <= now) {
+      entry = { count: 0, resetAt: now + RATE_WINDOW_MS };
+      hits.set(request.ip, entry);
+    }
+    if (++entry.count > config.RATE_LIMIT_PER_10S) {
+      return reply.code(429)
+        .header("Retry-After", String(Math.ceil((entry.resetAt - now) / 1000)))
+        .send({ message: "Too many requests - slow down." });
+    }
+  });
   app.get("/health", async (_request, reply) => {
     try {
       await pool.query("SELECT 1");
@@ -41,11 +71,26 @@ export async function buildApp() {
     // third-party feed with its own separate publish lag in both directions. Runs before the route
     // itself so it cannot be skipped by an early return, and is a no-op (0 rows matched) for a
     // controller who owns nothing yet, so it's safe unconditionally.
+    //
+    // The same heartbeat keeps this controller's shared notes and drawings alive. Those used to be
+    // refreshed only by their author reading GET /annotations, which the plugin does on connect and
+    // on an "annotations" signal - so five quiet minutes with nobody drawing expired every
+    // annotation on the server while its author sat there connected. Presence is one question and
+    // is now answered in one place. Only rows going stale are touched (the sweep's window is
+    // minutes), so an ordinary poll is not rewriting every stroke a controller has drawn each time.
     pluginApi.addHook("preHandler", async request => {
       try {
-        await pool.query(
-          "UPDATE sector_ownerships SET last_seen_online_at=now() WHERE controller_cid=$1 AND controller_callsign=$2 AND server=$3",
-          [request.controller.cid, request.controller.callsign, request.controller.server]);
+        const identity = [request.controller.cid, request.controller.callsign, request.controller.server];
+        await Promise.all([
+          pool.query(
+            "UPDATE sector_ownerships SET last_seen_online_at=now() WHERE controller_cid=$1 AND controller_callsign=$2 AND server=$3",
+            identity),
+          pool.query(
+            `UPDATE annotations SET last_seen_online_at=now()
+              WHERE author_cid=$1 AND author_callsign=$2 AND server=$3
+                AND last_seen_online_at < now()-interval '30 seconds'`,
+            identity)
+        ]);
       } catch (error) {
         app.log.warn(error, "Could not refresh controller heartbeat.");
       }

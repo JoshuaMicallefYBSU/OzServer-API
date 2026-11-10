@@ -27,6 +27,16 @@ preserving the plugin-facing `/api/v1` contract.
 
 `GET /health` checks both the API process and its database connection.
 
+## Tests
+
+`npm test` runs the unit tests anywhere. The route tests in `src/api.integration.test.ts` need a
+Postgres they are allowed to wipe, and are skipped without one:
+
+    docker run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=test postgres:17-alpine
+    TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres npm test
+
+CI runs them on every push and pull request.
+
 ## Production
 
 Use one Linux account per administrator and individual SSH public keys. Do not share private keys.
@@ -59,6 +69,10 @@ Deployment is pull-based. A systemd timer runs `ozserver-deploy` every two minut
 redeploys only when `origin/main` has moved:
 
     git fetch -> rebuild -> up -d -> db:migrate:prod -> health check
+
+The container also applies pending migrations itself before it starts serving (see the Dockerfile's
+`CMD`), so new code never runs against the old schema; the script's own `db:migrate:prod` then finds
+nothing left to do.
 
 The health check gates the deploy. If `/health` does not report `"database":"ok"` within about a
 minute, the script resets to the previous commit and rebuilds, so a bad push leaves the previous

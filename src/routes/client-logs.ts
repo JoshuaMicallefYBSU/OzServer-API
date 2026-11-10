@@ -1,6 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { timingSafeEqual } from "node:crypto";
 import { parseServer } from "../auth.js";
+import { config } from "../config.js";
 import { pool } from "../db.js";
 
 // Collects every controller's plugin log so two clients can be compared side by side - see
@@ -9,6 +11,25 @@ import { pool } from "../db.js";
 // Batched by the client, so the cap is per request rather than per line. Generous enough that a
 // reconnect burst arrives in one call, bounded so a looping client cannot post unbounded volume.
 const MaxLinesPerBatch = 200;
+
+// How far a line's own timestamp may sit from the server's clock before it is pulled back to it.
+// The client clock is only ever used for ordering, and a little disagreement between two clients
+// is itself worth seeing - but a clock that is days out (or a deliberately absurd `at`) would file
+// the line outside every window anyone ever queries.
+const MaxClockSkewMs = 12 * 60 * 60 * 1000;
+
+// "30 minutes", "2 hours", "1 day". Passed to Postgres as an interval, which accepts a great deal
+// more than this and answers anything it does not with an error - so an unvalidated value was a
+// 500 for a typo, and "100 years" was a scan of the whole table.
+const sinceSchema = z.string().trim().regex(/^\d{1,4}\s*(second|minute|hour|day)s?$/i).default("30 minutes");
+const limitSchema = z.coerce.number().int().min(1).max(5000).default(500);
+
+function tokenMatches(presented: string | undefined, expected: string): boolean {
+  if (!presented) return false;
+  const left = Buffer.from(presented);
+  const right = Buffer.from(expected);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
 
 const batchSchema = z.object({
   lines: z.array(z.object({
@@ -45,7 +66,7 @@ export async function protectedClientLogRoutes(app: FastifyInstance): Promise<vo
       [request.controller.cid, request.controller.callsign, request.controller.server,
        lines.map(line => line.category),
        lines.map(line => line.message),
-       lines.map(line => line.at),
+       lines.map(line => Math.abs(line.at.getTime() - Date.now()) > MaxClockSkewMs ? new Date() : line.at),
        lines.map(line => line.plugin_version ?? null),
        lines.map(line => line.session_id ?? null),
        lines.map(line => line.sequence ?? null),
@@ -79,10 +100,27 @@ export async function publicClientLogRoutes(app: FastifyInstance): Promise<void>
   app.get<{ Querystring: {
     since?: string; callsign?: string; category?: string; limit?: string;
     sector?: string; fdr_callsign?: string; request_id?: string; session_id?: string; server?: string;
+    token?: string;
   } }>(
     "/client-logs", async (request, reply) => {
-      const since = request.query.since ?? "30 minutes";
-      const limit = Math.min(Number(request.query.limit) || 500, 5000);
+      // Optional gate - see CLIENT_LOGS_TOKEN. Everything this returns names a controller.
+      if (config.CLIENT_LOGS_TOKEN) {
+        const header = request.headers.authorization;
+        const presented = header?.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : request.query.token;
+        if (!tokenMatches(presented, config.CLIENT_LOGS_TOKEN)) {
+          return reply.code(401).send({ message: "A valid token is required to read client logs." });
+        }
+      }
+
+      const parsedSince = sinceSchema.safeParse(request.query.since);
+      const parsedLimit = limitSchema.safeParse(request.query.limit);
+      if (!parsedSince.success || !parsedLimit.success) {
+        return reply.code(400).send({
+          message: "since must look like '30 minutes' (seconds, minutes, hours or days) and limit must be 1-5000."
+        });
+      }
+      const since = parsedSince.data;
+      const limit = parsedLimit.data;
       const server = request.query.server === undefined ? null : parseServer(request.query.server);
       if (request.query.server !== undefined && server === null) {
         return reply.code(400).send({ message: "server, if given, must be one of the known servers." });

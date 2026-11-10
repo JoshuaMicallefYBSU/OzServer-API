@@ -8,6 +8,7 @@ import {
   transferFlightsToCurrentSectorOwners
 } from "./grouping.js";
 import { isWithinStartupGrace } from "./presence.js";
+import { SERVERS, type Server } from "./auth.js";
 import type { ControllerIdentity } from "./types.js";
 
 export async function runMaintenance(): Promise<void> {
@@ -15,7 +16,15 @@ export async function runMaintenance(): Promise<void> {
   // grace window, so a restart of this server is never read as every controller disconnecting at
   // once - every real client gets that same window to make a request and refresh its own row first.
   const withinStartupGrace = isWithinStartupGrace(config.DISCONNECT_GRACE_MINUTES * 60_000);
-  const affectedServers = await transaction(async client => {
+  const affected = await transaction(async client => {
+    // The same per-server lock every sector mutation takes (sectors.ts lockMutations), in a fixed
+    // order. The sweep deletes and re-inserts ownership rows across many sectors at once, and
+    // without it it could interleave with a claim working through the same rows in a different
+    // order - a deadlock Postgres resolves by killing one of the two, which is a claim answered 500
+    // or a sweep that silently did nothing this minute.
+    for (const server of SERVERS) {
+      await client.query("SELECT pg_advisory_xact_lock(684276, hashtext($1))", [server]);
+    }
     // Grouped by server, not pooled into one flat list: ownership is now per-server, a single
     // sweep pass can span multiple servers' disconnects at once, and reassignFreedSectors needs to
     // know which server's sector_ownerships to search for each freed id - a reassignment must
@@ -94,19 +103,32 @@ export async function runMaintenance(): Promise<void> {
     await client.query("DELETE FROM sector_requests WHERE rejected_at < now()-interval '1 day'");
     // Kept for a day. Long enough to look into something reported the next morning, short enough
     // that a busy evening's worth of every controller's logs is not accumulated indefinitely.
-    await client.query("DELETE FROM client_logs WHERE logged_at < now()-interval '1 day'");
+    //
+    // By created_at, not logged_at. logged_at is the *client's* clock (see client-logs.ts), and
+    // purging on it meant a client whose clock ran ahead - or one simply sending a far-future
+    // timestamp - wrote rows this never removed.
+    await client.query("DELETE FROM client_logs WHERE created_at < now()-interval '1 day'");
     // Shared notes and drawings outlive a momentary drop but not a sign-off, on the same grace the
-    // sectors above use. Keyed off last_seen_online_at, which every read by the author refreshes -
-    // so this only ever catches a controller whose client has actually stopped calling.
-    await client.query(
-      "DELETE FROM annotations WHERE last_seen_online_at < now()-($1*interval '1 minute')",
-      [config.DISCONNECT_GRACE_MINUTES]);
+    // sectors above use. Keyed off last_seen_online_at, which every request the author's client
+    // makes refreshes (the heartbeat hook in app.ts) - so this only ever catches a controller whose
+    // client has actually stopped calling.
+    //
+    // Held off for the same startup window as the sector sweep above, and for the same reason:
+    // straight after a restart every row looks as stale as this process's own downtime was long.
+    const expiredAnnotations = withinStartupGrace ? [] : (await client.query<{ server: string }>(
+      "DELETE FROM annotations WHERE last_seen_online_at < now()-($1*interval '1 minute') RETURNING server",
+      [config.DISCONNECT_GRACE_MINUTES])).rows;
     await client.query("DELETE FROM resume_snapshots WHERE created_at < now()-($1*interval '1 minute')", [config.RESUME_WINDOW_MINUTES]);
-    return [...new Set(droppedOwners.map(owner => owner.server))];
+    return {
+      sectors: [...new Set(droppedOwners.map(owner => owner.server))],
+      annotations: [...new Set(expiredAnnotations.map(row => row.server as Server))]
+    };
   });
   // A disconnect sweep frees sectors without any request having been made, so nothing else would
   // announce it - subscribers would sit on a stale picture until their own fallback poll. Published
   // once per server actually affected by this pass, never a single unscoped event: one sweep can
   // release sectors on more than one server at a time, and a subscriber only watches one.
-  for (const server of affectedServers) await publish({ type: "sectors", server });
+  for (const server of affected.sectors) await publish({ type: "sectors", server });
+  // Likewise for markup that just expired: without a signal every other scope kept drawing it.
+  for (const server of affected.annotations) await publish({ type: "annotations", server });
 }

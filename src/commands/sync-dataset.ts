@@ -62,6 +62,17 @@ await transaction(async client => {
       seenSectors.push(name);
     }
   }
+  // Deleting a sector cascades to whoever owns it right now, so this one statement can take live
+  // ownership away from connected controllers. It should only ever do that for a sector the dataset
+  // really dropped - not because a fetch came back with a different shape than this parser expects
+  // and "every sector" suddenly reads as "a handful". A real release removes a few sectors at most;
+  // losing more than a fifth of them in one sync is treated as a broken fetch and refused.
+  const known = Number((await client.query("SELECT count(*) AS count FROM sectors")).rows[0].count);
+  const surviving = Number((await client.query(
+    "SELECT count(*) AS count FROM sectors WHERE name=ANY($1)", [seenSectors])).rows[0].count);
+  if (known > 0 && surviving < known * 0.8) {
+    throw new Error(`Refusing to sync: the dataset now lists only ${surviving} of the ${known} sectors already known.`);
+  }
   await client.query("DELETE FROM sectors WHERE NOT (name=ANY($1))", [seenSectors]);
 
   const seenPositions: string[] = [];

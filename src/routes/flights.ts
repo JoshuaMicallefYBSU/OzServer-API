@@ -22,7 +22,11 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
       `SELECT s.name FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
         WHERE o.controller_cid=$1 AND o.server=$2`, [identity.cid, identity.server])).rows.map(row => row.name));
     const results: Array<{ callsign: string; updated: boolean }> = [];
-    for (const flight of flights) {
+    // Locked in one fixed order. Each row is taken FOR UPDATE below and held to the end of the
+    // batch, so two controllers' batches naming the same two aircraft in opposite orders each took
+    // one and waited for the other - a deadlock Postgres breaks by failing one whole batch.
+    const ordered = [...flights].sort((left, right) => left.callsign < right.callsign ? -1 : left.callsign > right.callsign ? 1 : 0);
+    for (const flight of ordered) {
       const existing = (await client.query(
         "SELECT controlling_cid,controlling_callsign,current_sector,data FROM flight_data_records WHERE callsign=$1 AND server=$2 FOR UPDATE", [flight.callsign, identity.server])).rows[0];
 
@@ -141,8 +145,10 @@ export async function flightRoutes(app: FastifyInstance): Promise<void> {
   app.post("/fdr", async (request, reply) => {
     const parsed = flightSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(422).send({ message: "Invalid flight data.", errors: parsed.error.flatten() });
-    await upsert([parsed.data], request.controller);
-    return parsed.data;
+    // `updated` is false when the push was refused because another controller holds authority -
+    // this used to answer with the submitted flight either way, which read as success.
+    const [result] = await upsert([parsed.data], request.controller);
+    return { ...parsed.data, updated: result?.updated ?? false };
   });
   app.post("/fdr/batch", async (request, reply) => {
     const parsed = z.object({ flights: z.array(flightSchema).max(500) }).safeParse(request.body);
