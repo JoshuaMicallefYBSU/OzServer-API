@@ -20,13 +20,30 @@ type SectorRow = {
   controller_callsign: string | null; last_seen_online_at: Date | null;
 };
 
+const sectorNames = z.array(z.string().max(32)).max(400);
+
 const mutationSchema = z.object({
-  claim: z.array(z.string()).default([]),
-  release: z.array(z.string()).default([]),
-  request: z.array(z.string()).default([]),
+  claim: sectorNames.default([]),
+  release: sectorNames.default([]),
+  request: sectorNames.default([]),
   // Applied to every sector in `claim` - see claimGroup's `exclusions`.
-  exclude: z.array(z.string()).default([])
+  exclude: sectorNames.default([]),
+  // See claimGroup's `primaryGroup`.
+  primary_group: sectorNames.optional()
 });
+
+// The single-sector claim's body. Everything is optional: a plain claim sends nothing but its
+// identity.
+const claimSchema = z.object({
+  exclude: sectorNames.default([]),
+  primary_group: sectorNames.optional()
+});
+
+// Validated rather than trusted. These used to go to Postgres as whatever arrived - a non-numeric
+// id, or request_ids that was not an array - and came back as a 500 from a type error deep in a
+// query, logged as a server fault for what was simply a malformed request.
+const requestIdSchema = z.coerce.number().int().positive();
+const requestIdsSchema = z.object({ request_ids: z.array(requestIdSchema).max(400).default([]) });
 
 async function lockMutations(client: pg.PoolClient, server: string): Promise<void> {
   // Sector groups overlap. One transaction-wide lock makes the complete check-and-write operation
@@ -143,7 +160,8 @@ async function claimGroup(
   identity: ControllerIdentity,
   name: string,
   exclusions: string[] = [],
-  allOrNothing = false
+  allOrNothing = false,
+  primaryGroup?: string[]
 ): Promise<{ claimed: string[]; skipped: string[]; withheld: string[]; conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }>; missing: boolean }> {
   const rows = (await covered(client, name, identity.server)).filter(row => !exclusions.includes(row.name));
   if (rows.length === 0) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: true };
@@ -158,6 +176,20 @@ async function claimGroup(
       && row.callsign?.toUpperCase() === row.controller_callsign.toUpperCase())
     .map(row => row.controller_callsign!.toUpperCase()));
   const overriddenTopDown: Array<{ sector: string; owner: { cid: number; callsign: string } }> = [];
+  // The sectors of the claimant's own position (Positions.xml, as the plugin's PrimaryPosition
+  // derives it), when the client sends them.
+  //
+  // A named primary taking a sector straight off whoever extended into it is right for the
+  // position's own group - that is what "the primary owns the position" means, and the holder's
+  // client hands the same sectors back on its side (PrimaryPositionWatcher). It is wrong for the
+  // rest of what the claim merely *covers*: responsible_sectors reaches further than the position
+  // does for eight positions in the current dataset (an arriving Inverell's claim sweeps up five
+  // Brisbane TCU sectors, Benalla's four of Melbourne Approach's, Gundagai's nine of Sydney's), and
+  // the override took those off a controller who was present and working them, with no request and
+  // nothing on their side expecting it. Unowned or abandoned cover is still claimed as before; only
+  // the override is confined to the group. A client that does not send it gets the old behaviour.
+  const primaryGroupNames = primaryGroup ? new Set(primaryGroup.map(group => group.toUpperCase())) : null;
+  const overrideAllowed = (row: SectorRow) => primaryGroupNames === null || primaryGroupNames.has(row.name.toUpperCase());
 
   for (const row of rows) {
     if (row.controller_cid === null || row.controller_cid === identity.cid
@@ -167,7 +199,7 @@ async function claimGroup(
     }
     const ownerIsLoggedOnForThisSector = row.callsign?.toUpperCase() === row.controller_callsign?.toUpperCase();
     const ownerHasPositionInThisClaim = positionOwnersInClaim.has(row.controller_callsign?.toUpperCase() ?? "");
-    if (claimantIsNamedPrimary && !ownerIsLoggedOnForThisSector && !ownerHasPositionInThisClaim) {
+    if (claimantIsNamedPrimary && overrideAllowed(row) && !ownerIsLoggedOnForThisSector && !ownerHasPositionInThisClaim) {
       takeable.push(row);
       overriddenTopDown.push({ sector: row.name, owner: { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } });
       continue;
@@ -222,6 +254,19 @@ async function claimGroup(
     client,
     takeable.map(row => ({ sector: row.name, cid: row.controller_cid, callsign: row.controller_callsign })),
     identity);
+
+  // Requests this claim has made meaningless. One still pending against a sector that just changed
+  // hands names a target who no longer owns it: nobody can accept it (transferRequest checks both),
+  // the requester sees it pending forever, cannot ask again (one request per sector), and their
+  // client stays on its fast poll waiting for an answer that cannot come. And the claimant's own
+  // request for a sector they now hold has been overtaken by events. Both simply go - a request
+  // disappearing is what the requester's client already sees on an accept or a cancel.
+  await client.query(
+    `DELETE FROM sector_requests
+      WHERE server=$3
+        AND ((sector_id=ANY($1) AND rejected_at IS NULL) OR (sector_id=ANY($2) AND requesting_cid=$4))`,
+    [takeable.filter(row => row.controller_cid !== null && row.controller_cid !== identity.cid).map(row => row.id),
+     takeable.map(row => row.id), identity.server, identity.cid]);
 
   if (takeable.length > 0 || skipped.length > 0 || withheld.length > 0 || exclusions.length > 0) {
     await writeDiagnosticLog(client, identity, "ServerSector", `Claim ${name}: ${takeable.length} claimed, ${skipped.length} skipped, ${withheld.length} withheld`, {
@@ -359,10 +404,12 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
   app.get("/sectors/controlled", async request => (await syncPayload(pool, request.controller)).controlled);
   app.get("/sector-requests", async request => requestsPayload(pool, request.controller));
 
-  app.post<{ Params: { name: string }; Body: { exclude?: string[] } }>("/sectors/:name/claim", async (request, reply) => {
+  app.post<{ Params: { name: string } }>("/sectors/:name/claim", async (request, reply) => {
+    const parsed = claimSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(422).send({ message: "Invalid sector claim.", errors: parsed.error.flatten() });
     const result = await transaction(async client => {
       await lockMutations(client, request.controller.server);
-      return claimGroup(client, request.controller, request.params.name, request.body?.exclude ?? [], true);
+      return claimGroup(client, request.controller, request.params.name, parsed.data.exclude, true, parsed.data.primary_group);
     });
     if (result.missing) return reply.code(404).send({ message: "Sector not found." });
     if (result.skipped.length) return reply.code(409).send({ message: "Some of these sectors are already owned.", conflicts: result.conflicts });
@@ -374,20 +421,26 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     return released ? reply.code(204).send() : reply.code(403).send({ message: "Only the current owner may release this sector." });
   });
 
-  app.post<{ Params: { name: string } }>("/sectors/:name/request", async (request, reply) => transaction(async client => {
+  // Every route below that runs in a transaction returns its answer *out* of the transaction and
+  // sends it afterwards. Two of them used to call reply.send() from inside the callback, which put
+  // the response on the wire before COMMIT: the caller was told "done" for something that could
+  // still roll back, and the change signal the response triggers could reach other clients before
+  // the change it announced was visible to them.
+  app.post<{ Params: { name: string } }>("/sectors/:name/request", async (request, reply) => {
+    const outcome = await transaction(async (client): Promise<{ code: number; body: unknown }> => {
     await lockMutations(client, request.controller.server);
     const sector = (await client.query(
       `SELECT s.id,o.controller_cid,o.controller_callsign FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.name=$1`,
       [request.params.name, request.controller.server])).rows[0];
-    if (!sector) return reply.code(404).send({ message: "Sector not found." });
-    if (!sector.controller_cid) return reply.code(400).send({ message: "Sector is unclaimed - claim it directly instead of requesting it." });
-    if (sector.controller_cid === request.controller.cid) return reply.code(400).send({ message: "You already own this sector." });
+    if (!sector) return { code: 404, body: { message: "Sector not found." } };
+    if (!sector.controller_cid) return { code: 400, body: { message: "Sector is unclaimed - claim it directly instead of requesting it." } };
+    if (sector.controller_cid === request.controller.cid) return { code: 400, body: { message: "You already own this sector." } };
     await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND server=$3 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid, request.controller.server]);
     const inserted = await client.query(
       `INSERT INTO sector_requests (sector_id,requesting_cid,requesting_callsign,target_cid,target_callsign,server)
        VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (sector_id,requesting_cid,server) DO NOTHING RETURNING *`,
       [sector.id, request.controller.cid, request.controller.callsign, sector.controller_cid, sector.controller_callsign, request.controller.server]);
-    if (!inserted.rows[0]) return reply.code(409).send({ message: "You already have a pending request for this sector." });
+    if (!inserted.rows[0]) return { code: 409, body: { message: "You already have a pending request for this sector." } };
     await writeDiagnosticLog(client, request.controller, "ServerSector", `Requested ${request.params.name} from ${sector.controller_callsign}`, {
       action: "request_create",
       request_id: Number(inserted.rows[0].id),
@@ -395,8 +448,10 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       from: { cid: request.controller.cid, callsign: request.controller.callsign },
       to: { cid: sector.controller_cid, callsign: sector.controller_callsign }
     });
-    return reply.code(201).send(inserted.rows[0]);
-  }));
+    return { code: 201, body: inserted.rows[0] };
+    });
+    return reply.code(outcome.code).send(outcome.body);
+  });
 
   app.post("/sectors/commit", async (request, reply) => {
     const parsed = mutationSchema.safeParse(request.body);
@@ -411,7 +466,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       const result = { claimed: [] as string[], released: [] as string[], requested: [] as string[], skipped: [] as string[], withheld: [] as string[], failed: [] as string[] };
       for (const name of parsed.data.release) (await releaseGroup(client, request.controller, name) ? result.released : result.failed).push(name);
       for (const name of parsed.data.claim) {
-        const claimed = await claimGroup(client, request.controller, name, parsed.data.exclude);
+        const claimed = await claimGroup(client, request.controller, name, parsed.data.exclude, false, parsed.data.primary_group);
         if (claimed.missing) result.failed.push(name); else { result.claimed.push(...claimed.claimed); result.skipped.push(...claimed.skipped); result.withheld.push(...claimed.withheld); }
       }
       for (const name of parsed.data.request) {
@@ -439,7 +494,8 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
-  app.post("/sectors/release-all", async (request, reply) => transaction(async client => {
+  app.post("/sectors/release-all", async (request, reply) => {
+    await transaction(async client => {
     await lockMutations(client, request.controller.server);
     const sectors = (await client.query(
       `SELECT s.name FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
@@ -470,11 +526,44 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       fdr_authority_transferred: transferredFlights,
       fdr_authority_cleared: clearedFlights
     });
+    });
     return reply.code(204).send();
-  }));
+  });
 
   app.post("/sectors/resume", async request => transaction(async client => {
     await lockMutations(client, request.controller.server);
+
+    // What this controller still holds under a *different* callsign, from a session that has gone
+    // quiet. Ownership is decided by cid alone (claimGroup, releaseGroup, /sectors/sync's `mine`)
+    // but kept alive and released by cid and callsign together (the heartbeat, release-all, the
+    // sweep), so a controller who dropped and came back as another position was left "owning" the
+    // old position's sectors under a callsign nobody was connected as: listed as theirs, never
+    // heartbeated, untouched by their own release-all, and read by claimGroup as a controller
+    // logged on to a position they had left - until the sweep finally removed them minutes later.
+    // Coming back as someone else is the end of that session, so it is closed here the way the
+    // sweep would close it. Only rows already past the presence window: a second client genuinely
+    // connected under the same cid (a SweatBox mentor running two positions) is still heartbeating
+    // its own, and is left alone. Never straight after a restart, when every row looks stale.
+    const superseded = isWithinStartupGrace(config.PRESENCE_TIMEOUT_SECONDS * 1000) ? [] : (await client.query<{ sector_id: string; controller_callsign: string }>(
+      `DELETE FROM sector_ownerships
+        WHERE controller_cid=$1 AND server=$2 AND controller_callsign<>$3
+          AND last_seen_online_at < now()-($4*interval '1 second')
+        RETURNING sector_id,controller_callsign`,
+      [request.controller.cid, request.controller.server, request.controller.callsign, config.PRESENCE_TIMEOUT_SECONDS])).rows;
+    if (superseded.length > 0) {
+      const previousCallsigns = [...new Set(superseded.map(row => row.controller_callsign))];
+      await reassignFreedSectors(client, superseded.map(row => row.sector_id), request.controller.server);
+      for (const callsign of previousCallsigns) {
+        const previous = { cid: request.controller.cid, callsign, server: request.controller.server };
+        await transferFlightsToCurrentSectorOwners(client, previous);
+        await clearFlightsWithoutCurrentSectorOwner(client, previous);
+      }
+      await writeDiagnosticLog(client, request.controller, "ServerSector", "Closed a previous session under another callsign", {
+        action: "resume_superseded_session",
+        previous_callsigns: previousCallsigns,
+        sector_ids: superseded.map(row => row.sector_id)
+      });
+    }
     const snapshot = (await client.query(
       "DELETE FROM resume_snapshots WHERE controller_cid=$1 AND controller_callsign=$2 AND server=$3 RETURNING *",
       [request.controller.cid, request.controller.callsign, request.controller.server])).rows[0];
@@ -554,27 +643,37 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     return { resumed, flights: restoredFlights, sync: await syncPayload(client, request.controller) };
   }));
 
-  app.post<{ Params: { id: string } }>("/sector-requests/:id/accept", async (request, reply) => transaction(async client => {
-    await lockMutations(client, request.controller.server);
-    const sector = await transferRequest(client, request.controller, Number(request.params.id));
-    return sector ? { message: "Ownership transferred.", sync: await syncPayload(client, request.controller) }
+  app.post<{ Params: { id: string } }>("/sector-requests/:id/accept", async (request, reply) => {
+    const id = requestIdSchema.safeParse(request.params.id);
+    const sync = !id.success ? null : await transaction(async client => {
+      await lockMutations(client, request.controller.server);
+      const sector = await transferRequest(client, request.controller, id.data);
+      return sector ? syncPayload(client, request.controller) : null;
+    });
+    return sync ? { message: "Ownership transferred.", sync }
       : reply.code(403).send({ message: "Only the sector's current owner may accept this request." });
-  }));
+  });
 
-  app.post<{ Body: { request_ids?: number[] } }>("/sector-requests/accept-batch", async request => transaction(async client => {
+  app.post("/sector-requests/accept-batch", async (request, reply) => {
+    const parsed = requestIdsSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(422).send({ message: "Invalid request ids.", errors: parsed.error.flatten() });
+    return transaction(async client => {
     await lockMutations(client, request.controller.server);
     const results = [];
-    for (const id of request.body?.request_ids ?? []) {
+    for (const id of parsed.data.request_ids) {
       const sector = await transferRequest(client, request.controller, id);
       results.push({ request_id: id, sector, accepted: sector !== null,
         message: sector ? "Ownership transferred." : "Request no longer exists or is not yours to accept." });
     }
     return { results, sync: await syncPayload(client, request.controller) };
-  }));
+    });
+  });
 
   // Mirrors accept-batch so declining a grouped request is one call rather than one per sector.
-  app.post<{ Body: { request_ids?: number[] } }>("/sector-requests/reject-batch", async request => {
-    const ids = request.body?.request_ids ?? [];
+  app.post("/sector-requests/reject-batch", async (request, reply) => {
+    const parsed = requestIdsSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return reply.code(422).send({ message: "Invalid request ids.", errors: parsed.error.flatten() });
+    const ids = parsed.data.request_ids;
     const changed = await pool.query(
       "UPDATE sector_requests SET rejected_at=now() WHERE id=ANY($1) AND target_cid=$2 AND server=$3 AND rejected_at IS NULL RETURNING id",
       [ids, request.controller.cid, request.controller.server]);
@@ -587,6 +686,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post<{ Params: { id: string } }>("/sector-requests/:id/reject", async (request, reply) => {
+    if (!requestIdSchema.safeParse(request.params.id).success) return reply.code(403).send({ message: "This request cannot be rejected." });
     const changed = await pool.query(
       "UPDATE sector_requests SET rejected_at=now() WHERE id=$1 AND target_cid=$2 AND server=$3 AND rejected_at IS NULL RETURNING id",
       [request.params.id, request.controller.cid, request.controller.server]);
@@ -598,6 +698,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     return changed.rowCount ? { message: "Request rejected.", sync: await syncPayload(pool, request.controller) } : reply.code(403).send({ message: "This request cannot be rejected." });
   });
   app.post<{ Params: { id: string } }>("/sector-requests/:id/cancel", async (request, reply) => {
+    if (!requestIdSchema.safeParse(request.params.id).success) return reply.code(403).send({ message: "This request cannot be cancelled." });
     const changed = await pool.query(
       "DELETE FROM sector_requests WHERE id=$1 AND requesting_cid=$2 AND server=$3 RETURNING id",
       [request.params.id, request.controller.cid, request.controller.server]);
@@ -609,6 +710,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     return changed.rowCount ? { message: "Request cancelled.", sync: await syncPayload(pool, request.controller) } : reply.code(403).send({ message: "This request cannot be cancelled." });
   });
   app.post<{ Params: { id: string } }>("/sector-requests/:id/acknowledge-rejection", async (request, reply) => {
+    if (!requestIdSchema.safeParse(request.params.id).success) return reply.code(404).send({ message: "Rejected request not found." });
     const changed = await pool.query(
       "DELETE FROM sector_requests WHERE id=$1 AND requesting_cid=$2 AND server=$3 AND rejected_at IS NOT NULL RETURNING id",
       [request.params.id, request.controller.cid, request.controller.server]);

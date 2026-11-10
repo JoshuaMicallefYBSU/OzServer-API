@@ -51,6 +51,10 @@ const updateSchema = z.object({
   message: "Nothing to update."
 });
 
+// An id that is not a uuid cannot name a row, and Postgres says so with a type error rather than
+// "no rows" - a 500 for a malformed request. Checked first, and answered the way a missing row is.
+const idSchema = z.string().uuid();
+
 type AnnotationRow = {
   id: string;
   kind: string;
@@ -111,6 +115,9 @@ export async function annotationRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) {
       return reply.code(422).send({ message: "Invalid annotation update.", errors: parsed.error.flatten() });
     }
+    if (!idSchema.safeParse(request.params.id).success) {
+      return reply.code(403).send({ message: "Only the author may change this annotation." });
+    }
 
     // COALESCE so an update carrying only one of the two leaves the other alone, rather than the
     // route having to build a different statement per combination.
@@ -134,6 +141,9 @@ export async function annotationRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post<{ Params: { id: string } }>("/annotations/:id/delete", async (request, reply) => {
+    if (!idSchema.safeParse(request.params.id).success) {
+      return reply.code(403).send({ message: "Only the author may delete this annotation." });
+    }
     const deleted = await pool.query(
       "DELETE FROM annotations WHERE id=$1 AND author_cid=$2 AND author_callsign=$3 AND server=$4",
       [request.params.id, request.controller.cid, request.controller.callsign, request.controller.server]);

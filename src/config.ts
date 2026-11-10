@@ -28,7 +28,18 @@ const schema = z.object({
   ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(60),
   // How often network_atis is re-synced from the VATSIM datafeed (network-atis-sync.ts). The feed
   // itself only republishes every ~15s and vatsim.ts caches it for 15s, so going lower buys nothing.
-  NETWORK_ATIS_SYNC_SECONDS: z.coerce.number().positive().default(30)
+  NETWORK_ATIS_SYNC_SECONDS: z.coerce.number().positive().default(30),
+  // Requests one address may make in any ten seconds before it is answered 429 (see app.ts). A
+  // connected plugin makes two or three a second at its busiest, and a map viewer about the same,
+  // so this is roughly ten of either behind one address - far above honest use, far below a loop.
+  RATE_LIMIT_PER_10S: z.coerce.number().int().positive().default(300),
+  // Open /events streams the process will hold at once, across every address (see events.ts).
+  MAX_EVENT_SUBSCRIBERS: z.coerce.number().int().positive().default(500),
+  // When set, GET /client-logs requires it (Authorization: Bearer, or ?token=). Unset keeps the
+  // endpoint public, which is how it has run so far - it returns every controller's CID, callsign
+  // and decision log for the last day to anyone who asks, so set this once the console page can
+  // send it.
+  CLIENT_LOGS_TOKEN: z.string().trim().min(16).optional()
 });
 
 export const config = schema.parse(process.env);
