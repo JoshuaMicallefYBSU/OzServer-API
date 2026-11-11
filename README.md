@@ -13,7 +13,11 @@ preserving the plugin-facing `/api/v1` contract.
 - Direct, short-lived caching of the VATSIM data and AFV transceiver feeds
 - Every VATPAC airport ATIS on the live network mirrored from the VATSIM datafeed into
   `network_atis` every `NETWORK_ATIS_SYNC_SECONDS`, served publicly at `GET /api/v1/vatsim/atis`
-  and `GET /api/v1/vatsim/atis/:icao`
+  and `GET /api/v1/vatsim/atis/:icao`. Each entry carries `atis_letter`, `content` (the broadcast
+  split into its vatSys sections, every section always present and `null` when not broadcast),
+  `changed` (the sections this letter changed, from the `+` markers vatSys writes into the text -
+  e.g. `["RWY","OPR INFO"]`) and `last_updated` as a `DDHHMMz` day-time group (`110615z`). A
+  station connected without a letter is not mirrored, so an entry always describes a real broadcast
 - Docker deployment behind Caddy on `api.ozserver.org`
 
 ## Local setup

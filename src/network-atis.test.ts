@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { atisContent, atisIcao, vatpacAtis, type VatsimAtis } from "./network-atis.js";
+import { atisChanges, atisContent, atisIcao, atisTimestamp, vatpacAtis, type VatsimAtis } from "./network-atis.js";
 
 const entry = (callsign: string, extra: Partial<VatsimAtis> = {}): VatsimAtis =>
   ({ cid: 1234567, callsign, frequency: "128.300", atis_code: "A", text_atis: ["SYDNEY INFORMATION A"], ...extra });
@@ -27,9 +27,16 @@ describe("vatpacAtis", () => {
     expect(vatpacAtis([entry("YSSY_ATIS"), entry("YSSY_D_ATIS")], new Set()).map(atis => atis.icao)).toEqual(["YSSY", "YSSY"]);
   });
 
-  it("normalises a missing letter and text", () => {
-    expect(vatpacAtis([entry("YMML_ATIS", { atis_code: null, text_atis: null })], new Set())[0])
-      .toMatchObject({ icao: "YMML", atis_code: null, text_atis: [] });
+  it("drops a station with no ATIS letter instead of mirroring an empty broadcast", () => {
+    expect(vatpacAtis([entry("YMAV_ATIS", { atis_code: null, text_atis: null }), entry("YMML_ATIS")], new Set())
+      .map(atis => atis.callsign)).toEqual(["YMML_ATIS"]);
+    expect(vatpacAtis([entry("YMAV_ATIS", { atis_code: "  " })], new Set())).toEqual([]);
+  });
+
+  it("normalises missing text and reports the sections the letter changed", () => {
+    expect(vatpacAtis([entry("YMML_ATIS", { text_atis: null })], new Set())[0])
+      .toMatchObject({ icao: "YMML", atis_code: "A", text_atis: [], changed: [] });
+    expect(vatpacAtis([entry("YMML_ATIS", { text_atis: ["+[RWY] 34", "[QNH] 1020"] })], new Set())[0]?.changed).toEqual(["RWY"]);
   });
 });
 
@@ -73,9 +80,38 @@ describe("atisContent", () => {
   });
 });
 
+describe("atisChanges", () => {
+  it("lists the sections marked with a + in ATIS editor order, not text order", () => {
+    expect(atisChanges(["ATIS YMML V 090232", "+[OPR INFO] WORKS IN PROGRESS", "+[RWY] 34", "[QNH] 1020"]))
+      .toEqual(["RWY", "OPR INFO"]);
+  });
+
+  it("is empty when the letter changed nothing", () => {
+    expect(atisChanges(["[RWY] 34", "[QNH] 1020"])).toEqual([]);
+  });
+
+  it("ignores a + on a tag that is not a served section, and does not repeat a section", () => {
+    expect(atisChanges(["+[MODE] 34 PROPS IVA", "+[SFC_COND] WET", "+[SFC COND] WET"])).toEqual(["SFC COND"]);
+  });
+});
+
+describe("atisTimestamp", () => {
+  it("formats an instant as a UTC day-time group", () => {
+    expect(atisTimestamp("2026-11-11T06:06:31.574Z")).toBe("110606z");
+    expect(atisTimestamp(new Date(Date.UTC(2026, 10, 1, 0, 5)))).toBe("010005z");
+  });
+
+  it("passes through a missing or unreadable timestamp as null", () => {
+    expect(atisTimestamp(null)).toBeNull();
+    expect(atisTimestamp(undefined)).toBeNull();
+    expect(atisTimestamp("not a date")).toBeNull();
+  });
+});
+
 describe("ZULU ATIS", () => {
   it("keeps the raw text as content instead of splitting it into sections", () => {
-    const [zulu] = vatpacAtis([entry("YSSY_ATIS", { atis_code: "Z", text_atis: ["ATIS YSSY ZULU", "[RWY] NOT A SECTION, JUST TEXT"] })], new Set());
-    expect(zulu?.content).toBe("ATIS YSSY ZULU [RWY] NOT A SECTION, JUST TEXT");
+    const [zulu] = vatpacAtis([entry("YSSY_ATIS", { atis_code: "Z", text_atis: ["ATIS YSSY ZULU", "+[RWY] NOT A SECTION, JUST TEXT"] })], new Set());
+    expect(zulu?.content).toBe("ATIS YSSY ZULU +[RWY] NOT A SECTION, JUST TEXT");
+    expect(zulu?.changed).toEqual([]);
   });
 });
