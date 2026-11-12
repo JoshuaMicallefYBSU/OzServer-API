@@ -134,14 +134,10 @@ export async function publicAtisRoutes(app: FastifyInstance): Promise<void> {
     return reply.code(row.created ? 201 : 200).send(forPublisher(row));
   });
 
-  // Take an airport's ATIS down - the controller running it has signed off. Answered 204 either
-  // way: a plugin withdrawing an ATIS that is already gone has got what it asked for.
-  app.delete<{ Params: { icao: string }; Querystring: { token?: string } }>("/vatsim/atis/:icao", async (request, reply) => {
-    if (!mayPublish(request)) return reply.code(401).send(denied);
-    const removed = await pool.query("DELETE FROM network_atis WHERE icao=$1", [request.params.icao.trim().toUpperCase()]);
-    if (removed.rowCount) await publish({ type: "atis", server: "live" });
-    return reply.code(204).send();
-  });
+  // There is deliberately no way to withdraw an ATIS. A controller signing off does not unsay the
+  // broadcast they were making, and the last letter they published is still the best answer to
+  // "what is YSSY running" for a while afterwards - so a record leaves only by being replaced, or
+  // by ageing out in runMaintenance (NETWORK_ATIS_RETAIN_MINUTES).
 
   app.get("/vatsim/atis", async () =>
     (await pool.query<NetworkAtisRow>(`SELECT ${ATIS_COLUMNS} FROM network_atis ORDER BY icao`)).rows.map(forApi));

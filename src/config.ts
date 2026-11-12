@@ -27,11 +27,11 @@ const schema = z.object({
   FDR_RETAIN_MINUTES: z.coerce.number().positive().default(15),
   ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(60),
   // How long an ATIS published with PUT /api/v1/vatsim/atis/:icao survives without being heard
-  // from again before runMaintenance deletes it. A plugin is expected to withdraw its own ATIS on
-  // sign-off (DELETE); this is what catches the one whose client crashed, closed vatSys without
-  // withdrawing, or simply lost the network - and it bounds how wrong a broadcast nobody is making
-  // any more can be. Measured from the last PUT, so a plugin re-publishing an unchanged ATIS keeps
-  // it alive indefinitely, which is correct: it is still on the air.
+  // from again before runMaintenance deletes it - the only way a record ever leaves, short of
+  // being replaced by a later one. There is no withdraw: a controller signing off does not unsay
+  // the broadcast, and the last letter they published stays the best available answer for a while
+  // afterwards. Measured from the last PUT, so a plugin re-publishing an unchanged ATIS keeps it
+  // alive indefinitely, which is correct: it is still on the air.
   NETWORK_ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(90),
   // Requests one address may make in any ten seconds before it is answered 429 (see app.ts). A
   // connected plugin makes two or three a second at its busiest, and a map viewer about the same,
@@ -44,7 +44,7 @@ const schema = z.object({
   // and decision log for the last day to anyone who asks, so set this once the console page can
   // send it.
   CLIENT_LOGS_TOKEN: z.string().trim().min(16).optional(),
-  // When set, PUT and DELETE /api/v1/vatsim/atis/:icao require it (Authorization: Bearer, or
+  // When set, PUT /api/v1/vatsim/atis/:icao requires it (Authorization: Bearer, or
   // ?token=). Unset leaves publishing an ATIS open to anyone who can reach this API, which is how
   // it ships - set it once the ATIS plugin can send one, and give that plugin the same value.
   ATIS_TOKEN: z.string().trim().min(16).optional()

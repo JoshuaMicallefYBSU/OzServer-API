@@ -45,14 +45,19 @@ than refused, in `content` and in `changed` alike. `controller` is required, `fr
 `client` are optional, and anything else in the body is ignored. A body whose `icao` disagrees with
 the URL, or that carries no ATIS letter, is answered `422` and stores nothing.
 
-`DELETE /api/v1/vatsim/atis/YSSY` takes an ATIS down when the controller running it signs off. It
-answers `204` whether or not there was one to remove, so a plugin need not check first.
-
-An ATIS also expires on its own `NETWORK_ATIS_RETAIN_MINUTES` (90) after the last `PUT` that
-carried it - the sweep in `maintenance.ts`, for the client that crashed or dropped without
-withdrawing. Measured from when the broadcast last reached this API rather than from `issued`, so
-a plugin that re-publishes an unchanged ATIS keeps it alive for as long as it is on the air, while
+There is no way to withdraw an ATIS: a record leaves only by being replaced, or by ageing out
+`NETWORK_ATIS_RETAIN_MINUTES` (90) after the last `PUT` that carried it - the sweep in
+`maintenance.ts`. A controller signing off does not unsay the broadcast they were making, and the
+letter they last published stays the best answer to "what is YSSY running" for a while afterwards.
+The clock runs from when the broadcast last reached this API rather than from `issued`, so a
+plugin that re-publishes an unchanged ATIS keeps it alive for as long as it is on the air, while
 one that publishes only on change has 90 minutes from each broadcast.
+
+Published ATIS are drawn on the public map: `GET /api/v1/map/atis` returns them placed at their
+airport (so an airport the dataset has no position for is served by `/vatsim/atis` but cannot be
+mapped), alongside the vatSys ATIS an OzServer controller's own client pushed with `POST /atis`
+for any airport with no published one. Both come back in the same shape - a published ATIS wins
+where an airport has both.
 
 Read it back with `GET /api/v1/vatsim/atis` (every airport, by ICAO) or
 `GET /api/v1/vatsim/atis/:icao` (one airport, or `null`). The response is the broadcast as
@@ -63,7 +68,7 @@ response is the one exception, since it answers the plugin that just sent them. 
 changing publishes the existing `atis` server-sent event.
 
 Publishing is open to anything that can reach the API unless `ATIS_TOKEN` is set, in which case
-`PUT` and `DELETE` require it as `Authorization: Bearer <token>` (or `?token=`).
+`PUT` requires it as `Authorization: Bearer <token>` (or `?token=`).
 
 ## Local setup
 

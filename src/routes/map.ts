@@ -2,10 +2,37 @@ import type { FastifyInstance } from "fastify";
 import { parseServer } from "../auth.js";
 import { config } from "../config.js";
 import { pool } from "../db.js";
+import { atisSectionContent, atisTimestamp } from "../network-atis.js";
 import { afvTransceivers, vatsimData } from "../vatsim.js";
 
 const visibleTypes = ["TWR", "APP", "DEP", "CTR", "FSS"];
 const typePriority: Record<string, number> = { FMP: 0, CTR: 1, FSS: 1, APP: 2, DEP: 2, TWR: 3, GND: 3, DEL: 3 };
+
+// atis_broadcasts keeps a frequency FSD-style - (MHz - 100) * 1000, so 132.500 is stored as 32500
+// - where a published ATIS carries the text the controller typed ("126.250"). The map wants the
+// one readable form either way.
+const fsdFrequency = (value: number | null): string | null =>
+  value === null || value === undefined ? null : (100 + value / 1000).toFixed(3);
+
+type AtisMapRow = { icao: string; atis_letter: string; content: unknown; lat: number; lon: number };
+
+// One ATIS as the map draws it, whichever table it came out of. content is rebuilt in ATIS-editor
+// order (jsonb does not keep key order, and a vatSys push can carry editor-only tags like MODE
+// that are not part of the broadcast); a zulu ATIS's free text passes through as the string it is.
+function mapAtis(row: AtisMapRow, type: string, frequency: string | null, time: Date | string | null, changed: string[]) {
+  return {
+    icao: row.icao,
+    lat: row.lat,
+    lon: row.lon,
+    atis_letter: row.atis_letter,
+    type,
+    frequency,
+    content: typeof row.content === "string" ? row.content
+      : atisSectionContent((row.content ?? {}) as Record<string, string | null>),
+    changed,
+    issued: atisTimestamp(time)
+  };
+}
 
 export async function mapRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Querystring: { server?: string } }>("/map/sectors", async (request, reply) => {
@@ -57,13 +84,38 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
   app.get("/map/sector-shapes", async () => (await pool.query(
     "SELECT name,full_name,type,callsign,responsible_sectors,boundary FROM sectors ORDER BY name")).rows);
 
+  // Every ATIS the map can draw, in one shape whichever way it reached this server: the ones a
+  // vatSys ATIS plugin published (network_atis - see routes/atis.ts), and, for an airport that has
+  // no published ATIS, the vatSys ATIS an OzServer controller's own client pushed
+  // (atis_broadcasts). Published wins where both exist: it is the broadcast itself, with its
+  // sections, its letter and the time the controller issued it, rather than our record of what one
+  // controller's plugin last sent us.
+  //
+  // Only an airport the dataset holds a position for can be drawn, since that is where lat/lon
+  // comes from - an ATIS published for anywhere else is still served by /vatsim/atis, just not
+  // placed on the map.
   app.get<{ Querystring: { server?: string } }>("/map/atis", async (request, reply) => {
     const server = parseServer(request.query.server);
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
-    return (await pool.query(
-      `SELECT a.*,p.default_lat AS lat,p.default_lon AS lon FROM atis_broadcasts a JOIN positions p ON p.asmgcs_airport=a.icao
-        WHERE a.server=$2 AND a.last_seen_at >= now()-($1*interval '1 minute')`,
+    // ?server= scopes the atis_broadcasts half only: network_atis has no server of its own (an
+    // ATIS is a broadcast on the network), so the published ones are the same on every view.
+    const published = (await pool.query(
+      `SELECT a.icao,a.atis_letter,a.type,a.frequency,a.content,a.changed,a.issued,
+              p.default_lat AS lat,p.default_lon AS lon
+         FROM network_atis a JOIN positions p ON p.asmgcs_airport=a.icao`)).rows;
+    const pushed = (await pool.query(
+      `SELECT a.icao,a.atis_letter,a.frequency,a.content,a.last_seen_at,
+              p.default_lat AS lat,p.default_lon AS lon
+         FROM atis_broadcasts a JOIN positions p ON p.asmgcs_airport=a.icao
+        WHERE a.server=$2 AND a.last_seen_at >= now()-($1*interval '1 minute')
+          AND NOT EXISTS (SELECT 1 FROM network_atis n WHERE n.icao=a.icao)`,
       [config.ATIS_RETAIN_MINUTES, server])).rows;
+    return [
+      ...published.map(row => mapAtis(row, row.type, row.frequency, row.issued, row.changed)),
+      // atis_broadcasts holds no issue time of its own, so the time it last reached us stands in,
+      // and nothing in it is marked as changed - vatSys sends that plugin the content only.
+      ...pushed.map(row => mapAtis(row, "atis", fsdFrequency(row.frequency), row.last_seen_at, []))
+    ];
   });
 
   app.get<{ Querystring: { server?: string } }>("/map/controllers", async (request, reply) => {

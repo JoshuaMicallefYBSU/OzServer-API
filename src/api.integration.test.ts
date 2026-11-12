@@ -68,6 +68,11 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     await sector("INA", "XX-INA_CTR", []);
     await sector("OUT", "XX-OUT_APP", []);
     await sector("FAR", "XX-FAR_CTR", []);
+    // The map places an ATIS at its airport's position, so an airport the dataset has no position
+    // for cannot be drawn at all - see /map/atis.
+    await db.query(
+      `INSERT INTO positions (name,asmgcs_airport,default_lat,default_lon)
+       VALUES ('YSSY_SMC','YSSY',-33.94,151.18),('YBBN_SMC','YBBN',-27.38,153.12)`);
 
     app = await (await import("./app.js")).buildApp();
     runMaintenance = (await import("./maintenance.js")).runMaintenance;
@@ -81,7 +86,7 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE sector_ownerships, sector_requests, flight_data_records, annotations, client_logs, resume_snapshots, network_atis");
+    await db.query("TRUNCATE sector_ownerships, sector_requests, flight_data_records, annotations, client_logs, resume_snapshots, network_atis, atis_broadcasts");
   });
 
   it("rejects a request with no controller identity", async () => {
@@ -289,11 +294,11 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     });
 
     it("tells the publisher who it recorded, and tells nobody else", async () => {
-      const published = (await put("YSSY")).json();
-      expect(published.controller).toEqual({ callsign: "SY_TWR", cid: 1234567 });
-      expect(published.client).toEqual({ name: "vatSys ATIS Plugin", version: "4.3" });
+      const answer = (await put("YSSY")).json();
+      expect(answer.controller).toEqual({ callsign: "SY_TWR", cid: 1234567 });
+      expect(answer.client).toEqual({ name: "vatSys ATIS Plugin", version: "4.3" });
       // The broadcast is public; the controller behind it and the build they run are not.
-      const read = (await app.inject({ method: "GET", url: "/api/v1/vatsim/atis" })).json()[0];
+      const read = (await published()).json()[0];
       expect(read).not.toHaveProperty("controller");
       expect(read).not.toHaveProperty("client");
     });
@@ -323,12 +328,34 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect((await published()).json()).toHaveLength(1);
     });
 
-    it("takes an ATIS down when the controller running it signs off", async () => {
+    it("is drawn on the map at its airport, letter, sections and all", async () => {
       await put("YSSY");
-      expect((await app.inject({ method: "DELETE", url: "/api/v1/vatsim/atis/YSSY" })).statusCode).toBe(204);
-      expect((await published("YSSY")).json()).toBeNull();
-      // Withdrawing one that is already gone is the same answer, so a plugin need not check first.
-      expect((await app.inject({ method: "DELETE", url: "/api/v1/vatsim/atis/YSSY" })).statusCode).toBe(204);
+      const markers = (await app.inject({ method: "GET", url: "/api/v1/map/atis?server=live" })).json();
+      expect(markers).toHaveLength(1);
+      expect(markers[0]).toMatchObject({
+        icao: "YSSY", atis_letter: "N", type: "atis", frequency: "126.250", issued: "120914",
+        changed: ["WIND", "QNH"], lat: -33.94, lon: 151.18
+      });
+      expect(markers[0].content.QNH).toBe("1013");
+    });
+
+    it("shares the map with the vatSys ATIS pushed for an airport that has none published", async () => {
+      // What an OzServer controller's own vatSys pushes (POST /atis), for an airport with no
+      // published ATIS: same shape on the map, frequency converted out of its FSD form.
+      await post("/atis", primary, { icao: "YBBN", atis_letter: "C", frequency: 32500, content: { QNH: "1012", MODE: "01" } });
+      await put("YSSY");
+      const markers = (await app.inject({ method: "GET", url: "/api/v1/map/atis?server=live" })).json();
+      expect(markers.map((marker: { icao: string }) => marker.icao).sort()).toEqual(["YBBN", "YSSY"]);
+      const brisbane = markers.find((marker: { icao: string }) => marker.icao === "YBBN");
+      expect(brisbane).toMatchObject({ atis_letter: "C", frequency: "132.500", changed: [] });
+      expect(brisbane.content).not.toHaveProperty("MODE");
+      expect(brisbane.content.QNH).toBe("1012");
+    });
+
+    it("cannot be withdrawn - time is the only thing that takes one down", async () => {
+      await put("YSSY");
+      expect((await app.inject({ method: "DELETE", url: "/api/v1/vatsim/atis/YSSY" })).statusCode).toBe(404);
+      expect((await published("YSSY")).json()).toMatchObject({ icao: "YSSY" });
     });
   });
 
