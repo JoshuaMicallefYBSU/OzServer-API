@@ -1,7 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { timingSafeEqual } from "node:crypto";
-import { parseServer } from "../auth.js";
+import { parseServer, tokenMatches } from "../auth.js";
 import { config } from "../config.js";
 import { pool } from "../db.js";
 
@@ -23,13 +22,6 @@ const MaxClockSkewMs = 12 * 60 * 60 * 1000;
 // 500 for a typo, and "100 years" was a scan of the whole table.
 const sinceSchema = z.string().trim().regex(/^\d{1,4}\s*(second|minute|hour|day)s?$/i).default("30 minutes");
 const limitSchema = z.coerce.number().int().min(1).max(5000).default(500);
-
-function tokenMatches(presented: string | undefined, expected: string): boolean {
-  if (!presented) return false;
-  const left = Buffer.from(presented);
-  const right = Buffer.from(expected);
-  return left.length === right.length && timingSafeEqual(left, right);
-}
 
 const batchSchema = z.object({
   lines: z.array(z.object({

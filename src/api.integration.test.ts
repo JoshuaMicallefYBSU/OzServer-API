@@ -81,7 +81,7 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE sector_ownerships, sector_requests, flight_data_records, annotations, client_logs, resume_snapshots");
+    await db.query("TRUNCATE sector_ownerships, sector_requests, flight_data_records, annotations, client_logs, resume_snapshots, network_atis");
   });
 
   it("rejects a request with no controller identity", async () => {
@@ -250,6 +250,67 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     await goQuiet(extender);
     await runMaintenance();
     expect(await mine(primary)).toEqual(["GRP", "INA", "OUT"]);
+  });
+
+  // PUT /vatsim/atis/:icao is how an ATIS reaches this server now - published by the vatSys ATIS
+  // plugin rather than mirrored from VATSIM's datafeed, and with no controller identity in the
+  // body, so it does not go through pluginAuth the way everything above does.
+  describe("the ATIS a vatSys ATIS plugin publishes", () => {
+    const sydney = {
+      icao: "YSSY", callsign: "YSSY_ATIS", atis_letter: "N", type: "atis", frequency: "126.250",
+      issued: "2026-11-12T09:14:00Z",
+      content: { "RWY": "34L FOR ARRS, RWY 34R FOR DEPS", "WIND": "320/15-25", "QNH": "1013" },
+      changed: ["QNH", "WIND"],
+      controller: { callsign: "SY_TWR", cid: "1234567" },
+      client: { name: "vatSys ATIS Plugin", version: "4.3" }
+    };
+    const put = (icao: string, atis: Record<string, unknown> = sydney) =>
+      app.inject({ method: "PUT", url: `/api/v1/vatsim/atis/${icao}`, payload: atis });
+    // No trailing slash when every airport is wanted: Fastify matches these as two distinct routes.
+    const published = (icao?: string) =>
+      app.inject({ method: "GET", url: icao ? `/api/v1/vatsim/atis/${icao}` : "/api/v1/vatsim/atis" });
+
+    it("creates the airport's record, and replaces it when the same body comes again", async () => {
+      expect((await put("YSSY")).statusCode).toBe(201);
+      const again = await put("YSSY");
+      expect(again.statusCode).toBe(200);
+      expect(again.json()).toMatchObject({ icao: "YSSY", atis_letter: "N", issued: "120914z" });
+      expect((await published()).json()).toHaveLength(1);
+    });
+
+    it("serves the sections in editor order and the change list in it too", async () => {
+      await put("YSSY");
+      const atis = (await published("yssy")).json();
+      expect(Object.keys(atis.content))
+        .toEqual(["APCH", "RWY", "SFC COND", "OPR INFO", "WIND", "VIS", "WX", "CLD", "TMP", "QNH", "SIGWX"]);
+      expect(atis.content.RWY).toBe("34L FOR ARRS, RWY 34R FOR DEPS");
+      expect(atis.content.APCH).toBeNull();
+      expect(atis.changed).toEqual(["WIND", "QNH"]);
+      expect(atis.controller).toEqual({ callsign: "SY_TWR", cid: 1234567 });
+      expect(atis.client).toEqual({ name: "vatSys ATIS Plugin", version: "4.3" });
+    });
+
+    it("keeps a zulu broadcast's text as its content", async () => {
+      await put("YSCB", {
+        ...sydney, icao: "YSCB", callsign: "YSCB_ATIS", atis_letter: "Z", type: "zulu",
+        content: "CANBERRA TOWER IS CLOSED ... CONTACT CANBERRA APPROACH ON 124.500 ...", changed: []
+      });
+      expect((await published("YSCB")).json().content).toBe("CANBERRA TOWER IS CLOSED ... CONTACT CANBERRA APPROACH ON 124.500 ...");
+    });
+
+    it("refuses a body that contradicts its URL, or carries no letter, and stores neither", async () => {
+      expect((await put("YMML")).statusCode).toBe(422);
+      expect((await put("YSSY", { ...sydney, atis_letter: "" })).statusCode).toBe(422);
+      expect((await published()).json()).toEqual([]);
+    });
+
+    it("takes an ATIS down when the controller running it signs off", async () => {
+      await put("YSSY");
+      expect((await app.inject({ method: "DELETE", url: "/api/v1/vatsim/atis/YSSY" })).statusCode).toBe(204);
+      expect((await published("YSSY")).json()).toBeNull();
+      // Withdrawing one that is already gone is the same answer, so a plugin need not check first.
+      expect((await app.inject({ method: "DELETE", url: "/api/v1/vatsim/atis/YSSY" })).statusCode).toBe(204);
+    });
   });
 
   it("limits how fast one address may call", async () => {

@@ -11,14 +11,52 @@ preserving the plugin-facing `/api/v1` contract.
   groups from being claimed concurrently
 - Compact JSONB storage for flight data, avoiding a schema migration for every vatSys FDR field
 - Direct, short-lived caching of the VATSIM data and AFV transceiver feeds
-- Every VATPAC airport ATIS on the live network mirrored from the VATSIM datafeed into
-  `network_atis` every `NETWORK_ATIS_SYNC_SECONDS`, served publicly at `GET /api/v1/vatsim/atis`
-  and `GET /api/v1/vatsim/atis/:icao`. Each entry carries `atis_letter`, `content` (the broadcast
-  split into its vatSys sections, every section always present and `null` when not broadcast),
-  `changed` (the sections this letter changed, from the `+` markers vatSys writes into the text -
-  e.g. `["RWY","OPR INFO"]`) and `last_updated` as a `DDHHMMz` day-time group (`110615z`). A
-  station connected without a letter is not mirrored, so an entry always describes a real broadcast
+- ATIS published straight to this API by the vatSys ATIS plugin and served publicly at
+  `GET /api/v1/vatsim/atis` - see [ATIS](#atis)
 - Docker deployment behind Caddy on `api.ozserver.org`
+
+## ATIS
+
+The vatSys ATIS plugin publishes an airport's ATIS directly - one record per airport, created or
+replaced in full:
+
+```
+PUT /api/v1/vatsim/atis/YSSY
+{
+  "icao": "YSSY",
+  "callsign": "YSSY_ATIS",
+  "atis_letter": "N",
+  "type": "atis",
+  "frequency": "126.250",
+  "issued": "2026-11-12T09:14:00Z",
+  "content": { "APCH": "EXP INST APCH", "RWY": "34L FOR ARRS, RWY 34R FOR DEPS", "WIND": "320/15-25", "QNH": "1013" },
+  "changed": ["WIND", "QNH"],
+  "controller": { "callsign": "SY_TWR", "cid": "1234567" },
+  "client": { "name": "vatSys ATIS Plugin", "version": "4.3" }
+}
+```
+
+Sending the same body twice is harmless: `201` the first time, `200` after, and the stored record
+is the same either way. `type` is `atis` for a sectioned broadcast, or `zulu` for the free text a
+closed tower leaves running - a `zulu` sends its broadcast text as `content` (a plain string) and
+its `changed` is always empty. `changed` is the sections this letter changed, i.e. the ones vatSys
+marks with a leading `+`; a name this API does not serve (`MODE`, `TIME_CHECK`) is dropped rather
+than refused, in `content` and in `changed` alike. `controller` is required, `frequency` and
+`client` are optional, and anything else in the body is ignored. A body whose `icao` disagrees with
+the URL, or that carries no ATIS letter, is answered `422` and stores nothing.
+
+`DELETE /api/v1/vatsim/atis/YSSY` takes an ATIS down when the controller running it signs off. It
+answers `204` whether or not there was one to remove, so a plugin need not check first. Nothing
+else removes a record: an ATIS stays until it is replaced or deleted.
+
+Read it back with `GET /api/v1/vatsim/atis` (every airport, by ICAO) or
+`GET /api/v1/vatsim/atis/:icao` (one airport, or `null`). The response is the body that was
+published, with `issued` as a `DDHHMMz` day-time group (`120914z`), `controller.cid` as a number,
+and `content` carrying every section in ATIS-editor order - `null` for each one not broadcast.
+Either endpoint changing publishes the existing `atis` server-sent event.
+
+Publishing is open to anything that can reach the API unless `ATIS_TOKEN` is set, in which case
+`PUT` and `DELETE` require it as `Authorization: Bearer <token>` (or `?token=`).
 
 ## Local setup
 

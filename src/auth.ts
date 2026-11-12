@@ -1,3 +1,4 @@
+import { timingSafeEqual } from "node:crypto";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
@@ -33,6 +34,16 @@ export function parseControllerIdentity(source: unknown): { cid: number; callsig
 // user-typed free text, so there is nothing to normalise.
 export function parseServer(value: unknown): Server | null {
   return typeof value === "string" && (SERVERS as readonly string[]).includes(value) ? value as Server : null;
+}
+
+// For the shared-secret gates (CLIENT_LOGS_TOKEN, ATIS_TOKEN), which are a single configured
+// string rather than a per-caller credential. Compared in constant time so a wrong token cannot be
+// walked character by character from how long the answer took.
+export function tokenMatches(presented: string | undefined, expected: string): boolean {
+  if (!presented) return false;
+  const left = Buffer.from(presented);
+  const right = Buffer.from(expected);
+  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 export async function pluginAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {

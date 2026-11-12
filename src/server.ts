@@ -3,7 +3,6 @@ import { config } from "./config.js";
 import { pool } from "./db.js";
 import { closeAllClients, startEventListener, stopEventListener } from "./events.js";
 import { runMaintenance } from "./maintenance.js";
-import { syncNetworkAtis } from "./network-atis-sync.js";
 
 const app = await buildApp();
 // Never rejects and retries on its own for as long as the process lives (see events.ts), so a
@@ -12,10 +11,6 @@ const app = await buildApp();
 await startEventListener(app.log);
 const maintenanceTimer = setInterval(() => void runMaintenance().catch(error => app.log.error(error)), 60_000);
 maintenanceTimer.unref();
-const syncAtis = () => void syncNetworkAtis().catch(error => app.log.error(error));
-syncAtis();
-const networkAtisTimer = setInterval(syncAtis, config.NETWORK_ATIS_SYNC_SECONDS * 1000);
-networkAtisTimer.unref();
 
 let shuttingDown = false;
 const shutdown = async () => {
@@ -25,7 +20,6 @@ const shutdown = async () => {
   // exit is ours rather than a SIGKILL.
   setTimeout(() => process.exit(0), 8_000).unref();
   clearInterval(maintenanceTimer);
-  clearInterval(networkAtisTimer);
   // Open event streams first: app.close() waits for in-flight responses, and those never end on
   // their own.
   closeAllClients();

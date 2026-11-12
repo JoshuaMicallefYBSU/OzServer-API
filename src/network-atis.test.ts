@@ -1,103 +1,135 @@
 import { describe, expect, it } from "vitest";
-import { atisChanges, atisContent, atisIcao, atisTimestamp, vatpacAtis, type VatsimAtis } from "./network-atis.js";
+import { atisChangedSections, atisSectionContent, atisTimestamp, atisUpdateSchema } from "./network-atis.js";
 
-const entry = (callsign: string, extra: Partial<VatsimAtis> = {}): VatsimAtis =>
-  ({ cid: 1234567, callsign, frequency: "128.300", atis_code: "A", text_atis: ["SYDNEY INFORMATION A"], ...extra });
+// A complete, valid PUT body - the one in the plugin's API notes - which each test then varies.
+const body = (extra: Record<string, unknown> = {}) => ({
+  icao: "YSSY",
+  callsign: "YSSY_ATIS",
+  atis_letter: "N",
+  type: "atis",
+  frequency: "126.250",
+  issued: "2026-11-12T09:14:00Z",
+  content: {
+    "APCH": "EXP INST APCH",
+    "RWY": "34L FOR ARRS, RWY 34R FOR DEPS",
+    "SFC COND": null,
+    "OPR INFO": "INDEPENDENT PARALLEL APPROACHES IN PROGRESS",
+    "WIND": "320/15-25, MX XW 14KTS",
+    "VIS": "GT 10KM",
+    "WX": null,
+    "CLD": "FEW030",
+    "TMP": "18",
+    "QNH": "1013",
+    "SIGWX": null
+  },
+  changed: ["WIND", "QNH"],
+  controller: { callsign: "SY_TWR", cid: "1234567" },
+  client: { name: "vatSys ATIS Plugin", version: "4.3" },
+  ...extra
+});
 
-describe("atisIcao", () => {
-  it("reads the airport from plain and suffixed ATIS callsigns", () => {
-    expect(atisIcao("YSSY_ATIS")).toBe("YSSY");
-    expect(atisIcao("yssy_d_atis")).toBe("YSSY");
+const parse = (input: Record<string, unknown>) => atisUpdateSchema.safeParse(input);
+const accepted = (input: Record<string, unknown>) => {
+  const result = parse(input);
+  if (!result.success) throw new Error(`Expected a valid ATIS: ${result.error.message}`);
+  return result.data;
+};
+
+describe("atisUpdateSchema", () => {
+  it("accepts the published body and normalises its identifiers", () => {
+    const atis = accepted(body({ icao: "yssy", callsign: "yssy_atis", atis_letter: "n", type: "ATIS" }));
+    expect(atis).toMatchObject({
+      icao: "YSSY",
+      callsign: "YSSY_ATIS",
+      atis_letter: "N",
+      type: "atis",
+      frequency: "126.250",
+      controller: { callsign: "SY_TWR", cid: 1234567 },
+      client: { name: "vatSys ATIS Plugin", version: "4.3" }
+    });
+    expect(atis.issued.toISOString()).toBe("2026-11-12T09:14:00.000Z");
   });
 
-  it("rejects callsigns that are not an airport ATIS", () => {
-    expect(atisIcao("SY_APP")).toBeNull();
-    expect(atisIcao("ML-TBD_CTR")).toBeNull();
-    expect(atisIcao("YSSY_TWR")).toBeNull();
+  it("keeps a zulu broadcast's text as its content, with nothing marked changed", () => {
+    const atis = accepted(body({
+      type: "zulu",
+      content: "CANBERRA TOWER IS CLOSED ... CONTACT CANBERRA APPROACH ON 124.500 ...",
+      changed: ["RWY"]
+    }));
+    expect(atis.content).toBe("CANBERRA TOWER IS CLOSED ... CONTACT CANBERRA APPROACH ON 124.500 ...");
+    expect(atis.changed).toEqual([]);
+  });
+
+  it("refuses content that does not match the type it was published as", () => {
+    expect(parse(body({ type: "zulu" })).success).toBe(false);
+    expect(parse(body({ content: "JUST TEXT" })).success).toBe(false);
+  });
+
+  it("refuses a broadcast with nothing in it", () => {
+    expect(parse(body({ content: {} })).success).toBe(false);
+    expect(parse(body({ content: { "RWY": null, "QNH": "" } })).success).toBe(false);
+    // A section this API does not serve is not a broadcast either - it is dropped, not stored.
+    expect(parse(body({ content: { "MODE": "34 PROPS IVA" } })).success).toBe(false);
+    expect(parse(body({ type: "zulu", content: "   " })).success).toBe(false);
+  });
+
+  it("refuses a broadcast with no letter, a letter that is not one, or no airport", () => {
+    expect(parse(body({ atis_letter: null })).success).toBe(false);
+    expect(parse(body({ atis_letter: " " })).success).toBe(false);
+    expect(parse(body({ atis_letter: "NA" })).success).toBe(false);
+    expect(parse(body({ icao: "YSS" })).success).toBe(false);
+  });
+
+  it("takes a frequency as published, or none at all, but not a malformed one", () => {
+    expect(accepted(body({ frequency: null })).frequency).toBeNull();
+    expect(accepted(body({ frequency: undefined })).frequency).toBeNull();
+    expect(accepted(body({ frequency: "118.1" })).frequency).toBe("118.1");
+    expect(parse(body({ frequency: "one two six" })).success).toBe(false);
+  });
+
+  it("refuses a body with no controller behind it, or an unusable time", () => {
+    expect(parse(body({ controller: undefined })).success).toBe(false);
+    expect(parse(body({ controller: { callsign: "SY_TWR" } })).success).toBe(false);
+    expect(parse(body({ issued: "not a time" })).success).toBe(false);
+  });
+
+  it("treats the client as optional telemetry", () => {
+    expect(accepted(body({ client: undefined })).client).toBeNull();
   });
 });
 
-describe("vatpacAtis", () => {
-  it("keeps Australian airports and dataset airports, drops everything else", () => {
-    const result = vatpacAtis([entry("YSSY_ATIS"), entry("NZAA_ATIS"), entry("EGLL_ATIS"), entry("AGGH_ATIS")], new Set(["AGGH"]));
-    expect(result.map(atis => atis.callsign)).toEqual(["YSSY_ATIS", "AGGH_ATIS"]);
-  });
-
-  it("keeps an arrival and a departure ATIS for the same airport as separate stations", () => {
-    expect(vatpacAtis([entry("YSSY_ATIS"), entry("YSSY_D_ATIS")], new Set()).map(atis => atis.icao)).toEqual(["YSSY", "YSSY"]);
-  });
-
-  it("drops a station with no ATIS letter instead of mirroring an empty broadcast", () => {
-    expect(vatpacAtis([entry("YMAV_ATIS", { atis_code: null, text_atis: null }), entry("YMML_ATIS")], new Set())
-      .map(atis => atis.callsign)).toEqual(["YMML_ATIS"]);
-    expect(vatpacAtis([entry("YMAV_ATIS", { atis_code: "  " })], new Set())).toEqual([]);
-  });
-
-  it("normalises missing text and reports the sections the letter changed", () => {
-    expect(vatpacAtis([entry("YMML_ATIS", { text_atis: null })], new Set())[0])
-      .toMatchObject({ icao: "YMML", atis_code: "A", text_atis: [], changed: [] });
-    expect(vatpacAtis([entry("YMML_ATIS", { text_atis: ["+[RWY] 34", "[QNH] 1020"] })], new Set())[0]?.changed).toEqual(["RWY"]);
-  });
-});
-
-describe("atisContent", () => {
-  const ymml = [
-    "ATIS YMML V 090232",
-    "+[APCH] AIRCRAFT ON THE ALPHA STAR EXP GLS OR RNP APCH",
-    "[RWY] 34",
-    "[WIND] 290-020/5",
-    "[WX] CAVOK",
-    "[TMP] 20",
-    "[QNH] 1020"
-  ];
-
-  it("splits the text into its sections without the tags or change markers", () => {
-    expect(atisContent(ymml)).toEqual({
-      "APCH": "AIRCRAFT ON THE ALPHA STAR EXP GLS OR RNP APCH",
-      "RWY": "34",
-      "SFC COND": null,
-      "OPR INFO": null,
-      "WIND": "290-020/5",
-      "VIS": null,
-      "WX": "CAVOK",
-      "CLD": null,
-      "TMP": "20",
-      "QNH": "1020",
-      "SIGWX": null
+describe("atisSectionContent", () => {
+  it("returns every section in editor order, null for the ones not broadcast", () => {
+    expect(atisSectionContent({ QNH: "1013", RWY: "34L" })).toEqual({
+      "APCH": null, "RWY": "34L", "SFC COND": null, "OPR INFO": null, "WIND": null,
+      "VIS": null, "WX": null, "CLD": null, "TMP": null, "QNH": "1013", "SIGWX": null
     });
   });
 
-  it("drops MODE, OFCW_NOTIFY and TIME_CHECK without letting them leak into a neighbouring section", () => {
-    const content = atisContent(["[MODE] 34 PROPS IVA", "[RWY] 34L AND R", "[OFCW_NOTIFY] GROUND OR APPROACH"]);
-    expect(content.RWY).toBe("34L AND R");
+  it("accepts a tag however vatSys spelled it, and drops one this API does not serve", () => {
+    const content = atisSectionContent({ "SFC_COND": "WET", "sfc cond": "WET", "MODE": "34 PROPS IVA" });
+    expect(content["SFC COND"]).toBe("WET");
     expect(Object.keys(content)).not.toContain("MODE");
   });
 
-  it("joins a section the text wraps across lines and accepts underscore tag names", () => {
-    const content = atisContent(["[SFC_COND] WET", "[SIGWX] WIND SHEAR WARNING, A320 REPORTED", "MODERATE OVERSHOOT"]);
-    expect(content["SFC COND"]).toBe("WET");
-    expect(content.SIGWX).toBe("WIND SHEAR WARNING, A320 REPORTED MODERATE OVERSHOOT");
+  it("reads an empty or whitespace-only section as not broadcast", () => {
+    expect(atisSectionContent({ RWY: "", QNH: "   " })).toMatchObject({ RWY: null, QNH: null });
   });
 });
 
-describe("atisChanges", () => {
-  it("lists the sections marked with a + in ATIS editor order, not text order", () => {
-    expect(atisChanges(["ATIS YMML V 090232", "+[OPR INFO] WORKS IN PROGRESS", "+[RWY] 34", "[QNH] 1020"]))
-      .toEqual(["RWY", "OPR INFO"]);
+describe("atisChangedSections", () => {
+  it("lists the changed sections in editor order, deduplicated, known ones only", () => {
+    expect(atisChangedSections(["QNH", "wind", "MODE", "WIND"])).toEqual(["WIND", "QNH"]);
   });
 
   it("is empty when the letter changed nothing", () => {
-    expect(atisChanges(["[RWY] 34", "[QNH] 1020"])).toEqual([]);
-  });
-
-  it("ignores a + on a tag that is not a served section, and does not repeat a section", () => {
-    expect(atisChanges(["+[MODE] 34 PROPS IVA", "+[SFC_COND] WET", "+[SFC COND] WET"])).toEqual(["SFC COND"]);
+    expect(atisChangedSections([])).toEqual([]);
   });
 });
 
 describe("atisTimestamp", () => {
   it("formats an instant as a UTC day-time group", () => {
-    expect(atisTimestamp("2026-11-11T06:06:31.574Z")).toBe("110606z");
+    expect(atisTimestamp("2026-11-12T09:14:00Z")).toBe("120914z");
     expect(atisTimestamp(new Date(Date.UTC(2026, 10, 1, 0, 5)))).toBe("010005z");
   });
 
@@ -105,13 +137,5 @@ describe("atisTimestamp", () => {
     expect(atisTimestamp(null)).toBeNull();
     expect(atisTimestamp(undefined)).toBeNull();
     expect(atisTimestamp("not a date")).toBeNull();
-  });
-});
-
-describe("ZULU ATIS", () => {
-  it("keeps the raw text as content instead of splitting it into sections", () => {
-    const [zulu] = vatpacAtis([entry("YSSY_ATIS", { atis_code: "Z", text_atis: ["ATIS YSSY ZULU", "+[RWY] NOT A SECTION, JUST TEXT"] })], new Set());
-    expect(zulu?.content).toBe("ATIS YSSY ZULU +[RWY] NOT A SECTION, JUST TEXT");
-    expect(zulu?.changed).toEqual([]);
   });
 });

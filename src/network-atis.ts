@@ -1,80 +1,56 @@
-// Pure parsing/filtering for the VATSIM datafeed's `atis` array - kept free of any database import
-// so it can be unit tested without a DATABASE_URL. The sync itself is in network-atis-sync.ts.
+// Pure validation and normalisation for the ATIS a vatSys ATIS plugin publishes to this API with
+// PUT /api/v1/vatsim/atis/:icao - kept free of any database import so it can be unit tested without
+// a DATABASE_URL. The route itself is in routes/atis.ts.
+//
+// Nothing here reads VATSIM's public datafeed any more. An ATIS used to be mirrored out of that
+// feed's `atis` array every 30 seconds and the sections parsed back out of its flat broadcast lines
+// - so it could only ever be as fresh, and as structured, as a third party's view of the network.
+// The plugin running the ATIS now publishes it directly, in the shape vatSys already holds it in:
+// the section split and the change markers arrive as data instead of being re-derived from text.
+import { z } from "zod";
 
-// One entry of the datafeed's top-level `atis` array (https://data.vatsim.net/v3/vatsim-data.json).
-export type VatsimAtis = {
-  cid: number;
-  name?: string;
-  callsign: string;
-  frequency: string;
-  atis_code?: string | null;
-  text_atis?: string[] | null;
-  logon_time?: string;
-  last_updated?: string;
-};
-
-export type NetworkAtis = {
-  callsign: string;
-  icao: string;
-  // Always a letter: an entry without one is not mirrored at all (see vatpacAtis).
-  atis_code: string;
-  frequency: string;
-  text_atis: string[];
-  // The ATIS split into its sections, or - for a ZULU ATIS, which is free text with no sections -
-  // the raw broadcast text as-is.
-  content: AtisContent | string;
-  // The sections this letter changed (vatSys's leading +), in editor order. Empty for a ZULU ATIS.
-  changed: string[];
-  cid: number;
-  name: string | null;
-  logon_time: string | null;
-  last_updated: string | null;
-};
-
-// The sections of a vatSys ATIS (as laid out in the ATIS editor) that the API serves. MODE,
-// OFCW_NOTIFY and TIME_CHECK are editor settings rather than broadcast information, so they are
-// left out even when the text carries them.
+// The sections of a vatSys ATIS, in the order the ATIS editor lays them out. MODE, OFCW_NOTIFY and
+// TIME_CHECK are editor settings rather than broadcast information, so they are not among them.
 export const ATIS_SECTIONS = ["APCH", "RWY", "SFC COND", "OPR INFO", "WIND", "VIS", "WX", "CLD", "TMP", "QNH", "SIGWX"] as const;
-export type AtisContent = Record<typeof ATIS_SECTIONS[number], string | null>;
+export type AtisSection = typeof ATIS_SECTIONS[number];
+export type AtisContent = Record<AtisSection, string | null>;
 
-// "[RWY] 34" or "+[APCH] ..." - the leading + is how vatSys marks a section changed since the
-// previous letter, so it belongs to the tag, not to the previous section's value.
-const tagPattern = /(?<marker>\+?)\[(?<name>[^\]]+)\]/g;
-const normaliseTag = (tag: string) => tag.trim().toUpperCase().replace(/[\s_]+/g, " ");
+// "atis" is an ordinary sectioned broadcast. "zulu" is the free text a closed tower leaves running
+// ("CANBERRA TOWER IS CLOSED ..."), which has no sections at all - its content is that text itself,
+// and nothing in it can be marked as changed.
+export const ATIS_TYPES = ["atis", "zulu"] as const;
+export type AtisType = typeof ATIS_TYPES[number];
 
-// Every tag in the broadcast text, each paired with the slice of text it owns: from the end of the
-// tag up to the next tag of any kind (including MODE etc., which are not sections we serve), so a
-// section the text wraps across several lines still comes out whole. `section` is null for a tag
-// that is not one of ATIS_SECTIONS, and `changed` is vatSys's leading + marker.
-function atisTags(text: string) {
-  const tags = [...text.matchAll(tagPattern)];
-  return tags.map((tag, index) => ({
-    section: ATIS_SECTIONS.find(name => name === normaliseTag(tag.groups?.name ?? "")) ?? null,
-    changed: tag.groups?.marker === "+",
-    value: text.slice((tag.index ?? 0) + tag[0].length, tags[index + 1]?.index ?? text.length).replace(/\s+/g, " ").trim()
-  }));
-}
+// "SFC_COND" and "sfc cond" name the same section as "SFC COND": the spelling varies with where in
+// vatSys the tag came from, the section does not.
+const normaliseSection = (value: string): string => value.trim().toUpperCase().replace(/[\s_]+/g, " ");
+const asSection = (value: string): AtisSection | null =>
+  ATIS_SECTIONS.find(section => section === normaliseSection(value)) ?? null;
 
-// Splits the broadcast's text into its sections. A section missing from the text - or present but
-// empty - is null.
-export function atisContent(lines: readonly string[]): AtisContent {
-  const content = Object.fromEntries(ATIS_SECTIONS.map(section => [section, null])) as AtisContent;
-  for (const tag of atisTags(lines.join(" "))) {
-    if (tag.section) content[tag.section] = tag.value || null;
+// Every section, always, in editor order - null for one this broadcast does not carry. A key that
+// is not a section this API serves (MODE, or anything a later vatSys adds) is dropped rather than
+// refused, so a plugin that sends more than this API knows about still publishes successfully.
+export function atisSectionContent(input: Record<string, string | null | undefined>): AtisContent {
+  const given = new Map<AtisSection, string | null>();
+  for (const [key, value] of Object.entries(input)) {
+    const section = asSection(key);
+    if (!section) continue;
+    const text = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+    given.set(section, text || null);
   }
-  return content;
+  return Object.fromEntries(ATIS_SECTIONS.map(section => [section, given.get(section) ?? null])) as AtisContent;
 }
 
-// The sections this letter changed since the previous one - the ones vatSys marked with a leading
-// + ("+[RWY] 34"). Listed in the order the sections appear in the ATIS editor rather than the order
-// the text happens to use, and deduplicated, so a consumer can compare the array directly.
-export function atisChanges(lines: readonly string[]): string[] {
-  const changed = new Set(atisTags(lines.join(" ")).filter(tag => tag.changed && tag.section).map(tag => tag.section));
+// The sections this letter changed - what vatSys marks with a leading + in the ATIS text. Returned
+// in editor order rather than the order the plugin happened to list them, and deduplicated, so a
+// consumer can compare the array directly.
+export function atisChangedSections(input: readonly string[]): AtisSection[] {
+  const changed = new Set(input.map(asSection));
   return ATIS_SECTIONS.filter(section => changed.has(section));
 }
 
-// A day-time group as aviation writes it - DDHHMMz, e.g. 110615z for the 11th at 0615 UTC - which
-// is how an ATIS timestamp is read and spoken, rather than an ISO instant.
+// A day-time group as aviation writes it - DDHHMMz, e.g. 120914z for the 12th at 0914 UTC - which
+// is how an ATIS time is read and spoken, rather than an ISO instant.
 export function atisTimestamp(value: Date | string | null | undefined): string | null {
   if (value === null || value === undefined) return null;
   const date = value instanceof Date ? value : new Date(value);
@@ -83,48 +59,54 @@ export function atisTimestamp(value: Date | string | null | undefined): string |
   return `${pad(date.getUTCDate())}${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}z`;
 }
 
-// YSSY_ATIS, and the less common suffixed forms like YSSY_D_ATIS (departure) or YSSY_A_ATIS.
-const callsignPattern = /^([A-Z]{4})(?:_[A-Z0-9]+)?_ATIS$/;
+const text = (max: number) => z.string().trim().min(1).max(max);
+const upperText = (max: number) => text(max).transform(value => value.toUpperCase());
 
-export function atisIcao(callsign: string): string | null {
-  return callsignPattern.exec(callsign.trim().toUpperCase())?.[1] ?? null;
-}
-
-// VATPAC's airports are Australia's (every Australian ICAO starts with Y), plus anything else the
-// vatSys dataset itself defines an aerodrome position for - passed in as `datasetAirports` - so an
-// airport VATPAC adds to its profile is picked up by the next dataset sync without a code change.
-export function isVatpacAirport(icao: string, datasetAirports: ReadonlySet<string>): boolean {
-  return icao.startsWith("Y") || datasetAirports.has(icao);
-}
-
-export function vatpacAtis(entries: readonly VatsimAtis[], datasetAirports: ReadonlySet<string>): NetworkAtis[] {
-  const result = new Map<string, NetworkAtis>();
-  for (const entry of entries) {
-    if (typeof entry?.callsign !== "string") continue;
-    const icao = atisIcao(entry.callsign);
-    if (!icao || !isVatpacAirport(icao, datasetAirports)) continue;
-    const callsign = entry.callsign.trim().toUpperCase();
-    const code = entry.atis_code?.trim().toUpperCase();
-    // No letter means there is no broadcast to mirror yet - a station that has connected but not
-    // published an ATIS. Dropping it here rather than storing a letterless, all-null row keeps
-    // "a row exists" and "there is an ATIS" the same statement for every consumer, and the sync's
-    // own delete sweep removes the row again if a connected station's letter goes away.
-    if (!code || code.length !== 1) continue;
-    const textAtis = (entry.text_atis ?? []).filter(line => typeof line === "string");
-    result.set(callsign, {
-      callsign,
-      icao,
-      atis_code: code,
-      frequency: String(entry.frequency),
-      text_atis: textAtis,
-      content: code === "Z" ? textAtis.join(" ").trim() : atisContent(textAtis),
-      // A ZULU ATIS has no sections, so nothing to mark as changed.
-      changed: code === "Z" ? [] : atisChanges(textAtis),
-      cid: Number(entry.cid),
-      name: entry.name ?? null,
-      logon_time: entry.logon_time ?? null,
-      last_updated: entry.last_updated ?? null
-    });
+// The PUT body. Deliberately forgiving about shape where it costs nothing - a letter in either
+// case, a cid as a string or a number, an unknown section - and strict about the few things a
+// consumer then relies on: a real airport, a single letter, a known type, and a content that
+// matches that type.
+export const atisUpdateSchema = z.object({
+  icao: z.string().trim().regex(/^[A-Za-z]{4}$/).transform(value => value.toUpperCase()),
+  callsign: upperText(32),
+  atis_letter: z.string().trim().regex(/^[A-Za-z]$/).transform(value => value.toUpperCase()),
+  type: z.preprocess(value => typeof value === "string" ? value.trim().toLowerCase() : value, z.enum(ATIS_TYPES)),
+  // "126.250", as it is spoken and displayed. Null or absent for a broadcast with no frequency of
+  // its own - kept as text rather than a number because it is only ever shown, never tuned here.
+  frequency: z.string().trim().regex(/^\d{3}(\.\d{1,3})?$/).nullish(),
+  // When the controller issued this letter, not when it reached us: an ATIS that sat unchanged for
+  // an hour is still that letter's broadcast, and re-publishing it must not make it look newer.
+  issued: z.coerce.date(),
+  content: z.union([z.string().trim().min(1).max(4_000), z.record(z.string().max(64), z.string().max(1_000).nullable())]),
+  changed: z.array(z.string().max(64)).max(32).default([]),
+  controller: z.object({ callsign: upperText(32), cid: z.coerce.number().int().positive() }),
+  client: z.object({ name: text(64), version: text(32) }).nullish()
+}).superRefine((value, ctx) => {
+  // A type/content mismatch is a plugin bug, and a silent one: stored as-is it would reach every
+  // consumer as an ATIS whose content is not the shape its own type promises.
+  if (value.type === "zulu" && typeof value.content !== "string") {
+    ctx.addIssue({ code: "custom", path: ["content"], message: "A zulu ATIS's content is the broadcast text itself." });
   }
-  return [...result.values()];
-}
+  if (value.type === "atis" && typeof value.content === "string") {
+    ctx.addIssue({ code: "custom", path: ["content"], message: "An atis content is an object of sections." });
+  }
+  // Every section empty is not a quiet ATIS, it is an ATIS that was never filled in - a record of
+  // nulls that a consumer cannot tell apart from a real broadcast. Refused rather than stored.
+  if (value.type === "atis" && typeof value.content !== "string"
+    && Object.values(atisSectionContent(value.content)).every(section => section === null)) {
+    ctx.addIssue({ code: "custom", path: ["content"], message: "This ATIS carries no sections at all." });
+  }
+}).transform(value => ({
+  icao: value.icao,
+  callsign: value.callsign,
+  atis_letter: value.atis_letter,
+  type: value.type,
+  frequency: value.frequency ?? null,
+  issued: value.issued,
+  content: typeof value.content === "string" ? value.content : atisSectionContent(value.content),
+  changed: value.type === "zulu" ? [] : atisChangedSections(value.changed),
+  controller: value.controller,
+  client: value.client ?? null
+}));
+
+export type AtisUpdate = z.infer<typeof atisUpdateSchema>;
