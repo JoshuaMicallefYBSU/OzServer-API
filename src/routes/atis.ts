@@ -29,8 +29,12 @@ export async function protectedAtisRoutes(app: FastifyInstance): Promise<void> {
 // One row per airport, published by the vatSys ATIS plugin rather than mirrored from VATSIM's
 // datafeed (see network-atis.ts). No ?server= anywhere below: an ATIS is broadcast on the live
 // network, and a plugin that is not connected to it has no ATIS to publish.
-const NETWORK_ATIS_COLUMNS = `icao,callsign,atis_letter,type,frequency,issued,content,changed,
-  controller_callsign,controller_cid,client_name,client_version`;
+// The broadcast itself - what a GET returns. Who published it is deliberately not selected here:
+// the ATIS is public information, the controller behind it and the build they are running are not,
+// and this endpoint needs no identity of its own to be read by anyone. They are still stored (the
+// plugin sends them, and they are what makes a bad record traceable) - just never served.
+const ATIS_COLUMNS = "icao,callsign,atis_letter,type,frequency,issued,content,changed";
+const PUBLISHED_ATIS_COLUMNS = `${ATIS_COLUMNS},controller_callsign,controller_cid,client_name,client_version`;
 
 type NetworkAtisRow = {
   icao: string;
@@ -41,17 +45,20 @@ type NetworkAtisRow = {
   issued: Date | string | null;
   content: string | Partial<Record<string, string | null>>;
   changed: string[];
+};
+
+type PublishedAtisRow = NetworkAtisRow & {
   controller_callsign: string;
   controller_cid: number;
   client_name: string | null;
   client_version: string | null;
 };
 
-// Built key by key rather than handing back the row: the response is the same shape the plugin PUT,
-// so a body round-trips, and a column added later does not leak into it unasked. jsonb does not
-// keep key order (it stores keys shortest-first), so content is rebuilt in the order the sections
-// appear in the vatSys ATIS editor; a zulu ATIS's content is its raw text, passed through
-// untouched. issued is served as a DDHHMMz day-time group - the form an ATIS time is read in.
+// Built key by key rather than handing back the row, so a column added later does not leak into a
+// public response unasked. jsonb does not keep key order (it stores keys shortest-first), so
+// content is rebuilt in the order the sections appear in the vatSys ATIS editor; a zulu ATIS's
+// content is its raw text, passed through untouched. issued is served as a DDHHMM day-time group
+// - the form an ATIS time is read in.
 function forApi(row: NetworkAtisRow) {
   const content = row.content;
   return {
@@ -63,7 +70,15 @@ function forApi(row: NetworkAtisRow) {
     issued: atisTimestamp(row.issued),
     content: typeof content === "string" ? content
       : Object.fromEntries(ATIS_SECTIONS.map(section => [section, content[section] ?? null])),
-    changed: row.changed,
+    changed: row.changed
+  };
+}
+
+// The answer to a PUT, which goes back to the plugin that just sent all of this - so it confirms
+// what was recorded, publisher included, in the same shape the body had.
+function forPublisher(row: PublishedAtisRow) {
+  return {
+    ...forApi(row),
     controller: { callsign: row.controller_callsign, cid: row.controller_cid },
     client: row.client_name === null ? null : { name: row.client_name, version: row.client_version }
   };
@@ -109,14 +124,14 @@ export async function publicAtisRoutes(app: FastifyInstance): Promise<void> {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())
        ON CONFLICT (icao) DO UPDATE SET callsign=$2,atis_letter=$3,type=$4,frequency=$5,issued=$6,content=$7,
          changed=$8,controller_callsign=$9,controller_cid=$10,client_name=$11,client_version=$12,received_at=now()
-       RETURNING ${NETWORK_ATIS_COLUMNS},(xmax=0) AS created`,
+       RETURNING ${PUBLISHED_ATIS_COLUMNS},(xmax=0) AS created`,
       [icao, atis.callsign, atis.atis_letter, atis.type, atis.frequency, atis.issued,
         JSON.stringify(atis.content), atis.changed, atis.controller.callsign, atis.controller.cid,
-        atis.client?.name ?? null, atis.client?.version ?? null])).rows[0] as NetworkAtisRow & { created: boolean };
+        atis.client?.name ?? null, atis.client?.version ?? null])).rows[0] as PublishedAtisRow & { created: boolean };
     // Rides the existing "atis" signal, so anything already re-reading on it picks this up without
     // needing a new event type. Published after the write, never before it.
     await publish({ type: "atis", server: "live" });
-    return reply.code(row.created ? 201 : 200).send(forApi(row));
+    return reply.code(row.created ? 201 : 200).send(forPublisher(row));
   });
 
   // Take an airport's ATIS down - the controller running it has signed off. Answered 204 either
@@ -129,11 +144,11 @@ export async function publicAtisRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get("/vatsim/atis", async () =>
-    (await pool.query<NetworkAtisRow>(`SELECT ${NETWORK_ATIS_COLUMNS} FROM network_atis ORDER BY icao`)).rows.map(forApi));
+    (await pool.query<NetworkAtisRow>(`SELECT ${ATIS_COLUMNS} FROM network_atis ORDER BY icao`)).rows.map(forApi));
 
   // One airport, or null when nobody is running its ATIS - not a 404: "there is no ATIS for YSSY
   // right now" is an answer, and every caller here is polling rather than following a link.
   app.get<{ Params: { icao: string } }>("/vatsim/atis/:icao", async request =>
-    (await pool.query<NetworkAtisRow>(`SELECT ${NETWORK_ATIS_COLUMNS} FROM network_atis WHERE icao=$1`,
+    (await pool.query<NetworkAtisRow>(`SELECT ${ATIS_COLUMNS} FROM network_atis WHERE icao=$1`,
       [request.params.icao.trim().toUpperCase()])).rows.map(forApi)[0] ?? null);
 }

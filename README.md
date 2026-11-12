@@ -46,14 +46,21 @@ than refused, in `content` and in `changed` alike. `controller` is required, `fr
 the URL, or that carries no ATIS letter, is answered `422` and stores nothing.
 
 `DELETE /api/v1/vatsim/atis/YSSY` takes an ATIS down when the controller running it signs off. It
-answers `204` whether or not there was one to remove, so a plugin need not check first. Nothing
-else removes a record: an ATIS stays until it is replaced or deleted.
+answers `204` whether or not there was one to remove, so a plugin need not check first.
+
+An ATIS also expires on its own `NETWORK_ATIS_RETAIN_MINUTES` (90) after the last `PUT` that
+carried it - the sweep in `maintenance.ts`, for the client that crashed or dropped without
+withdrawing. Measured from when the broadcast last reached this API rather than from `issued`, so
+a plugin that re-publishes an unchanged ATIS keeps it alive for as long as it is on the air, while
+one that publishes only on change has 90 minutes from each broadcast.
 
 Read it back with `GET /api/v1/vatsim/atis` (every airport, by ICAO) or
-`GET /api/v1/vatsim/atis/:icao` (one airport, or `null`). The response is the body that was
-published, with `issued` as a `DDHHMMz` day-time group (`120914z`), `controller.cid` as a number,
-and `content` carrying every section in ATIS-editor order - `null` for each one not broadcast.
-Either endpoint changing publishes the existing `atis` server-sent event.
+`GET /api/v1/vatsim/atis/:icao` (one airport, or `null`). The response is the broadcast as
+published, with `issued` as a `DDHHMM` day-time group (`120914`, always UTC) and `content`
+carrying every section in ATIS-editor order - `null` for each one not broadcast. `controller` and
+`client` are stored but never served: the broadcast is public, who is running it is not. The `PUT`
+response is the one exception, since it answers the plugin that just sent them. Either endpoint
+changing publishes the existing `atis` server-sent event.
 
 Publishing is open to anything that can reach the API unless `ATIS_TOKEN` is set, in which case
 `PUT` and `DELETE` require it as `Authorization: Bearer <token>` (or `?token=`).

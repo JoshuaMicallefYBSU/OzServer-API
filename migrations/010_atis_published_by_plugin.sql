@@ -40,6 +40,9 @@ CREATE TABLE network_atis (
     -- The sections this letter changed, in ATIS-editor order - what vatSys marks with a leading +.
     -- Empty for a zulu ATIS, and for a letter that changed nothing.
     changed text[] NOT NULL DEFAULT '{}',
+    -- Who published it. Stored, never served (routes/atis.ts answers a GET with the broadcast
+    -- alone): it is what makes a bad or stale record traceable to the client that sent it, which
+    -- is an operator's question, not a public one.
     controller_callsign varchar(32) NOT NULL,
     controller_cid integer NOT NULL,
     -- Which plugin build published this. Telemetry only: useful when one version starts sending

@@ -274,7 +274,7 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect((await put("YSSY")).statusCode).toBe(201);
       const again = await put("YSSY");
       expect(again.statusCode).toBe(200);
-      expect(again.json()).toMatchObject({ icao: "YSSY", atis_letter: "N", issued: "120914z" });
+      expect(again.json()).toMatchObject({ icao: "YSSY", atis_letter: "N", issued: "120914" });
       expect((await published()).json()).toHaveLength(1);
     });
 
@@ -286,8 +286,16 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect(atis.content.RWY).toBe("34L FOR ARRS, RWY 34R FOR DEPS");
       expect(atis.content.APCH).toBeNull();
       expect(atis.changed).toEqual(["WIND", "QNH"]);
-      expect(atis.controller).toEqual({ callsign: "SY_TWR", cid: 1234567 });
-      expect(atis.client).toEqual({ name: "vatSys ATIS Plugin", version: "4.3" });
+    });
+
+    it("tells the publisher who it recorded, and tells nobody else", async () => {
+      const published = (await put("YSSY")).json();
+      expect(published.controller).toEqual({ callsign: "SY_TWR", cid: 1234567 });
+      expect(published.client).toEqual({ name: "vatSys ATIS Plugin", version: "4.3" });
+      // The broadcast is public; the controller behind it and the build they run are not.
+      const read = (await app.inject({ method: "GET", url: "/api/v1/vatsim/atis" })).json()[0];
+      expect(read).not.toHaveProperty("controller");
+      expect(read).not.toHaveProperty("client");
     });
 
     it("keeps a zulu broadcast's text as its content", async () => {
@@ -302,6 +310,17 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect((await put("YMML")).statusCode).toBe(422);
       expect((await put("YSSY", { ...sydney, atis_letter: "" })).statusCode).toBe(422);
       expect((await published()).json()).toEqual([]);
+    });
+
+    it("expires an ATIS nobody has published again, and keeps a re-published one", async () => {
+      await put("YSSY");
+      await db.query("UPDATE network_atis SET received_at=now()-interval '91 minutes'");
+      await runMaintenance();
+      expect((await published()).json()).toEqual([]);
+      // Re-publishing is what keeps it alive: the same body again resets the clock.
+      await put("YSSY");
+      await runMaintenance();
+      expect((await published()).json()).toHaveLength(1);
     });
 
     it("takes an ATIS down when the controller running it signs off", async () => {

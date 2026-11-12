@@ -100,6 +100,14 @@ export async function runMaintenance(): Promise<void> {
     }
     await client.query(`DELETE FROM flight_data_records WHERE last_seen_at < now()-($1*interval '1 minute')`, [config.FDR_RETAIN_MINUTES]);
     await client.query(`DELETE FROM atis_broadcasts WHERE last_seen_at < now()-($1*interval '1 minute')`, [config.ATIS_RETAIN_MINUTES]);
+    // An ATIS a plugin published stays until it is replaced or withdrawn - or until this sweep
+    // decides nobody can still be broadcasting it (see NETWORK_ATIS_RETAIN_MINUTES). Aged from
+    // when we last heard the broadcast, not from the letter's own issue time: a plugin that keeps
+    // re-publishing an unchanged ATIS is still telling us it is on the air, and ageing that out
+    // would delete and re-create the same record every pass.
+    const expiredAtis = (await client.query(
+      `DELETE FROM network_atis WHERE received_at < now()-($1*interval '1 minute')`,
+      [config.NETWORK_ATIS_RETAIN_MINUTES])).rowCount ?? 0;
     await client.query("DELETE FROM sector_requests WHERE rejected_at < now()-interval '1 day'");
     // Kept for a day. Long enough to look into something reported the next morning, short enough
     // that a busy evening's worth of every controller's logs is not accumulated indefinitely.
@@ -121,7 +129,8 @@ export async function runMaintenance(): Promise<void> {
     await client.query("DELETE FROM resume_snapshots WHERE created_at < now()-($1*interval '1 minute')", [config.RESUME_WINDOW_MINUTES]);
     return {
       sectors: [...new Set(droppedOwners.map(owner => owner.server))],
-      annotations: [...new Set(expiredAnnotations.map(row => row.server as Server))]
+      annotations: [...new Set(expiredAnnotations.map(row => row.server as Server))],
+      atis: expiredAtis > 0
     };
   });
   // A disconnect sweep frees sectors without any request having been made, so nothing else would
@@ -131,4 +140,7 @@ export async function runMaintenance(): Promise<void> {
   for (const server of affected.sectors) await publish({ type: "sectors", server });
   // Likewise for markup that just expired: without a signal every other scope kept drawing it.
   for (const server of affected.annotations) await publish({ type: "annotations", server });
+  // And for an ATIS that just aged out - live network only, which is the only place one is
+  // published (see routes/atis.ts).
+  if (affected.atis) await publish({ type: "atis", server: "live" });
 }

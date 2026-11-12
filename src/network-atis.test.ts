@@ -129,8 +129,8 @@ describe("atisChangedSections", () => {
 
 describe("atisTimestamp", () => {
   it("formats an instant as a UTC day-time group", () => {
-    expect(atisTimestamp("2026-11-12T09:14:00Z")).toBe("120914z");
-    expect(atisTimestamp(new Date(Date.UTC(2026, 10, 1, 0, 5)))).toBe("010005z");
+    expect(atisTimestamp("2026-11-12T09:14:00Z")).toBe("120914");
+    expect(atisTimestamp(new Date(Date.UTC(2026, 10, 1, 0, 5)))).toBe("010005");
   });
 
   it("passes through a missing or unreadable timestamp as null", () => {

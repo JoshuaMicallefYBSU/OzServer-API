@@ -49,14 +49,16 @@ export function atisChangedSections(input: readonly string[]): AtisSection[] {
   return ATIS_SECTIONS.filter(section => changed.has(section));
 }
 
-// A day-time group as aviation writes it - DDHHMMz, e.g. 120914z for the 12th at 0914 UTC - which
-// is how an ATIS time is read and spoken, rather than an ISO instant.
+// A day-time group as aviation writes it - DDHHMM, e.g. 120914 for the 12th at 0914 UTC - which is
+// how an ATIS time is read and spoken, rather than an ISO instant. No trailing z: every time this
+// API serves is UTC and nothing here is ever local, so the marker only adds a character a consumer
+// has to strip before parsing it.
 export function atisTimestamp(value: Date | string | null | undefined): string | null {
   if (value === null || value === undefined) return null;
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   const pad = (part: number) => String(part).padStart(2, "0");
-  return `${pad(date.getUTCDate())}${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}z`;
+  return `${pad(date.getUTCDate())}${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}`;
 }
 
 const text = (max: number) => z.string().trim().min(1).max(max);

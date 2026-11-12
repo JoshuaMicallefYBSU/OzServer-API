@@ -26,6 +26,13 @@ const schema = z.object({
   RESUME_WINDOW_MINUTES: z.coerce.number().positive().default(5),
   FDR_RETAIN_MINUTES: z.coerce.number().positive().default(15),
   ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(60),
+  // How long an ATIS published with PUT /api/v1/vatsim/atis/:icao survives without being heard
+  // from again before runMaintenance deletes it. A plugin is expected to withdraw its own ATIS on
+  // sign-off (DELETE); this is what catches the one whose client crashed, closed vatSys without
+  // withdrawing, or simply lost the network - and it bounds how wrong a broadcast nobody is making
+  // any more can be. Measured from the last PUT, so a plugin re-publishing an unchanged ATIS keeps
+  // it alive indefinitely, which is correct: it is still on the air.
+  NETWORK_ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(90),
   // Requests one address may make in any ten seconds before it is answered 429 (see app.ts). A
   // connected plugin makes two or three a second at its busiest, and a map viewer about the same,
   // so this is roughly ten of either behind one address - far above honest use, far below a loop.
