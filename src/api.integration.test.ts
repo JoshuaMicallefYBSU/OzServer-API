@@ -130,6 +130,21 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect(await mine(extender)).toEqual(["INA", "OUT"]);
     });
 
+    it("answers a claim with every covered sector carved out as nothing to do, not as a missing sector", async () => {
+      // The retry a client makes after a 409 that contested everything the claim covers.
+      await post("/sectors/GRP/claim", extender, { exclude: ["INA", "OUT"] });
+      const contested = await post("/sectors/GRP/claim", primary);
+      expect(contested.statusCode).toBe(409);
+      expect(contested.json().conflicts).toHaveLength(3);
+
+      const retried = await post("/sectors/GRP/claim", primary, { exclude: ["GRP", "INA", "OUT"] });
+      expect(retried.statusCode).toBe(201);
+      expect(retried.json()).toEqual([]);
+      expect(await mine(extender)).toEqual(["GRP", "INA", "OUT"]);
+      // A sector that really does not exist is still told apart.
+      expect((await post("/sectors/NOPE/claim", primary)).statusCode).toBe(404);
+    });
+
     it("refuses a sector to the controller logged on as it while someone present holds it", async () => {
       const response = await post("/sectors/INA/claim", { cid: 1000004, callsign: "XX-INA_CTR" });
       expect(response.statusCode).toBe(409);
@@ -158,6 +173,36 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect((await get("/sector-requests", third)).json().by_me).toEqual([]);
       // Which is what lets them ask the new owner instead.
       expect((await post("/sectors/INA/request", third)).statusCode).toBe(201);
+    });
+  });
+
+  describe("a claim over a controller logged on inside the group", () => {
+    const member: Identity = { cid: 1000004, callsign: "XX-INA_CTR" };
+
+    it("is told when the sector it names is theirs, rather than being answered as if it worked", async () => {
+      await post("/sectors/INA/claim", member);
+      const response = await post("/sectors/INA/claim", third);
+      expect(response.statusCode).toBe(409);
+      expect(response.json().conflicts).toEqual([{ sector: "INA", owner: { cid: member.cid, callsign: member.callsign } }]);
+    });
+
+    it("quietly leaves them what it merely covers", async () => {
+      await post("/sectors/INA/claim", member);
+      const response = await post("/sectors/GRP/claim", primary);
+      expect(response.statusCode).toBe(201);
+      expect(await mine(primary)).toEqual(["GRP", "OUT"]);
+      expect(await mine(member)).toEqual(["INA"]);
+    });
+
+    it("still leaves them the rest of what they hold there once their own sector is carved out", async () => {
+      // The client excludes the sectors it knows the logged-on position is made of. What that
+      // controller holds inside the group beyond those is still theirs, and not a conflict.
+      await post("/sectors/INA/claim", member);
+      await post("/sectors/OUT/claim", member);
+      const response = await post("/sectors/GRP/claim", primary, { exclude: ["INA"] });
+      expect(response.statusCode).toBe(201);
+      expect(await mine(primary)).toEqual(["GRP"]);
+      expect(await mine(member)).toEqual(["INA", "OUT"]);
     });
   });
 
@@ -231,6 +276,28 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       const refused = await post("/fdr/batch", third, flight({ controlling_cid: third.cid, controlling_callsign: third.callsign, current_sector: "INA" }));
       expect(refused.json().results).toEqual([{ callsign: "QFA1", updated: false }]);
       expect((await record()).controlling_cid).toBe(extender.cid);
+    });
+
+    it("lets the controller a flight was handed to take it before it leaves the giver's sector", async () => {
+      const held = (who: Identity, state: string) => post("/fdr/batch", who, flight({
+        controlling_cid: who.cid, controlling_callsign: who.callsign, current_sector: "INA", state
+      }));
+      await post("/sectors/INA/claim", extender);
+      await post("/sectors/FAR/claim", third);
+      await held(extender, "STATE_CONTROLLED");
+
+      // Not offered yet, so somebody else reporting it as theirs is still refused.
+      expect((await held(third, "STATE_CONTROLLED")).json().results).toEqual([{ callsign: "QFA1", updated: false }]);
+
+      await held(extender, "STATE_HANDOVER");
+      // A second controller's own handover state is the stale give-away push, not an acceptance.
+      expect((await held(third, "STATE_HANDOVER")).json().results).toEqual([{ callsign: "QFA1", updated: false }]);
+      expect((await held(third, "STATE_CONTROLLED")).json().results).toEqual([{ callsign: "QFA1", updated: true }]);
+      expect(await record()).toMatchObject({ controlling_cid: third.cid, state: "STATE_CONTROLLED", current_sector: "INA" });
+
+      // And the giver's late push does not take it back.
+      expect((await held(extender, "STATE_HANDOVER")).json().results).toEqual([{ callsign: "QFA1", updated: false }]);
+      expect((await record()).controlling_cid).toBe(third.cid);
     });
   });
 

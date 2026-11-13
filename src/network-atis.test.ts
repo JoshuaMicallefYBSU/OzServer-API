@@ -93,6 +93,17 @@ describe("atisUpdateSchema", () => {
     expect(parse(body({ issued: "not a time" })).success).toBe(false);
   });
 
+  it("does not read a missing or non-text time as the start of 1970", () => {
+    expect(parse(body({ issued: null })).success).toBe(false);
+    expect(parse(body({ issued: 0 })).success).toBe(false);
+    expect(parse(body({ issued: true })).success).toBe(false);
+    expect(parse(body({ issued: "" })).success).toBe(false);
+  });
+
+  it("refuses a cid the database could not store", () => {
+    expect(parse(body({ controller: { callsign: "SY_TWR", cid: "99999999999" } })).success).toBe(false);
+  });
+
   it("treats the client as optional telemetry", () => {
     expect(accepted(body({ client: undefined })).client).toBeNull();
   });

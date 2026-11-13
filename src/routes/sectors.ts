@@ -163,13 +163,27 @@ async function claimGroup(
   allOrNothing = false,
   primaryGroup?: string[]
 ): Promise<{ claimed: string[]; skipped: string[]; withheld: string[]; conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }>; missing: boolean }> {
-  const rows = (await covered(client, name, identity.server)).filter(row => !exclusions.includes(row.name));
-  if (rows.length === 0) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: true };
+  const everything = await covered(client, name, identity.server);
+  // Only a sector that does not exist is "missing". A claim whose exclusions leave nothing to take
+  // names a real sector and simply has nothing to do, which is how a client retries after a 409
+  // that contested every sector it covers: it carves all of them out and asks for the rest. That
+  // came back 404 "Sector not found." - shown to a controller logging on to a position someone
+  // present was holding, about a sector that exists and that they had just requested.
+  if (everything.length === 0) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: true };
+  const rows = everything.filter(row => !exclusions.includes(row.name));
+  if (rows.length === 0) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: false };
   const takeable: SectorRow[] = [];
   const skipped: string[] = [];
   const withheld: string[] = [];
   const conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }> = [];
-  const positionOwnersInClaim = new Set(rows
+  // Worked out from everything the claim covers, before the exclusions are applied. The client
+  // excludes the sectors a logged-on controller's position is made of as *it* understands that
+  // position, which is not always everything this server records them as holding inside the group
+  // (CBW sits under SNO here but is not part of SNO's position there). Computed from what was left
+  // after the exclusions, the staffed sector itself was already gone, so nothing identified its
+  // controller as logged on inside the group and the leftover sector came back as a conflict - a
+  // "request it?" prompt about airspace this rule exists to leave alone quietly.
+  const positionOwnersInClaim = new Set(everything
     .filter(row => row.controller_callsign
       && row.callsign?.toUpperCase() === row.controller_callsign.toUpperCase())
     .map(row => row.controller_callsign!.toUpperCase()));
@@ -201,7 +215,13 @@ async function claimGroup(
     // here should make another controller wait out a reservation to take over a sector that isn't
     // actively being worked any more.
     if (isPresent(row)) {
-      if (ownerHasPositionInThisClaim) {
+      // Withholding is for what a claim merely sweeps up. The sector the claim *names* is the one
+      // thing the claimant asked for outright, and answering 201 with it quietly left out told the
+      // client it had succeeded: the sector stayed on their scope, unowned, and was claimed again
+      // on every poll (SNO, once a second, for five minutes on 13 Nov) with no request ever raised
+      // and nothing on either side to say why. A named sector someone present holds is a conflict
+      // like any other, so the claimant is told and can ask for it.
+      if (ownerHasPositionInThisClaim && row.name !== name) {
         withheld.push(row.name);
         continue;
       }

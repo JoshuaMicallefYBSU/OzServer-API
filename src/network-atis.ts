@@ -78,10 +78,17 @@ export const atisUpdateSchema = z.object({
   frequency: z.string().trim().regex(/^\d{3}(\.\d{1,3})?$/).nullish(),
   // When the controller issued this letter, not when it reached us: an ATIS that sat unchanged for
   // an hour is still that letter's broadcast, and re-publishing it must not make it look newer.
-  issued: z.coerce.date(),
+  //
+  // A string or a Date, and nothing else, before it is coerced: z.coerce.date() on its own turns
+  // null into midnight on 1 January 1970, a bare number into that many milliseconds after it, and
+  // `true` into one millisecond after it - each a valid date that would be stored and served as
+  // the time this ATIS was issued.
+  issued: z.union([z.string().trim().min(1), z.date()]).pipe(z.coerce.date()),
   content: z.union([z.string().trim().min(1).max(4_000), z.record(z.string().max(64), z.string().max(1_000).nullable())]),
   changed: z.array(z.string().max(64)).max(32).default([]),
-  controller: z.object({ callsign: upperText(32), cid: z.coerce.number().int().positive() }),
+  // Bounded to what the column holds (integer): anything larger passed validation and then failed
+  // inside the INSERT, answered as a 500 for what is simply a bad body.
+  controller: z.object({ callsign: upperText(32), cid: z.coerce.number().int().positive().max(2_147_483_647) }),
   client: z.object({ name: text(64), version: text(32) }).nullish()
 }).superRefine((value, ctx) => {
   // A type/content mismatch is a plugin bug, and a silent one: stored as-is it would reach every

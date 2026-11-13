@@ -74,13 +74,41 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
       // schedule, so cidsWithSectors reflects a claim within the same request that made it - and it
       // is already grace-gated against a real drop by runMaintenance's disconnect sweep. Nothing
       // this guard actually needs was unique to the datafeed check; it only added a way to fail.
+      //
+      // One takeover is not a stale claim at all, and the guard used to refuse it with the rest:
+      // the receiving end of a handoff the recorded authority made themselves. A controller hands
+      // an aircraft on before it reaches the boundary, so the one accepting it does not own the
+      // sector it is still in - and every push they made was turned away until the aircraft crossed,
+      // or the previous controller logged off. ML-SNO_CTR accepted JST215 from ML-BLA_CTR on 13 Nov
+      // and was refused every five seconds for two and a half minutes, with the record (and the map)
+      // still naming a controller who had given the aircraft away.
+      //
+      // Recognised from the record itself: the authority's own last push put the flight in
+      // handover, and the caller now reports it controlled, by them. The give-away push this guard
+      // exists for cannot look like that - it carries the giver's handover state, not a controlled
+      // one - so it is still refused exactly as before.
+      //
+      // And for the same reason a handover state never *takes* authority, even from the owner of
+      // the sector the aircraft is in. That is precisely the shape of the give-away push in a
+      // handoff made by hand: the giver still owns the sector, so owning it used to let their late
+      // push put their own name back on an aircraft the receiver had already accepted. Offering an
+      // aircraft is not a claim on it - the giver either gets it accepted (the receiver's controlled
+      // push stands) or cancels (their own controlled push takes it back through the ordinary rule).
+      const isHandover = (state: unknown) => state === "STATE_HANDOVER" || state === "STATE_HANDOVER_FIRST";
+      const recordedState = (existing?.data as { state?: unknown } | undefined)?.state;
+      const acceptsHandoff = isHandover(recordedState)
+        && flight.state === "STATE_CONTROLLED"
+        && controlling_cid === identity.cid;
+      const ownsSectorAndClaims = callerOwnsCurrentSector && !isHandover(flight.state);
       if (existing?.controlling_cid && existing.controlling_cid !== identity.cid
         && cidsWithSectors.has(existing.controlling_cid)
-        && !callerOwnsCurrentSector) {
+        && !ownsSectorAndClaims
+        && !acceptsHandoff) {
         await writeDiagnosticLog(client, identity, "ServerFDR", `Rejected ${flight.callsign} update; authority is still ${existing.controlling_callsign}`, {
           action: "fdr_update_rejected",
           fdr_callsign: flight.callsign,
-          reason: "existing_authority_holds_sectors",
+          reason: callerOwnsCurrentSector ? "handover_state_does_not_take_authority" : "existing_authority_holds_sectors",
+          recorded_state: recordedState ?? null,
           existing_authority: { cid: existing.controlling_cid, callsign: existing.controlling_callsign },
           attempted_authority: { cid: flight.controlling_cid ?? null, callsign: flight.controlling_callsign ?? null },
           attempted_state: flight.state ?? null,
