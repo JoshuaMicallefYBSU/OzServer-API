@@ -169,41 +169,27 @@ async function claimGroup(
   const skipped: string[] = [];
   const withheld: string[] = [];
   const conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }> = [];
-  const primary = rows.find(row => row.name === name);
-  const claimantIsNamedPrimary = primary?.callsign?.toUpperCase() === identity.callsign.toUpperCase();
   const positionOwnersInClaim = new Set(rows
     .filter(row => row.controller_callsign
       && row.callsign?.toUpperCase() === row.controller_callsign.toUpperCase())
     .map(row => row.controller_callsign!.toUpperCase()));
-  const overriddenTopDown: Array<{ sector: string; owner: { cid: number; callsign: string } }> = [];
-  // The sectors of the claimant's own position (Positions.xml, as the plugin's PrimaryPosition
-  // derives it), when the client sends them.
+  // No claim takes a sector off a controller who is present - not even a primary logging on to
+  // their own position. That used to be allowed for the position's group (primary_group): BLA
+  // logging on took BLA, ELW and MAE straight off the Huon controller holding them, with no request
+  // and nothing on Huon's side expecting it, and the aircraft inside went with them mid-session. A
+  // present owner is now always a conflict, and the arriving client turns its own position's
+  // conflicts into one request to the holder (OzServerOwnershipTracker.HandleConflictAsync), so the
+  // controller working the airspace is the one who decides when it moves.
   //
-  // A named primary taking a sector straight off whoever extended into it is right for the
-  // position's own group - that is what "the primary owns the position" means, and the holder's
-  // client hands the same sectors back on its side (PrimaryPositionWatcher). It is wrong for the
-  // rest of what the claim merely *covers*: responsible_sectors reaches further than the position
-  // does for eight positions in the current dataset (an arriving Inverell's claim sweeps up five
-  // Brisbane TCU sectors, Benalla's four of Melbourne Approach's, Gundagai's nine of Sydney's), and
-  // the override took those off a controller who was present and working them, with no request and
-  // nothing on their side expecting it. Unowned or abandoned cover is still claimed as before; only
-  // the override is confined to the group. A client that does not send it gets the old behaviour.
-  const primaryGroupNames = primaryGroup ? new Set(primaryGroup.map(group => group.toUpperCase())) : null;
-  const overrideAllowed = (row: SectorRow) => primaryGroupNames === null || primaryGroupNames.has(row.name.toUpperCase());
+  // primary_group is still accepted from clients that send it, and ignored.
+  void primaryGroup;
 
   for (const row of rows) {
-    if (row.controller_cid === null || row.controller_cid === identity.cid
-      || row.callsign?.toUpperCase() === identity.callsign.toUpperCase()) {
+    if (row.controller_cid === null || row.controller_cid === identity.cid) {
       takeable.push(row);
       continue;
     }
-    const ownerIsLoggedOnForThisSector = row.callsign?.toUpperCase() === row.controller_callsign?.toUpperCase();
     const ownerHasPositionInThisClaim = positionOwnersInClaim.has(row.controller_callsign?.toUpperCase() ?? "");
-    if (claimantIsNamedPrimary && overrideAllowed(row) && !ownerIsLoggedOnForThisSector && !ownerHasPositionInThisClaim) {
-      takeable.push(row);
-      overriddenTopDown.push({ sector: row.name, owner: { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } });
-      continue;
-    }
     // last_seen_online_at alone answers whether this row's owner is still actively present - see
     // isPresent. This used to be a fallback, only consulted when the VATSIM public datafeed didn't
     // already confirm the owner online, and gated on the much longer DISCONNECT_GRACE_MINUTES; both
@@ -233,7 +219,6 @@ async function claimGroup(
       withheld,
       conflicts,
       exclusions,
-      overridden_top_down: overriddenTopDown,
       all_or_nothing: allOrNothing
     });
     return { claimed: [], skipped, withheld, conflicts, missing: false };
@@ -277,7 +262,6 @@ async function claimGroup(
       withheld,
       conflicts,
       exclusions,
-      overridden_top_down: overriddenTopDown,
       previous_owners: previousOwners,
       fdr_authority_transferred: transferredFlights,
       all_or_nothing: allOrNothing
@@ -659,11 +643,31 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) return reply.code(422).send({ message: "Invalid request ids.", errors: parsed.error.flatten() });
     return transaction(async client => {
     await lockMutations(client, request.controller.server);
+    // Read up front, because accepting one request deletes the others its transfer carried along:
+    // accepting BLA moves ELW and MAE with it (transferRequest walks the whole covered group), and
+    // their own requests in the same batch then no longer exist. That is not a failure - the sector
+    // went exactly where it was asked to - and reporting it as one put "Request no longer exists"
+    // in front of a controller who had just accepted the lot.
+    const pending = new Map((await client.query(
+      `SELECT r.id, r.requesting_cid, s.name FROM sector_requests r JOIN sectors s ON s.id=r.sector_id
+        WHERE r.id=ANY($1) AND r.target_cid=$2 AND r.server=$3`,
+      [parsed.data.request_ids, request.controller.cid, request.controller.server])).rows
+      .map(row => [Number(row.id), { requestingCid: Number(row.requesting_cid), name: String(row.name) }]));
     const results = [];
     for (const id of parsed.data.request_ids) {
       const sector = await transferRequest(client, request.controller, id);
-      results.push({ request_id: id, sector, accepted: sector !== null,
-        message: sector ? "Ownership transferred." : "Request no longer exists or is not yours to accept." });
+      if (sector) {
+        results.push({ request_id: id, sector, accepted: true, message: "Ownership transferred." });
+        continue;
+      }
+      const before = pending.get(id);
+      const carried = before && (await client.query(
+        `SELECT 1 FROM sector_ownerships o JOIN sectors s ON s.id=o.sector_id
+          WHERE s.name=$1 AND o.controller_cid=$2 AND o.server=$3`,
+        [before.name, before.requestingCid, request.controller.server])).rowCount;
+      results.push(carried
+        ? { request_id: id, sector: before!.name, accepted: true, message: "Transferred with another sector in this request." }
+        : { request_id: id, sector: null, accepted: false, message: "Request no longer exists or is not yours to accept." });
     }
     return { results, sync: await syncPayload(client, request.controller) };
     });

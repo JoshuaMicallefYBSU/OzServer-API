@@ -17,8 +17,10 @@ preserving the plugin-facing `/api/v1` contract.
 
 ## ATIS
 
-The vatSys ATIS plugin publishes an airport's ATIS directly - one record per airport, created or
-replaced in full:
+The OzServer plugin publishes an airport's ATIS directly - relaying what badvectors/ATISPlugin is
+broadcasting, one record per airport, created or replaced in full. It publishes from a live-network
+session only: this record has no server of its own, so a SweatBox session would otherwise put
+training weather on the public map.
 
 ```
 PUT /api/v1/vatsim/atis/YSSY

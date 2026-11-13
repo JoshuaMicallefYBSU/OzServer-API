@@ -118,12 +118,29 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       await post("/sectors/OUT/claim", extender);
     });
 
-    it("takes back its own position but not the rest of what it covers", async () => {
+    it("does not take its own position off a present controller - it has to ask", async () => {
       const first = await post("/sectors/GRP/claim", primary, { primary_group: ["GRP", "INA"] });
       expect(first.statusCode).toBe(409);
-      expect(first.json().conflicts.map((conflict: { sector: string }) => conflict.sector)).toEqual(["OUT"]);
+      expect(first.json().conflicts.map((conflict: { sector: string }) => conflict.sector).sort()).toEqual(["INA", "OUT"]);
+      expect(await mine(extender)).toEqual(["INA", "OUT"]);
 
-      expect((await post("/sectors/GRP/claim", primary, { primary_group: ["GRP", "INA"], exclude: ["OUT"] })).statusCode).toBe(201);
+      // What is free is still claimable around the contested pieces.
+      expect((await post("/sectors/GRP/claim", primary, { exclude: ["INA", "OUT"] })).statusCode).toBe(201);
+      expect(await mine(primary)).toEqual(["GRP"]);
+      expect(await mine(extender)).toEqual(["INA", "OUT"]);
+    });
+
+    it("refuses a sector to the controller logged on as it while someone present holds it", async () => {
+      const response = await post("/sectors/INA/claim", { cid: 1000004, callsign: "XX-INA_CTR" });
+      expect(response.statusCode).toBe(409);
+      expect(await mine(extender)).toEqual(["INA", "OUT"]);
+    });
+
+    it("gets its own position once the holder accepts the request", async () => {
+      await post("/sectors/GRP/claim", primary, { exclude: ["INA", "OUT"] });
+      const requested = await post("/sectors/INA/request", primary);
+      expect(requested.statusCode).toBe(201);
+      expect((await post(`/sector-requests/${requested.json().id}/accept`, extender)).statusCode).toBe(200);
       expect(await mine(primary)).toEqual(["GRP", "INA"]);
       expect(await mine(extender)).toEqual(["OUT"]);
     });
@@ -134,14 +151,10 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect(await mine(primary)).toEqual(["GRP", "INA", "OUT"]);
     });
 
-    it("keeps the old everything-it-covers override for a client that sends no group", async () => {
-      expect((await post("/sectors/GRP/claim", primary)).statusCode).toBe(201);
-      expect(await mine(primary)).toEqual(["GRP", "INA", "OUT"]);
-    });
-
-    it("clears requests left pointing at the controller it took the sector from", async () => {
+    it("clears requests left pointing at a controller whose sector was taken after they went quiet", async () => {
       expect((await post("/sectors/INA/request", third)).statusCode).toBe(201);
-      await post("/sectors/GRP/claim", primary, { primary_group: ["GRP", "INA"], exclude: ["OUT"] });
+      await goQuiet(extender);
+      await post("/sectors/GRP/claim", primary);
       expect((await get("/sector-requests", third)).json().by_me).toEqual([]);
       // Which is what lets them ask the new owner instead.
       expect((await post("/sectors/INA/request", third)).statusCode).toBe(201);
