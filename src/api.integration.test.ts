@@ -357,6 +357,25 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect((await held(extender, "STATE_HANDOVER")).json().results).toEqual([{ callsign: "QFA1", updated: false }]);
       expect((await record()).controlling_cid).toBe(third.cid);
     });
+
+    it("takes an untracked report from the controller holding the FDR's data authority sector, and no one else", async () => {
+      await post("/sectors/INA/claim", extender);
+      await post("/sectors/FAR/claim", third);
+      await post("/fdr/batch", extender, flight({ controlling_cid: extender.cid, controlling_callsign: extender.callsign, state: "STATE_CONTROLLED" }));
+
+      const untracked = (who: Identity, authority: string) => post("/fdr/batch", who, flight({
+        controlling_cid: null, controlling_callsign: null, authority_sector: authority, state: "STATE_COORDINATED"
+      }));
+      // Not the data authority: refused.
+      expect((await untracked(third, "INA")).json().results).toEqual([{ callsign: "QFA1", updated: false }]);
+      // The holder of the authority sector: the tag was dropped, and the record now says so.
+      expect((await untracked(third, "FAR")).json().results).toEqual([{ callsign: "QFA1", updated: true }]);
+      expect(await record()).toMatchObject({ controlling_cid: null, authority_sector: "FAR", state: "STATE_COORDINATED" });
+
+      // An aircraft with no live position is still served to the map.
+      const aircraft = (await app.inject({ method: "GET", url: "/api/v1/map/aircraft?server=live" })).json();
+      expect(aircraft.map((row: { callsign: string }) => row.callsign)).toContain("QFA1");
+    });
   });
 
   describe("shared markup", () => {

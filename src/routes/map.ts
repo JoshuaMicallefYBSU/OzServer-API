@@ -68,9 +68,11 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Querystring: { server?: string } }>("/map/aircraft", async (request, reply) => {
     const server = parseServer(request.query.server);
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
+    // Every recent record, position or not: an activated FDR still at the gate, or a completed one,
+    // is drawn at its aerodrome (dep_lat/des_lat, which the plugin sends) rather than where it is.
     return (await pool.query(
       `SELECT * FROM flight_data_records WHERE server=$2 AND last_seen_at >= now()-($1*interval '1 minute')
-        AND (data->>'lat') IS NOT NULL ORDER BY callsign`,
+        ORDER BY callsign`,
       [config.FDR_RETAIN_MINUTES, server])).rows.map(row => ({ ...row.data, callsign: row.callsign,
         controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
         current_sector: row.current_sector, last_seen_at: row.last_seen_at }));

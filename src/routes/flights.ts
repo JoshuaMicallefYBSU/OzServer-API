@@ -8,7 +8,10 @@ const flightSchema = z.object({
   callsign: z.string().trim().min(1).max(20),
   controlling_cid: z.number().int().nullable().optional(),
   controlling_callsign: z.string().max(32).nullable().optional(),
-  current_sector: z.string().max(32).nullable().optional()
+  current_sector: z.string().max(32).nullable().optional(),
+  // The FDR's vatSys data authority (fdr.ControllingSector) - kept in data like any other field,
+  // and what an untracked push is recognised by (see reportsUntracked).
+  authority_sector: z.string().max(32).nullable().optional()
 }).passthrough();
 
 function hasOwn(value: object, key: string): boolean {
@@ -100,10 +103,21 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
         && flight.state === "STATE_CONTROLLED"
         && controlling_cid === identity.cid;
       const ownsSectorAndClaims = callerOwnsCurrentSector && !isHandover(flight.state);
+      // An untracked report from the FDR's data authority: the plugin now also pushes an activated
+      // (or completed) FDR that nobody tracks, from whichever controller holds the sector vatSys
+      // names as its data authority (FdrSync.ShouldPush), with no tag owner. If the record still
+      // names someone, it is because they have since dropped the tag - their client sees it as
+      // tracked and would not be pushing it untracked - so the authority holder is believed. Should
+      // that ever be a moment's lag (a track the authority's client has not heard of yet), the
+      // tracker's own next push puts their name straight back: nothing guards a record with no owner.
+      const reportsUntracked = hasOwn(flight, "controlling_cid") && flight.controlling_cid == null
+        && typeof flight.authority_sector === "string" && callerOwnedSectors.has(flight.authority_sector)
+        && !isHandover(recordedState);
       if (existing?.controlling_cid && existing.controlling_cid !== identity.cid
         && cidsWithSectors.has(existing.controlling_cid)
         && !ownsSectorAndClaims
-        && !acceptsHandoff) {
+        && !acceptsHandoff
+        && !reportsUntracked) {
         await writeDiagnosticLog(client, identity, "ServerFDR", `Rejected ${flight.callsign} update; authority is still ${existing.controlling_callsign}`, {
           action: "fdr_update_rejected",
           fdr_callsign: flight.callsign,
