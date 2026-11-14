@@ -1,7 +1,9 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { config } from "../config.js";
 import { writeDiagnosticLog } from "../diagnostics.js";
 import { pool, transaction } from "../db.js";
+import { isWithinStartupGrace } from "../presence.js";
 import type { ControllerIdentity } from "../types.js";
 
 const flightSchema = z.object({
@@ -21,6 +23,12 @@ function hasOwn(value: object, key: string): boolean {
 async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: ControllerIdentity) {
   return transaction(async client => {
     const cidsWithSectors = new Set((await client.query("SELECT DISTINCT controller_cid FROM sector_ownerships WHERE server=$1", [identity.server])).rows.map(row => row.controller_cid));
+    // Controllers whose client is still calling in (the heartbeat in app.ts). Everyone counts as
+    // present just after this server starts, before anybody has had a chance to call.
+    const presentCids = isWithinStartupGrace(config.PRESENCE_TIMEOUT_SECONDS * 1000) ? null : new Set((await client.query(
+      `SELECT DISTINCT controller_cid FROM sector_ownerships
+        WHERE server=$1 AND last_seen_online_at >= now()-($2*interval '1 second')`,
+      [identity.server, config.PRESENCE_TIMEOUT_SECONDS])).rows.map(row => row.controller_cid));
     const callerOwnedSectors = new Set((await client.query(
       `SELECT s.name FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
         WHERE o.controller_cid=$1 AND o.server=$2`, [identity.cid, identity.server])).rows.map(row => row.name));
@@ -110,14 +118,27 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
       // tracked and would not be pushing it untracked - so the authority holder is believed. Should
       // that ever be a moment's lag (a track the authority's client has not heard of yet), the
       // tracker's own next push puts their name straight back: nothing guards a record with no owner.
-      const reportsUntracked = hasOwn(flight, "controlling_cid") && flight.controlling_cid == null
+      const untrackedPush = hasOwn(flight, "controlling_cid") && flight.controlling_cid == null;
+      const reportsUntracked = untrackedPush
         && typeof flight.authority_sector === "string" && callerOwnedSectors.has(flight.authority_sector)
         && !isHandover(recordedState);
+      // The recorded controller has dropped off - still holding sectors (the disconnect grace
+      // period), but their client has stopped calling. Somebody has to keep the aircraft's position
+      // current meanwhile, and the plugin hands that to exactly one connected controller (see
+      // FdrSync.ResponsibleSectorForUntracked), whose report is taken. Their name stays on the record
+      // though: it is what lets them have the tag straight back if they reconnect within the grace
+      // period (POST /sectors/resume). Once the sweep has released their sectors, an untracked report
+      // clears it like any other.
+      const authorityAway = !!existing?.controlling_cid && existing.controlling_cid !== identity.cid
+        && cidsWithSectors.has(existing.controlling_cid)
+        && presentCids !== null && !presentCids.has(existing.controlling_cid);
+      const keepAwayAuthority = untrackedPush && authorityAway;
       if (existing?.controlling_cid && existing.controlling_cid !== identity.cid
         && cidsWithSectors.has(existing.controlling_cid)
         && !ownsSectorAndClaims
         && !acceptsHandoff
-        && !reportsUntracked) {
+        && !reportsUntracked
+        && !keepAwayAuthority) {
         await writeDiagnosticLog(client, identity, "ServerFDR", `Rejected ${flight.callsign} update; authority is still ${existing.controlling_callsign}`, {
           action: "fdr_update_rejected",
           fdr_callsign: flight.callsign,
@@ -143,6 +164,12 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
       delete data.controller_callsign;
       delete data.server;
 
+      // Standing in for a controller who has dropped off (keepAwayAuthority): the position and flight
+      // data are this report's, the tag - who holds it, and its tracked state - stays theirs.
+      const storedCid = keepAwayAuthority ? existing!.controlling_cid : controlling_cid;
+      const storedCallsign = keepAwayAuthority ? existing!.controlling_callsign : controlling_callsign;
+      if (keepAwayAuthority) delete data.state;
+
       const previousData = existing?.data ?? {};
       const previousState = previousData.state ?? null;
       const nextState = data.state ?? previousState;
@@ -151,11 +178,11 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
          VALUES ($1,$2,$3,$4,$5,now(),$6) ON CONFLICT (callsign, server) DO UPDATE SET
          controlling_cid=excluded.controlling_cid,controlling_callsign=excluded.controlling_callsign,
          current_sector=excluded.current_sector,data=flight_data_records.data || excluded.data,last_seen_at=now()`,
-        [callsign, controlling_cid, controlling_callsign, current_sector, JSON.stringify(data), identity.server]);
+        [callsign, storedCid, storedCallsign, current_sector, JSON.stringify(data), identity.server]);
 
       const changed = !existing
-        || existing.controlling_cid !== controlling_cid
-        || existing.controlling_callsign !== controlling_callsign
+        || existing.controlling_cid !== storedCid
+        || existing.controlling_callsign !== storedCallsign
         || existing.current_sector !== current_sector
         || previousState !== nextState;
 
@@ -170,11 +197,12 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
             state: previousState
           } : null,
           next: {
-            controlling_cid,
-            controlling_callsign,
+            controlling_cid: storedCid,
+            controlling_callsign: storedCallsign,
             current_sector,
             state: nextState
-          }
+          },
+          standing_in_for_away_controller: keepAwayAuthority || undefined
         });
       }
       results.push({ callsign, updated: true });

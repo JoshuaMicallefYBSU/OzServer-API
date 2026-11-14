@@ -87,43 +87,58 @@ function shareEdgeCorners(rings: Point[][]): Point[][] {
 // the Pacific ARA silently replaced the Australian one and the Australian ARA sector was drawn
 // swallowing WIL.
 //
-// A sector both datasets define is taken from the first (Australia) - it is the authority for its
-// own sectors - and one hidden from the Sectors window is not imported at all.
+// Which profile a sector comes from - Australian positions from the AUS profile, Pacific ones from
+// the PAC profile. Each profile carries copies of its neighbour's sectors, and says which are its
+// own by showing them in the Sectors window:
+//
+//  - the PAC profile shows only its own sectors (every Australian sector in it is hidden), so a
+//    sector PAC shows is a Pacific one and comes from PAC - including the Pacific aerodrome and
+//    approach positions the AUS profile also shows (AYNZA, AYPY ADC, NFFN ADC, NWWW ADC, ...);
+//  - any other sector AUS shows is an Australian one and comes from AUS;
+//  - one neither shows (KZAK, NZZO, WAAF, ...) is somebody else's airspace and is not imported.
 type ParsedDataset = {
+  profile: "AUS" | "PAC";
   boundaries: Map<string, Point[]>;
   volumes: Map<string, string[]>; // volume name -> boundary names
   sectors: Array<Record<string, any>>;
+  shown: Map<string, Record<string, any>>; // sectors this profile shows in its Sectors window, by name
 };
 const parsed: ParsedDataset[] = [];
-for (const base of datasets) {
+for (const [index, base] of datasets.entries()) {
   const volumesRoot = (await xml(base, "Volumes.xml")).Volumes;
   const sectorsRoot = (await xml(base, "Sectors.xml")).Sectors;
+  const sectors = list<Record<string, any>>(sectorsRoot.Sector);
   parsed.push({
+    profile: index === 0 ? "AUS" : "PAC",
     boundaries: new Map(list<Record<string, any>>(volumesRoot.Boundary).map(item => [String(item["@_Name"]),
       String(item["#text"] ?? "").split("/").filter(Boolean).map(coordinate)])),
     volumes: new Map(list<Record<string, any>>(volumesRoot.Volume).map(volume => [String(volume["@_Name"]), csv(volume.Boundaries)])),
-    sectors: list<Record<string, any>>(sectorsRoot.Sector)
+    sectors,
+    shown: new Map(sectors
+      .filter(sector => String(sector["@_DisplayInSectorsWindow"] ?? "true").toLowerCase() !== "false")
+      .map(sector => [String(sector["@_Name"]), sector]))
   });
 }
+const aus = parsed.find(dataset => dataset.profile === "AUS")!;
+const pac = parsed.find(dataset => dataset.profile === "PAC")!;
 
 const kept: Array<{ dataset: ParsedDataset; sector: Record<string, any>; boundaryNames: string[] }> = [];
-const keptNames = new Set<string>();
-for (const dataset of parsed) {
-  for (const sector of dataset.sectors) {
-    if (String(sector["@_DisplayInSectorsWindow"] ?? "true").toLowerCase() === "false") continue;
-    const name = String(sector["@_Name"]);
-    if (keptNames.has(name)) continue;
-    keptNames.add(name);
-    kept.push({ dataset, sector, boundaryNames: csv(sector.Volumes).flatMap(volume => dataset.volumes.get(volume) ?? []) });
-  }
-}
+const keep = (dataset: ParsedDataset, sector: Record<string, any>) => kept.push({
+  dataset, sector, boundaryNames: csv(sector.Volumes).flatMap(volume => dataset.volumes.get(volume) ?? [])
+});
+for (const sector of pac.shown.values()) keep(pac, sector);
+for (const [name, sector] of aus.shown) if (!pac.shown.has(name)) keep(aus, sector);
+
+const fromPacAlsoInAus = [...pac.shown.keys()].filter(name => aus.shown.has(name));
+console.log(`Sectors: ${kept.filter(k => k.dataset === aus).length} from AUS, ${kept.filter(k => k.dataset === pac).length} from PAC`
+  + (fromPacAlsoInAus.length ? ` (shown in both, taken from PAC: ${fromPacAlsoInAus.join(", ")})` : ""));
 
 // Shared edges matched across exactly the boundaries that will be drawn - not every boundary either
 // file happens to contain, or a hidden duplicate's corners would be pulled into the real outlines.
 const used = new Map<string, { dataset: ParsedDataset; name: string }>();
 for (const { dataset, boundaryNames } of kept) {
   for (const name of boundaryNames) {
-    if (dataset.boundaries.has(name)) used.set(`${parsed.indexOf(dataset)}:${name}`, { dataset, name });
+    if (dataset.boundaries.has(name)) used.set(`${dataset.profile}:${name}`, { dataset, name });
   }
 }
 const usedEntries = [...used.values()];
@@ -159,13 +174,27 @@ await transaction(async client => {
   }
   await client.query("DELETE FROM sectors WHERE NOT (name=ANY($1))", [seenSectors]);
 
+  // Positions likewise come from their own profile's Positions.xml. The two files share no position
+  // names today; should one ever appear in both, it is not silently overwritten by whichever file is
+  // read last - the PAC entry is taken if PAC shows a sector with that position's callsign prefix,
+  // the AUS one otherwise, and the clash is reported.
   const seenPositions: string[] = [];
-  for (const base of datasets) {
+  const positionProfile = new Map<string, "AUS" | "PAC">();
+  const pacPrefixes = new Set([...pac.shown.values()].map(sector => String(sector["@_Callsign"] ?? "").split(/[-_]/)[0]).filter(Boolean));
+  for (const [index, base] of datasets.entries()) {
+    const profile = index === 0 ? "AUS" : "PAC";
     const root = (await xml(base, "Positions.xml")).Positions;
     const candidates = [...list<Record<string, any>>(root.Position),
       ...list<Record<string, any>>(root.Group).flatMap(group => list<Record<string, any>>(group.Position))];
     for (const position of candidates) {
       const name = String(position["@_Name"]);
+      const already = positionProfile.get(name);
+      if (already) {
+        const pacOwns = pacPrefixes.has(name.split(/[-_ ]/)[0] ?? "");
+        console.warn(`Position ${name} is in both profiles; using ${pacOwns ? "PAC" : "AUS"}.`);
+        if ((pacOwns ? "PAC" : "AUS") !== profile) continue;
+      }
+      positionProfile.set(name, profile);
       const center = coordinate(String(position["@_DefaultCenter"]));
       await client.query(
         `INSERT INTO positions (name,asmgcs_airport,default_lat,default_lon,updated_at) VALUES ($1,$2,$3,$4,now())

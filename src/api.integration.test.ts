@@ -377,6 +377,25 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect(aircraft.map((row: { callsign: string }) => row.callsign)).toContain("QFA1");
     });
 
+    it("keeps an aircraft's position current from a stand-in while its controller has dropped off, and keeps their name on it", async () => {
+      await post("/sectors/INA/claim", extender);
+      await post("/sectors/FAR/claim", third);
+      await post("/fdr/batch", extender, flight({ controlling_cid: extender.cid, controlling_callsign: extender.callsign, state: "STATE_CONTROLLED", lat: -33.9, lon: 151.2 }));
+
+      // Gone quiet, but still within the grace period: their sectors are still theirs.
+      await goQuiet(extender, 60);
+      const standIn = await post("/fdr/batch", third, flight({
+        controlling_cid: null, controlling_callsign: null, authority_sector: "FAR", state: "STATE_UNCONTROLLED", lat: -34.5, lon: 150.9
+      }));
+      expect(standIn.json().results).toEqual([{ callsign: "QFA1", updated: true }]);
+      expect(await record()).toMatchObject({ controlling_cid: extender.cid, state: "STATE_CONTROLLED", lat: -34.5, lon: 150.9 });
+
+      // Once the sweep has released their sectors, an untracked report is just that.
+      await db.query("DELETE FROM sector_ownerships WHERE controller_cid=$1", [extender.cid]);
+      await post("/fdr/batch", third, flight({ controlling_cid: null, controlling_callsign: null, authority_sector: "FAR", state: "STATE_UNCONTROLLED", lat: -35, lon: 150.5 }));
+      expect(await record()).toMatchObject({ controlling_cid: null, state: "STATE_UNCONTROLLED", lat: -35 });
+    });
+
     it("keeps the last route when a push leaves it out, and serves it apart from the aircraft feed", async () => {
       const route = [{ n: "YSSY", lat: -33.9461, lon: 151.1772 }, { n: "RIVET", lat: -34.1, lon: 150.6 }, { n: "YMML", lat: -37.6733, lon: 144.8433 }];
       await post("/fdr/batch", extender, flight({ route_points: route, route_next_index: 1 }));
