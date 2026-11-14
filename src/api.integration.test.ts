@@ -107,6 +107,24 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     expect(response.json().conflicts[0]).toMatchObject({ sector: "INA", owner: { cid: extender.cid } });
   });
 
+  it("serves the ops picture: each controller with every sector they hold, and the requests between them", async () => {
+    await post("/sectors/GRP/claim", primary);
+    await post("/sectors/FAR/claim", extender);
+    expect((await post("/sectors/GRP/request", extender)).statusCode).toBe(201);
+
+    const response = await app.inject({ method: "GET", url: "/api/v1/map/ops?server=live" });
+    expect(response.statusCode).toBe(200);
+    const ops = response.json();
+    expect(ops.ownerships.map((row: { sector: string }) => row.sector).sort()).toEqual(["FAR", "GRP", "INA", "OUT"]);
+    const holder = ops.controllers.find((controller: { cid: number }) => controller.cid === primary.cid);
+    expect(holder).toMatchObject({ callsign: primary.callsign, home_sector: "GRP", online: true, is_flow: false });
+    expect([...holder.sectors].sort()).toEqual(["GRP", "INA", "OUT"]);
+    expect(ops.requests.some((row: { sector: string; requesting_cid: number; target_cid: number }) =>
+      row.sector === "GRP" && row.requesting_cid === extender.cid && row.target_cid === primary.cid)).toBe(true);
+
+    expect((await app.inject({ method: "GET", url: "/api/v1/map/ops" })).statusCode).toBe(400);
+  });
+
   it("lets a sector be claimed once its owner has gone quiet", async () => {
     await post("/sectors/INA/claim", extender);
     await goQuiet(extender);

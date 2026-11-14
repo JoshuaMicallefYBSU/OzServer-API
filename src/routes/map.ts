@@ -82,7 +82,96 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
   // sectors are shared across every server (see migrations/006_server_isolation.sql), so there is
   // nothing to scope here.
   app.get("/map/sector-shapes", async () => (await pool.query(
-    "SELECT name,full_name,type,callsign,responsible_sectors,boundary FROM sectors ORDER BY name")).rows);
+    "SELECT name,full_name,type,callsign,frequency,responsible_sectors,boundary FROM sectors ORDER BY name")).rows);
+
+  // The /ops page's whole live picture in one call: who holds which sector, every controller with
+  // the full set they hold, the requests between them and the shared notes/drawings. Geometry is not
+  // in here - the page loads /map/sector-shapes once and joins this onto it by sector name, so this
+  // stays small enough to re-read on every "sectors"/"annotations" signal.
+  //
+  // Read-only and public like the rest of /map: nothing here is more than what every connected
+  // controller already sees in their own Sectors window, and none of it can be acted on from a
+  // browser. Presence is judged from our own heartbeat (last_seen_online_at) for every server, live
+  // included - it is the signal the disconnect sweep itself trusts, and it has none of the
+  // datafeed's publish lag.
+  app.get<{ Querystring: { server?: string } }>("/map/ops", async (request, reply) => {
+    const server = parseServer(request.query.server);
+    if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
+
+    const [ownerships, requests, annotations] = await Promise.all([
+      pool.query(
+        `SELECT s.name, s.callsign AS sector_callsign, s.type, s.frequency,
+                o.controller_cid, o.controller_callsign, o.last_seen_online_at, o.created_at, o.updated_at
+           FROM sector_ownerships o JOIN sectors s ON s.id=o.sector_id
+          WHERE o.server=$1 ORDER BY s.name`, [server]),
+      pool.query(
+        `SELECT r.id, r.group_id, s.name AS sector, r.requesting_cid, r.requesting_callsign,
+                r.target_cid, r.target_callsign, r.created_at, r.rejected_at
+           FROM sector_requests r JOIN sectors s ON s.id=r.sector_id
+          WHERE r.server=$1 AND (r.rejected_at IS NULL OR r.rejected_at >= now()-interval '10 minutes')
+          ORDER BY r.created_at`, [server]),
+      pool.query(
+        `SELECT id, kind, author_cid, author_callsign, body, points, colour, created_at, updated_at
+           FROM annotations WHERE server=$1 ORDER BY created_at`, [server])
+    ]);
+
+    const timeoutMs = config.PRESENCE_TIMEOUT_SECONDS * 1000;
+    const now = Date.now();
+    const isFlow = (callsign: string | null | undefined) => !!callsign && callsign.toUpperCase().endsWith("_FMP");
+
+    type OpsController = {
+      cid: number; callsign: string; is_flow: boolean; online: boolean; last_seen_at: string | null;
+      home_sector: string | null; type: string | null; frequency: string | null; sectors: string[];
+    };
+    const controllers = new Map<string, OpsController>();
+    for (const row of ownerships.rows) {
+      const key = `${row.controller_cid}|${row.controller_callsign}`;
+      let controller = controllers.get(key);
+      if (!controller) {
+        controller = {
+          cid: row.controller_cid, callsign: row.controller_callsign, is_flow: isFlow(row.controller_callsign),
+          online: false, last_seen_at: null, home_sector: null, type: null, frequency: null, sectors: []
+        };
+        controllers.set(key, controller);
+      }
+      controller.sectors.push(row.name);
+      const seen = row.last_seen_online_at ? new Date(row.last_seen_online_at) : null;
+      if (seen && (!controller.last_seen_at || seen.getTime() > new Date(controller.last_seen_at).getTime())) {
+        controller.last_seen_at = seen.toISOString();
+        controller.online = now - seen.getTime() < timeoutMs;
+      }
+      // The "home" position is the sector whose own callsign is the controller's login callsign -
+      // the same rule /map/controllers uses. Someone covering only other positions has none.
+      if (row.sector_callsign && row.sector_callsign.toUpperCase() === String(row.controller_callsign).toUpperCase()) {
+        controller.home_sector = row.name;
+        controller.type = row.type;
+        controller.frequency = row.frequency;
+      }
+    }
+
+    return {
+      server,
+      generated_at: new Date().toISOString(),
+      presence_timeout_seconds: config.PRESENCE_TIMEOUT_SECONDS,
+      ownerships: ownerships.rows.map(row => ({
+        sector: row.name, cid: row.controller_cid, callsign: row.controller_callsign,
+        since: row.updated_at ?? row.created_at, last_seen_at: row.last_seen_online_at
+      })),
+      controllers: [...controllers.values()].sort((a, b) =>
+        (typePriority[a.type ?? ""] ?? 99) - (typePriority[b.type ?? ""] ?? 99) || a.callsign.localeCompare(b.callsign)),
+      requests: requests.rows.map(row => ({
+        id: Number(row.id), group_id: row.group_id, sector: row.sector,
+        requesting_cid: row.requesting_cid, requesting_callsign: row.requesting_callsign,
+        target_cid: row.target_cid, target_callsign: row.target_callsign,
+        is_flow_relief: isFlow(row.requesting_callsign),
+        created_at: row.created_at, rejected_at: row.rejected_at
+      })),
+      annotations: annotations.rows.map(row => ({
+        id: row.id, kind: row.kind, author: { cid: row.author_cid, callsign: row.author_callsign },
+        body: row.body, points: row.points, colour: row.colour, created_at: row.created_at, updated_at: row.updated_at
+      }))
+    };
+  });
 
   // Every ATIS the map can draw, in one shape whichever way it reached this server: the ones a
   // vatSys ATIS plugin published (network_atis - see routes/atis.ts), and, for an airport that has
