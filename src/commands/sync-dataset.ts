@@ -58,6 +58,12 @@ function shareEdgeCorners(rings: Point[][]): Point[][] {
     for (let i = 0; i < ring.length - 1; i++) {
       const a = ring[i]!, b = ring[i + 1]!;
       out.push(a);
+      // An edge across the antimeridian (179°E to 179°W, in the Fiji and Auckland Oceanic FIRs)
+      // reads in raw longitude as a line almost all the way round the world - straight through
+      // Australia - and matching against it pulled Australian corners into the Pacific outlines,
+      // drawing spikes across the continent. Those edges border nothing in either dataset that
+      // needs matching, so they are left exactly as given.
+      if (Math.abs(b.lon - a.lon) > 180) continue;
       const k = Math.cos(((a.lat + b.lat) / 2) * Math.PI / 180);
       const ax = a.lon * k, ay = a.lat, dx = b.lon * k - ax, dy = b.lat - ay;
       const length2 = dx * dx + dy * dy;
