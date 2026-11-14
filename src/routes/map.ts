@@ -73,9 +73,28 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     return (await pool.query(
       `SELECT * FROM flight_data_records WHERE server=$2 AND last_seen_at >= now()-($1*interval '1 minute')
         ORDER BY callsign`,
-      [config.FDR_RETAIN_MINUTES, server])).rows.map(row => ({ ...row.data, callsign: row.callsign,
-        controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
-        current_sector: row.current_sector, last_seen_at: row.last_seen_at }));
+      [config.FDR_RETAIN_MINUTES, server])).rows.map(row => {
+        // Routes are served by /map/routes instead: dozens of points per flight would multiply the
+        // size of a feed the map re-reads on every FDR signal. has_route lets the map know one exists.
+        const { route_points: routePoints, ...data } = (row.data ?? {}) as Record<string, unknown>;
+        return { ...data, callsign: row.callsign, has_route: Array.isArray(routePoints) && routePoints.length > 1,
+          controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
+          current_sector: row.current_sector, last_seen_at: row.last_seen_at };
+      });
+  });
+
+  // Every recent FDR's route as vatSys parsed it (route_points, pushed by the plugin), with the
+  // index of the next waypoint still to be flown. Fetched by the map only while routes are shown.
+  app.get<{ Querystring: { server?: string } }>("/map/routes", async (request, reply) => {
+    const server = parseServer(request.query.server);
+    if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
+    return (await pool.query(
+      `SELECT callsign, data->'route_points' AS route_points, (data->>'route_next_index')::int AS route_next_index
+         FROM flight_data_records
+        WHERE server=$2 AND last_seen_at >= now()-($1*interval '1 minute')
+          AND jsonb_typeof(data->'route_points')='array'
+        ORDER BY callsign`,
+      [config.FDR_RETAIN_MINUTES, server])).rows;
   });
 
   // Every sector's static geometry, regardless of staffing - unlike /map/sectors (staffed-only,

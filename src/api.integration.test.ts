@@ -376,6 +376,19 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       const aircraft = (await app.inject({ method: "GET", url: "/api/v1/map/aircraft?server=live" })).json();
       expect(aircraft.map((row: { callsign: string }) => row.callsign)).toContain("QFA1");
     });
+
+    it("keeps the last route when a push leaves it out, and serves it apart from the aircraft feed", async () => {
+      const route = [{ n: "YSSY", lat: -33.9461, lon: 151.1772 }, { n: "RIVET", lat: -34.1, lon: 150.6 }, { n: "YMML", lat: -37.6733, lon: 144.8433 }];
+      await post("/fdr/batch", extender, flight({ route_points: route, route_next_index: 1 }));
+      await post("/fdr/batch", extender, flight({ route_next_index: 2, lat: -35, lon: 149 }));
+
+      const routes = (await app.inject({ method: "GET", url: "/api/v1/map/routes?server=live" })).json();
+      expect(routes).toEqual([{ callsign: "QFA1", route_points: route, route_next_index: 2 }]);
+
+      const [row] = (await app.inject({ method: "GET", url: "/api/v1/map/aircraft?server=live" })).json();
+      expect(row).toMatchObject({ callsign: "QFA1", has_route: true });
+      expect(row.route_points).toBeUndefined();
+    });
   });
 
   describe("shared markup", () => {
