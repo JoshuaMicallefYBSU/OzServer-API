@@ -68,6 +68,8 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     await sector("INA", "XX-INA_CTR", []);
     await sector("OUT", "XX-OUT_APP", []);
     await sector("FAR", "XX-FAR_CTR", []);
+    await db.query(
+      "INSERT INTO sectors (name,full_name,callsign,type,responsible_sectors) VALUES ('XX FMP','XX FMP','XX_FMP','FMP','[]')");
     // The map places an ATIS at its airport's position, so an airport the dataset has no position
     // for cannot be drawn at all - see /map/atis.
     await db.query(
@@ -216,6 +218,44 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     expect((await post(`/sector-requests/${id}/accept`, extender)).statusCode).toBe(200);
     expect(await mine(third)).toEqual(["INA"]);
     expect(await mine(extender)).toEqual([]);
+  });
+
+  describe("a flow (FMP) position", () => {
+    const flow: Identity = { cid: 1000004, callsign: "XX_FMP" };
+
+    it("holds its own FMP sector", async () => {
+      expect((await post("/sectors/XX%20FMP/claim", flow)).statusCode).toBe(201);
+      expect(await mine(flow)).toEqual(["XX FMP"]);
+    });
+
+    it("cannot claim enroute or TMA airspace, even when nobody holds it", async () => {
+      const response = await post("/sectors/GRP/claim", flow);
+      expect(response.statusCode).toBe(403);
+      expect(await mine(flow)).toEqual([]);
+
+      const committed = await post("/sectors/commit", flow, { claim: ["INA", "XX FMP"] });
+      expect(committed.json().result.failed).toEqual(["INA"]);
+      expect(await mine(flow)).toEqual(["XX FMP"]);
+    });
+
+    it("cannot request airspace nobody holds", async () => {
+      expect((await post("/sectors/INA/request", flow)).statusCode).toBe(403);
+      expect((await post("/sectors/commit", flow, { request: ["INA"] })).json().result.failed).toEqual(["INA"]);
+      expect(await mine(flow)).toEqual([]);
+    });
+
+    it("can take a held sector as relief cover once its controller accepts", async () => {
+      await post("/sectors/INA/claim", extender);
+      // Claiming it is still refused - it has to be asked for.
+      expect((await post("/sectors/INA/claim", flow)).statusCode).toBe(403);
+      const requested = await post("/sectors/INA/request", flow);
+      expect(requested.statusCode).toBe(201);
+      expect(await mine(extender)).toEqual(["INA"]);
+
+      expect((await post(`/sector-requests/${requested.json().id}/accept`, extender)).statusCode).toBe(200);
+      expect(await mine(flow)).toEqual(["INA"]);
+      expect(await mine(extender)).toEqual([]);
+    });
   });
 
   it("answers malformed ids and bodies as client errors, not server faults", async () => {

@@ -15,10 +15,32 @@ import {
 import type { ControllerIdentity } from "../types.js";
 
 type SectorRow = {
-  id: string; name: string; full_name: string; callsign: string | null;
+  id: string; name: string; full_name: string; callsign: string | null; type: string | null;
   responsible_sectors: string[]; controller_cid: number | null;
   controller_callsign: string | null; last_seen_online_at: Date | null;
 };
+
+// Flow (FMP) positions claim flow sectors and nothing else. An FMP controller transmits on enroute
+// and TMA lines to talk to those units, and every press used to claim the line's sector: PH_FMP
+// ended up owning AAE (with AAR and AAW), PHA and HYD on 14 Nov, none of which anybody was working.
+// What an FMP may do is provide relief cover: request a sector another controller holds, and take
+// it the ordinary way if they accept. So claims of anything else are refused, and so is a request
+// for a sector nobody holds; requests for held sectors, and their acceptance, are left alone. The
+// plugin applies the same rule (PrimaryPosition.MayOwn). A sector's type is its callsign suffix
+// (see sync-dataset).
+function isFlowCallsign(callsign: string | null | undefined): boolean {
+  return Boolean(callsign && /_FMP$/i.test(callsign));
+}
+
+function isFlowSector(sector: { type?: string | null; callsign?: string | null }): boolean {
+  return sector.type?.toUpperCase() === "FMP" || isFlowCallsign(sector.callsign);
+}
+
+function mayOwn(identity: { callsign: string }, sector: { type?: string | null; callsign?: string | null }): boolean {
+  return !isFlowCallsign(identity.callsign) || isFlowSector(sector);
+}
+
+const flowOnlyMessage = "Unable to assume sector - position is FMP. An FMP can only request a sector another controller holds, as relief cover.";
 
 const sectorNames = z.array(z.string().max(32)).max(400);
 
@@ -162,16 +184,27 @@ async function claimGroup(
   exclusions: string[] = [],
   allOrNothing = false,
   primaryGroup?: string[]
-): Promise<{ claimed: string[]; skipped: string[]; withheld: string[]; conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }>; missing: boolean }> {
+): Promise<{ claimed: string[]; skipped: string[]; withheld: string[]; conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }>; missing: boolean; refused: string[] }> {
   const everything = await covered(client, name, identity.server);
   // Only a sector that does not exist is "missing". A claim whose exclusions leave nothing to take
   // names a real sector and simply has nothing to do, which is how a client retries after a 409
   // that contested every sector it covers: it carves all of them out and asks for the rest. That
   // came back 404 "Sector not found." - shown to a controller logging on to a position someone
   // present was holding, about a sector that exists and that they had just requested.
-  if (everything.length === 0) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: true };
-  const rows = everything.filter(row => !exclusions.includes(row.name));
-  if (rows.length === 0) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: false };
+  if (everything.length === 0) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: true, refused: [] };
+  // Sectors this controller may never hold at all - see isFlowCallsign. Not conflicts (there is
+  // nobody to ask) and not withheld (it will not become claimable later); simply not taken.
+  const refused = everything.filter(row => !mayOwn(identity, row)).map(row => row.name);
+  if (refused.length > 0) {
+    await writeDiagnosticLog(client, identity, "ServerSector", `Claim ${name}: refused ${refused.join(", ")} - flow positions hold FMP sectors only`, {
+      action: "claim_refused_flow_position",
+      sector: name,
+      refused
+    });
+  }
+  if (refused.includes(name)) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: false, refused };
+  const rows = everything.filter(row => !exclusions.includes(row.name) && !refused.includes(row.name));
+  if (rows.length === 0) return { claimed: [], skipped: [], withheld: [], conflicts: [], missing: false, refused };
   const takeable: SectorRow[] = [];
   const skipped: string[] = [];
   const withheld: string[] = [];
@@ -241,7 +274,7 @@ async function claimGroup(
       exclusions,
       all_or_nothing: allOrNothing
     });
-    return { claimed: [], skipped, withheld, conflicts, missing: false };
+    return { claimed: [], skipped, withheld, conflicts, missing: false, refused };
   }
 
   const previousOwners = takeable
@@ -288,7 +321,7 @@ async function claimGroup(
     });
   }
 
-  return { claimed: takeable.map(row => row.name), skipped, withheld, conflicts, missing: false };
+  return { claimed: takeable.map(row => row.name), skipped, withheld, conflicts, missing: false, refused };
 }
 
 async function requestsPayload(client: pg.Pool | pg.PoolClient, identity: ControllerIdentity) {
@@ -363,6 +396,8 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
   // Restricting to the giver's own rows fixes both without adding a second opinion about who is
   // online. What is left unowned stays unowned, and is claimed through the ordinary path - which is
   // the one place the staffing rule is applied, and the only place it can be applied correctly.
+  // A flow position is given these the same way as anyone - relief cover the holder has just agreed
+  // to (see isFlowCallsign). What it may not do is claim them when nobody holds them.
   const rows = (await covered(client, request.name, identity.server))
     .filter(row => row.controller_cid === identity.cid);
 
@@ -416,6 +451,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       return claimGroup(client, request.controller, request.params.name, parsed.data.exclude, true, parsed.data.primary_group);
     });
     if (result.missing) return reply.code(404).send({ message: "Sector not found." });
+    if (result.refused.includes(request.params.name)) return reply.code(403).send({ message: flowOnlyMessage, refused: result.refused });
     if (result.skipped.length) return reply.code(409).send({ message: "Some of these sectors are already owned.", conflicts: result.conflicts });
     return reply.code(201).send(result.claimed);
   });
@@ -434,9 +470,11 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     const outcome = await transaction(async (client): Promise<{ code: number; body: unknown }> => {
     await lockMutations(client, request.controller.server);
     const sector = (await client.query(
-      `SELECT s.id,o.controller_cid,o.controller_callsign FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.name=$1`,
+      `SELECT s.id,s.type,s.callsign,o.controller_cid,o.controller_callsign FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.name=$1`,
       [request.params.name, request.controller.server])).rows[0];
     if (!sector) return { code: 404, body: { message: "Sector not found." } };
+    // A flow position may ask for airspace someone holds (relief cover), never claim what nobody does.
+    if (!sector.controller_cid && !mayOwn(request.controller, sector)) return { code: 403, body: { message: flowOnlyMessage } };
     if (!sector.controller_cid) return { code: 400, body: { message: "Sector is unclaimed - claim it directly instead of requesting it." } };
     if (sector.controller_cid === request.controller.cid) return { code: 400, body: { message: "You already own this sector." } };
     await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND server=$3 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid, request.controller.server]);
@@ -471,11 +509,11 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       for (const name of parsed.data.release) (await releaseGroup(client, request.controller, name) ? result.released : result.failed).push(name);
       for (const name of parsed.data.claim) {
         const claimed = await claimGroup(client, request.controller, name, parsed.data.exclude, false, parsed.data.primary_group);
-        if (claimed.missing) result.failed.push(name); else { result.claimed.push(...claimed.claimed); result.skipped.push(...claimed.skipped); result.withheld.push(...claimed.withheld); }
+        if (claimed.missing || claimed.refused.includes(name)) result.failed.push(name); else { result.claimed.push(...claimed.claimed); result.skipped.push(...claimed.skipped); result.withheld.push(...claimed.withheld); }
       }
       for (const name of parsed.data.request) {
         const sector = (await client.query(
-          `SELECT s.id,o.controller_cid,o.controller_callsign FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name=$1 AND o.server=$2`,
+          `SELECT s.id,s.type,s.callsign,o.controller_cid,o.controller_callsign FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id WHERE s.name=$1 AND o.server=$2`,
           [name, request.controller.server])).rows[0];
         if (!sector || sector.controller_cid === request.controller.cid) { result.failed.push(name); continue; }
         await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND server=$3 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid, request.controller.server]);
