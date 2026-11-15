@@ -48,8 +48,12 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
       const controlling_cid = hasOwn(flight, "controlling_cid")
         ? flight.controlling_cid ?? null
         : existing?.controlling_cid ?? null;
+      // Upper-cased like the caller's own identity (auth.ts): every later comparison of this column
+      // is against identity.callsign - the accept transfer, release-all, the sweep - and a callsign
+      // stored in another case would simply never match, leaving the flight with a controller
+      // nothing could move it off.
       const controlling_callsign = hasOwn(flight, "controlling_callsign")
-        ? flight.controlling_callsign ?? null
+        ? flight.controlling_callsign?.toUpperCase() ?? null
         : existing?.controlling_callsign ?? null;
       const current_sector = hasOwn(flight, "current_sector")
         ? flight.current_sector ?? null
@@ -225,8 +229,13 @@ export async function flightRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) return reply.code(422).send({ message: "Invalid flight batch.", errors: parsed.error.flatten() });
     return { results: await upsert(parsed.data.flights, request.controller) };
   });
+  // Every record, without its route. route_points is dozens of waypoints per flight and by far the
+  // bulk of a record, and nothing that reads this list uses it: the plugin polls it for label state
+  // and for what to activate on reconnect (as often as every few seconds, from every connected
+  // client), and the map reads routes from /map/routes. `data - 'route_points'` drops the key in
+  // Postgres, so it is never even sent to this process. GET /fdr/:callsign still returns it.
   app.get("/fdr/sync", async request => (await pool.query(
-    `SELECT callsign,controlling_cid,controlling_callsign,current_sector,last_seen_at,data
+    `SELECT callsign,controlling_cid,controlling_callsign,current_sector,last_seen_at,data - 'route_points' AS data
        FROM flight_data_records WHERE server=$1 ORDER BY callsign`, [request.controller.server])).rows.map(row => ({ ...row.data, callsign: row.callsign,
          controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
          current_sector: row.current_sector, last_seen_at: row.last_seen_at })));

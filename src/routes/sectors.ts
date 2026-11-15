@@ -748,38 +748,43 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post<{ Params: { id: string } }>("/sector-requests/:id/reject", async (request, reply) => {
-    if (!requestIdSchema.safeParse(request.params.id).success) return reply.code(403).send({ message: "This request cannot be rejected." });
+    // The parsed number goes to Postgres, not the raw parameter: "1e2" coerces to a valid id here
+    // and is not one a bigint column will take, which answered a malformed id with a 500.
+    const id = requestIdSchema.safeParse(request.params.id);
+    if (!id.success) return reply.code(403).send({ message: "This request cannot be rejected." });
     const changed = await pool.query(
       "UPDATE sector_requests SET rejected_at=now() WHERE id=$1 AND target_cid=$2 AND server=$3 AND rejected_at IS NULL RETURNING id",
-      [request.params.id, request.controller.cid, request.controller.server]);
+      [id.data, request.controller.cid, request.controller.server]);
     if (changed.rowCount)
-      await writeDiagnosticLog(pool, request.controller, "ServerSector", `Rejected request #${request.params.id}`, {
+      await writeDiagnosticLog(pool, request.controller, "ServerSector", `Rejected request #${id.data}`, {
         action: "request_reject",
-        request_id: request.params.id
+        request_id: id.data
       });
     return changed.rowCount ? { message: "Request rejected.", sync: await syncPayload(pool, request.controller) } : reply.code(403).send({ message: "This request cannot be rejected." });
   });
   app.post<{ Params: { id: string } }>("/sector-requests/:id/cancel", async (request, reply) => {
-    if (!requestIdSchema.safeParse(request.params.id).success) return reply.code(403).send({ message: "This request cannot be cancelled." });
+    const id = requestIdSchema.safeParse(request.params.id);
+    if (!id.success) return reply.code(403).send({ message: "This request cannot be cancelled." });
     const changed = await pool.query(
       "DELETE FROM sector_requests WHERE id=$1 AND requesting_cid=$2 AND server=$3 RETURNING id",
-      [request.params.id, request.controller.cid, request.controller.server]);
+      [id.data, request.controller.cid, request.controller.server]);
     if (changed.rowCount)
-      await writeDiagnosticLog(pool, request.controller, "ServerSector", `Cancelled request #${request.params.id}`, {
+      await writeDiagnosticLog(pool, request.controller, "ServerSector", `Cancelled request #${id.data}`, {
         action: "request_cancel",
-        request_id: request.params.id
+        request_id: id.data
       });
     return changed.rowCount ? { message: "Request cancelled.", sync: await syncPayload(pool, request.controller) } : reply.code(403).send({ message: "This request cannot be cancelled." });
   });
   app.post<{ Params: { id: string } }>("/sector-requests/:id/acknowledge-rejection", async (request, reply) => {
-    if (!requestIdSchema.safeParse(request.params.id).success) return reply.code(404).send({ message: "Rejected request not found." });
+    const id = requestIdSchema.safeParse(request.params.id);
+    if (!id.success) return reply.code(404).send({ message: "Rejected request not found." });
     const changed = await pool.query(
       "DELETE FROM sector_requests WHERE id=$1 AND requesting_cid=$2 AND server=$3 AND rejected_at IS NOT NULL RETURNING id",
-      [request.params.id, request.controller.cid, request.controller.server]);
+      [id.data, request.controller.cid, request.controller.server]);
     if (changed.rowCount)
-      await writeDiagnosticLog(pool, request.controller, "ServerSector", `Acknowledged rejected request #${request.params.id}`, {
+      await writeDiagnosticLog(pool, request.controller, "ServerSector", `Acknowledged rejected request #${id.data}`, {
         action: "request_acknowledge_rejection",
-        request_id: request.params.id
+        request_id: id.data
       });
     return changed.rowCount ? reply.code(204).send() : reply.code(404).send({ message: "Rejected request not found." });
   });

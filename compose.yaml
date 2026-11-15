@@ -16,12 +16,11 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:3000:3000"
-    # The API needs outbound internet: status.vatsim.net and data.vatsim.net for claimGroup's
-    # staffed-conflict check (whether a covered sub-sector's default owner - who may not even be
-    # running this plugin - is online), and raw.githubusercontent.com for dataset:sync. The
-    # maintenance loop's disconnect sweep does NOT depend on this egress any more: it ages
-    # sector_ownerships purely off last_seen_online_at, refreshed by every controller's own
-    # authenticated request (see app.ts's heartbeat hook) rather than by cross-checking a feed that
+    # The API needs outbound internet: status.vatsim.net and data.vatsim.net for the public map
+    # (routes/map.ts - every controller and pilot on the network, plugin user or not), and
+    # raw.githubusercontent.com for dataset:sync. Nothing about sector ownership depends on this
+    # egress: claims, FDR authority and the disconnect sweep all read last_seen_online_at, refreshed
+    # by every controller's own authenticated request (see app.ts's heartbeat hook), not a feed that
     # lags a real connection by tens of seconds in both directions. postgres is deliberately left
     # off this network: it stays reachable only from `internal`.
     networks: [egress, internal]
