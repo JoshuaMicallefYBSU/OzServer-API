@@ -23,7 +23,9 @@ export type Pilot = {
   callsign: string; latitude: number; longitude: number; altitude: number; groundspeed: number; heading: number;
   flight_plan?: { aircraft?: string; aircraft_short?: string; altitude?: string; arrival?: string } | null;
 };
-type VatsimData = { controllers?: Controller[]; pilots?: Pilot[] };
+// `atis` is every connected ATIS station - read only for whether one is on the network at all
+// (routes/map.ts), never for its text, which the plugin publishes directly.
+type VatsimData = { controllers?: Controller[]; pilots?: Pilot[]; atis?: Array<{ callsign: string }> };
 type TransceiverEntry = { callsign: string; transceivers?: Array<{ frequency: number }> };
 
 const CACHE_MS = 15_000;

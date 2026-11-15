@@ -59,7 +59,10 @@ Published ATIS are drawn on the public map: `GET /api/v1/map/atis` returns them 
 airport (so an airport the dataset has no position for is served by `/vatsim/atis` but cannot be
 mapped), alongside the vatSys ATIS an OzServer controller's own client pushed with `POST /atis`
 for any airport with no published one. Both come back in the same shape - a published ATIS wins
-where an airport has both.
+where an airport has both. Each also carries `connected`: `true` while its ATIS station is on the
+network (listed in the VATSIM datafeed, or heard from in the last two minutes), `false` for a
+record this server is still holding after the station left. The map draws the first dark red and
+the second light grey.
 
 Read it back with `GET /api/v1/vatsim/atis` (every airport, by ICAO) or
 `GET /api/v1/vatsim/atis/:icao` (one airport, or `null`). The response is the broadcast as

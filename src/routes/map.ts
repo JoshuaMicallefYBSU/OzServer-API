@@ -50,12 +50,32 @@ function insideRing(ring: Ring, lat: number, lon: number): boolean {
   return inside;
 }
 
-type AtisMapRow ={ icao: string; atis_letter: string; content: unknown; lat: number; lon: number };
+type AtisMapRow = { icao: string; atis_letter: string; content: unknown; lat: number; lon: number };
+
+// Whether the station behind an ATIS record is on the network right now, as opposed to a record
+// this server is still holding after its controller left (a published ATIS is kept for
+// NETWORK_ATIS_RETAIN_MINUTES, a pushed one for ATIS_RETAIN_MINUTES, and neither can be withdrawn).
+// The map draws the two differently.
+//
+// VATSIM's datafeed lists every connected ATIS station, so on the live network that is the answer.
+// It lags a new connection by up to a minute, so a record heard from in the last two minutes counts
+// as connected without it - otherwise every ATIS would appear as "saved" first and turn "active" a
+// refresh or two later. Where the feed cannot answer (it is unreachable, or this is a SweatBox ATIS,
+// which it never lists) the plugin's own re-push decides: both ATIS paths re-send every 20 minutes
+// while still broadcasting, so one not heard from in 25 has stopped.
+const ATIS_JUST_HEARD_MS = 2 * 60_000;
+const ATIS_REPUSH_MS = 25 * 60_000;
+
+function atisConnected(station: string, heardAt: Date | string | null, onNetwork: Set<string> | null): boolean {
+  const age = heardAt === null ? Infinity : Date.now() - new Date(heardAt).getTime();
+  if (onNetwork === null) return age < ATIS_REPUSH_MS;
+  return age < ATIS_JUST_HEARD_MS || onNetwork.has(station.toUpperCase());
+}
 
 // One ATIS as the map draws it, whichever table it came out of. content is rebuilt in ATIS-editor
 // order (jsonb does not keep key order, and a vatSys push can carry editor-only tags like MODE
 // that are not part of the broadcast); a zulu ATIS's free text passes through as the string it is.
-function mapAtis(row: AtisMapRow, type: string, frequency: string | null, time: Date | string | null, changed: string[]) {
+function mapAtis(row: AtisMapRow, type: string, frequency: string | null, time: Date | string | null, changed: string[], connected: boolean) {
   return {
     icao: row.icao,
     lat: row.lat,
@@ -66,7 +86,8 @@ function mapAtis(row: AtisMapRow, type: string, frequency: string | null, time: 
     content: typeof row.content === "string" ? row.content
       : atisSectionContent((row.content ?? {}) as Record<string, string | null>),
     changed,
-    issued: atisTimestamp(time)
+    issued: atisTimestamp(time),
+    connected
   };
 }
 
@@ -239,7 +260,7 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     // ?server= scopes the atis_broadcasts half only: network_atis has no server of its own (an
     // ATIS is a broadcast on the network), so the published ones are the same on every view.
     const published = (await pool.query(
-      `SELECT a.icao,a.atis_letter,a.type,a.frequency,a.content,a.changed,a.issued,
+      `SELECT a.icao,a.callsign,a.atis_letter,a.type,a.frequency,a.content,a.changed,a.issued,a.received_at,
               p.default_lat AS lat,p.default_lon AS lon
          FROM network_atis a JOIN positions p ON p.asmgcs_airport=a.icao`)).rows;
     const pushed = (await pool.query(
@@ -249,11 +270,19 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
         WHERE a.server=$2 AND a.last_seen_at >= now()-($1*interval '1 minute')
           AND NOT EXISTS (SELECT 1 FROM network_atis n WHERE n.icao=a.icao)`,
       [config.ATIS_RETAIN_MINUTES, server])).rows;
+    // Every ATIS station connected to the live network, or null when the feed has nothing to say.
+    const feed = (await vatsimData())?.atis;
+    const onNetwork = feed ? new Set(feed.map(station => station.callsign.toUpperCase())) : null;
+    // A pushed ATIS has no station callsign on record; vatSys connects one as <ICAO>_ATIS. Only the
+    // live view can ask the feed about it - a SweatBox ATIS is never listed there.
+    const pushedOnNetwork = server === "live" ? onNetwork : null;
     return [
-      ...published.map(row => mapAtis(row, row.type, row.frequency, row.issued, row.changed)),
+      ...published.map(row => mapAtis(row, row.type, row.frequency, row.issued, row.changed,
+        atisConnected(row.callsign, row.received_at, onNetwork))),
       // atis_broadcasts holds no issue time of its own, so the time it last reached us stands in,
       // and nothing in it is marked as changed - vatSys sends that plugin the content only.
-      ...pushed.map(row => mapAtis(row, "atis", fsdFrequency(row.frequency), row.last_seen_at, []))
+      ...pushed.map(row => mapAtis(row, "atis", fsdFrequency(row.frequency), row.last_seen_at, [],
+        atisConnected(`${row.icao}_ATIS`, row.last_seen_at, pushedOnNetwork)))
     ];
   });
 
