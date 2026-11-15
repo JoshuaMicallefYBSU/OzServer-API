@@ -19,7 +19,11 @@
 // of caching, where the plugin has the real thing section by section the moment it changes.
 
 type Controller = { cid: number; callsign: string; frequency?: string };
-type VatsimData = { controllers?: Controller[] };
+export type Pilot = {
+  callsign: string; latitude: number; longitude: number; altitude: number; groundspeed: number; heading: number;
+  flight_plan?: { aircraft?: string; aircraft_short?: string; altitude?: string; arrival?: string } | null;
+};
+type VatsimData = { controllers?: Controller[]; pilots?: Pilot[] };
 type TransceiverEntry = { callsign: string; transceivers?: Array<{ frequency: number }> };
 
 const CACHE_MS = 15_000;

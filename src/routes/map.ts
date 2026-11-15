@@ -14,7 +14,42 @@ const typePriority: Record<string, number> = { FMP: 0, CTR: 1, FSS: 1, APP: 2, D
 const fsdFrequency = (value: number | null): string | null =>
   value === null || value === undefined ? null : (100 + value / 1000).toFixed(3);
 
-type AtisMapRow = { icao: string; atis_letter: string; content: unknown; lat: number; lon: number };
+// Every sector boundary ring, for /map/traffic's point-in-airspace test. The dataset changes only
+// when sync-dataset runs, so the rings are read at most every ten minutes, not on every request.
+//
+// Longitudes are taken onto 0-360 (as is the pilot's, in insideRing): the oceanic sectors run out
+// past 180 degrees, and on -180..180 a ring crossing the antimeridian would wrap the wrong way round
+// the globe.
+type Ring = Array<[number, number]>; // [lon 0-360, lat]
+let ringCache: { expires: number; rings: Ring[] } = { expires: 0, rings: [] };
+const eastLon = (lon: number) => (lon < 0 ? lon + 360 : lon);
+
+async function sectorPolygons(): Promise<Ring[]> {
+  if (ringCache.expires > Date.now()) return ringCache.rings;
+  const rows = (await pool.query("SELECT boundary FROM sectors")).rows;
+  const rings: Ring[] = [];
+  for (const row of rows) {
+    for (const ring of (Array.isArray(row.boundary) ? row.boundary : [])) {
+      if (!Array.isArray(ring) || ring.length < 3) continue;
+      rings.push(ring.map((point: { lat: number; lon: number }) => [eastLon(Number(point.lon)), Number(point.lat)]));
+    }
+  }
+  ringCache = { expires: Date.now() + 10 * 60_000, rings };
+  return rings;
+}
+
+// Ray casting: odd crossings of a ray running east from the point means inside.
+function insideRing(ring: Ring, lat: number, lon: number): boolean {
+  const x = eastLon(lon);
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i], [xj, yj] = ring[j];
+    if ((yi > lat) !== (yj > lat) && x < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+type AtisMapRow ={ icao: string; atis_letter: string; content: unknown; lat: number; lon: number };
 
 // One ATIS as the map draws it, whichever table it came out of. content is rebuilt in ATIS-editor
 // order (jsonb does not keep key order, and a vatSys push can carry editor-only tags like MODE
@@ -267,4 +302,47 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
   // network), and has no database query of its own to scope. Left global/unscoped; /map/controllers'
   // non-live branch above already covers the practical consequence with a frequency fallback.
   app.get("/afv/transceivers", async () => afvTransceivers());
+
+  // How much of the traffic OzServer covers it can actually see: every pilot in VATSIM's datafeed
+  // who is inside one of our sectors (the airspace the dataset describes - both FIRs and the
+  // oceanic sectors), and how many of those have a recent flight record pushed by a controller's
+  // plugin. Live network only - the datafeed has nothing to say about a SweatBox.
+  app.get("/map/traffic", async () => {
+    const [pilots, polygons, records] = await Promise.all([
+      vatsimData().then(data => data?.pilots ?? []),
+      sectorPolygons(),
+      pool.query("SELECT callsign FROM flight_data_records WHERE server='live' AND last_seen_at >= now()-($1*interval '1 minute')",
+        [config.FDR_RETAIN_MINUTES])
+    ]);
+    const seen = new Set(records.rows.map(row => String(row.callsign).toUpperCase()));
+    const inside = pilots.filter(pilot => polygons.some(ring => insideRing(ring, pilot.latitude, pilot.longitude)));
+    return {
+      in_firs: inside.length,
+      seen_by_ozserver: inside.filter(pilot => seen.has(pilot.callsign.toUpperCase())).length
+    };
+  });
+
+  // Airborne traffic around Australia, straight from VATSIM's public datafeed, for the homepage's
+  // decorative scope. Every pilot on the network, OzServer or not, trimmed to what a vatSys label
+  // shows: callsign and wake category, level, requested level, groundspeed, destination - plus the
+  // heading the page dead-reckons with between refreshes. Public like the rest of /map: it is the
+  // datafeed's own content, filtered.
+  app.get("/map/pilots", async () => {
+    const pilots = (await vatsimData())?.pilots ?? [];
+    return pilots
+      .filter(pilot => pilot.latitude >= -50 && pilot.latitude <= 0 && pilot.longitude >= 100 && pilot.longitude <= 170)
+      .filter(pilot => pilot.groundspeed >= 50)
+      .map(pilot => ({
+        callsign: pilot.callsign,
+        lat: pilot.latitude,
+        lon: pilot.longitude,
+        altitude: pilot.altitude,
+        groundspeed: pilot.groundspeed,
+        heading: pilot.heading,
+        // ICAO-format aircraft field: "B738/M-SDE3FGHIRWY/LB1" - the wake category follows the type.
+        wake: /^[A-Z0-9]{2,4}\/([LMHJ])/.exec(pilot.flight_plan?.aircraft ?? "")?.[1] ?? null,
+        rfl: pilot.flight_plan?.altitude ?? null,
+        arrival: pilot.flight_plan?.arrival || null
+      }));
+  });
 }
