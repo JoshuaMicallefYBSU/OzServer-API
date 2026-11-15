@@ -43,7 +43,8 @@ function insideRing(ring: Ring, lat: number, lon: number): boolean {
   const x = eastLon(lon);
   let inside = false;
   for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const [xi, yi] = ring[i], [xj, yj] = ring[j];
+    // Both indices are in range by construction; the assertion is for noUncheckedIndexedAccess.
+    const [xi, yi] = ring[i]!, [xj, yj] = ring[j]!;
     if ((yi > lat) !== (yj > lat) && x < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) inside = !inside;
   }
   return inside;
