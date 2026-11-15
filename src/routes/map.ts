@@ -105,7 +105,7 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
   app.get("/map/sector-shapes", async () => (await pool.query(
     "SELECT name,full_name,type,callsign,frequency,responsible_sectors,boundary FROM sectors ORDER BY name")).rows);
 
-  // The /map page's whole live picture in one call: who holds which sector, every controller with
+  // The /live-map page's whole live picture in one call: who holds which sector, every controller with
   // the full set they hold, and the requests between them. Geometry is not in here - the page
   // loads /map/sector-shapes once and joins this onto it by sector name, so this stays small enough
   // to re-read on every "sectors" signal.
