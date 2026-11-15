@@ -88,7 +88,7 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE sector_ownerships, sector_requests, flight_data_records, annotations, client_logs, resume_snapshots, network_atis, atis_broadcasts");
+    await db.query("TRUNCATE sector_ownerships, sector_requests, flight_data_records, client_logs, resume_snapshots, network_atis, atis_broadcasts");
   });
 
   it("rejects a request with no controller identity", async () => {
@@ -281,7 +281,6 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     expect((await post("/sector-requests/not-a-number/reject", extender)).statusCode).toBe(403);
     expect((await post("/sector-requests/accept-batch", extender, { request_ids: "1,2" })).statusCode).toBe(422);
     expect((await post("/sectors/INA/claim", extender, { exclude: "INA" })).statusCode).toBe(422);
-    expect((await post("/annotations/not-a-uuid/delete", extender)).statusCode).toBe(403);
     expect((await app.inject({ method: "GET", url: "/api/v1/client-logs?since=banana" })).statusCode).toBe(400);
     expect((await app.inject({ method: "GET", url: "/api/v1/client-logs?limit=-5" })).statusCode).toBe(400);
     expect((await app.inject({ method: "GET", url: "/api/v1/client-logs?since=2%20hours&limit=10" })).statusCode).toBe(200);
@@ -407,34 +406,6 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       const [row] = (await app.inject({ method: "GET", url: "/api/v1/map/aircraft?server=live" })).json();
       expect(row).toMatchObject({ callsign: "QFA1", has_route: true });
       expect(row.route_points).toBeUndefined();
-    });
-  });
-
-  describe("shared markup", () => {
-    const note = { kind: "note", body: "hold here", points: [{ lat: -33.9, lon: 151.2 }] };
-    const age = (seconds: number) => db.query(
-      "UPDATE annotations SET last_seen_online_at=now()-($1*interval '1 second')", [seconds]);
-    const count = async () => Number((await db.query("SELECT count(*) AS count FROM annotations")).rows[0].count);
-
-    it("is kept alive by any request its author makes", async () => {
-      expect((await post("/annotations", extender, note)).statusCode).toBe(201);
-      await age(40);
-      await get("/sectors/sync", extender);
-      await runMaintenance();
-      expect(await count()).toBe(1);
-    });
-
-    it("expires once its author has stopped calling", async () => {
-      await post("/annotations", extender, note);
-      await age(40);
-      await runMaintenance();
-      expect(await count()).toBe(0);
-    });
-
-    it("can only be removed by its author", async () => {
-      const id = (await post("/annotations", extender, note)).json().id;
-      expect((await post(`/annotations/${id}/delete`, third)).statusCode).toBe(403);
-      expect((await post(`/annotations/${id}/delete`, extender)).statusCode).toBe(204);
     });
   });
 

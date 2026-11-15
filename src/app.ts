@@ -4,7 +4,6 @@ import { config } from "./config.js";
 import { pluginAuth } from "./auth.js";
 import { pool } from "./db.js";
 import { publish } from "./events.js";
-import { annotationRoutes } from "./routes/annotations.js";
 import { protectedClientLogRoutes, publicClientLogRoutes } from "./routes/client-logs.js";
 import { protectedAtisRoutes, publicAtisRoutes } from "./routes/atis.js";
 import { flightRoutes } from "./routes/flights.js";
@@ -71,26 +70,11 @@ export async function buildApp() {
     // third-party feed with its own separate publish lag in both directions. Runs before the route
     // itself so it cannot be skipped by an early return, and is a no-op (0 rows matched) for a
     // controller who owns nothing yet, so it's safe unconditionally.
-    //
-    // The same heartbeat keeps this controller's shared notes and drawings alive. Those used to be
-    // refreshed only by their author reading GET /annotations, which the plugin does on connect and
-    // on an "annotations" signal - so five quiet minutes with nobody drawing expired every
-    // annotation on the server while its author sat there connected. Presence is one question and
-    // is now answered in one place. Only rows going stale are touched (the sweep's window is
-    // minutes), so an ordinary poll is not rewriting every stroke a controller has drawn each time.
     pluginApi.addHook("preHandler", async request => {
       try {
-        const identity = [request.controller.cid, request.controller.callsign, request.controller.server];
-        await Promise.all([
-          pool.query(
-            "UPDATE sector_ownerships SET last_seen_online_at=now() WHERE controller_cid=$1 AND controller_callsign=$2 AND server=$3",
-            identity),
-          pool.query(
-            `UPDATE annotations SET last_seen_online_at=now()
-              WHERE author_cid=$1 AND author_callsign=$2 AND server=$3
-                AND last_seen_online_at < now()-interval '30 seconds'`,
-            identity)
-        ]);
+        await pool.query(
+          "UPDATE sector_ownerships SET last_seen_online_at=now() WHERE controller_cid=$1 AND controller_callsign=$2 AND server=$3",
+          [request.controller.cid, request.controller.callsign, request.controller.server]);
       } catch (error) {
         app.log.warn(error, "Could not refresh controller heartbeat.");
       }
@@ -115,14 +99,11 @@ export async function buildApp() {
         // Deliberately silent: nothing subscribes to these, and every controller posts
         // them continuously - announcing each batch would wake every client for nothing.
         return;
-      } else if (route.startsWith("/api/v1/annotations")) {
-        await publish({ type: "annotations", server });
       }
     });
     await sectorRoutes(pluginApi);
     await flightRoutes(pluginApi);
     await protectedAtisRoutes(pluginApi);
-    await annotationRoutes(pluginApi);
     await protectedClientLogRoutes(pluginApi);
   }, { prefix: "/api/v1" });
   app.setErrorHandler((error: FastifyError, _request, reply) => {

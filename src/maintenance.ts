@@ -116,20 +116,9 @@ export async function runMaintenance(): Promise<void> {
     // purging on it meant a client whose clock ran ahead - or one simply sending a far-future
     // timestamp - wrote rows this never removed.
     await client.query("DELETE FROM client_logs WHERE created_at < now()-interval '1 day'");
-    // Shared notes and drawings outlive a momentary drop but not a sign-off, on the same grace the
-    // sectors above use. Keyed off last_seen_online_at, which every request the author's client
-    // makes refreshes (the heartbeat hook in app.ts) - so this only ever catches a controller whose
-    // client has actually stopped calling.
-    //
-    // Held off for the same startup window as the sector sweep above, and for the same reason:
-    // straight after a restart every row looks as stale as this process's own downtime was long.
-    const expiredAnnotations = withinStartupGrace ? [] : (await client.query<{ server: string }>(
-      "DELETE FROM annotations WHERE last_seen_online_at < now()-($1*interval '1 minute') RETURNING server",
-      [config.DISCONNECT_GRACE_MINUTES])).rows;
     await client.query("DELETE FROM resume_snapshots WHERE created_at < now()-($1*interval '1 minute')", [config.RESUME_WINDOW_MINUTES]);
     return {
       sectors: [...new Set(droppedOwners.map(owner => owner.server))],
-      annotations: [...new Set(expiredAnnotations.map(row => row.server as Server))],
       atis: expiredAtis > 0
     };
   });
@@ -138,8 +127,6 @@ export async function runMaintenance(): Promise<void> {
   // once per server actually affected by this pass, never a single unscoped event: one sweep can
   // release sectors on more than one server at a time, and a subscriber only watches one.
   for (const server of affected.sectors) await publish({ type: "sectors", server });
-  // Likewise for markup that just expired: without a signal every other scope kept drawing it.
-  for (const server of affected.annotations) await publish({ type: "annotations", server });
   // And for an ATIS that just aged out - live network only, which is the only place one is
   // published (see routes/atis.ts).
   if (affected.atis) await publish({ type: "atis", server: "live" });

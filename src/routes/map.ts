@@ -105,10 +105,10 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
   app.get("/map/sector-shapes", async () => (await pool.query(
     "SELECT name,full_name,type,callsign,frequency,responsible_sectors,boundary FROM sectors ORDER BY name")).rows);
 
-  // The /ops page's whole live picture in one call: who holds which sector, every controller with
-  // the full set they hold, the requests between them and the shared notes/drawings. Geometry is not
-  // in here - the page loads /map/sector-shapes once and joins this onto it by sector name, so this
-  // stays small enough to re-read on every "sectors"/"annotations" signal.
+  // The /map page's whole live picture in one call: who holds which sector, every controller with
+  // the full set they hold, and the requests between them. Geometry is not in here - the page
+  // loads /map/sector-shapes once and joins this onto it by sector name, so this stays small enough
+  // to re-read on every "sectors" signal.
   //
   // Read-only and public like the rest of /map: nothing here is more than what every connected
   // controller already sees in their own Sectors window, and none of it can be acted on from a
@@ -119,7 +119,7 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     const server = parseServer(request.query.server);
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
 
-    const [ownerships, requests, annotations] = await Promise.all([
+    const [ownerships, requests] = await Promise.all([
       pool.query(
         `SELECT s.name, s.callsign AS sector_callsign, s.type, s.frequency,
                 o.controller_cid, o.controller_callsign, o.last_seen_online_at, o.created_at, o.updated_at
@@ -130,10 +130,7 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
                 r.target_cid, r.target_callsign, r.created_at, r.rejected_at
            FROM sector_requests r JOIN sectors s ON s.id=r.sector_id
           WHERE r.server=$1 AND (r.rejected_at IS NULL OR r.rejected_at >= now()-interval '10 minutes')
-          ORDER BY r.created_at`, [server]),
-      pool.query(
-        `SELECT id, kind, author_cid, author_callsign, body, points, colour, created_at, updated_at
-           FROM annotations WHERE server=$1 ORDER BY created_at`, [server])
+          ORDER BY r.created_at`, [server])
     ]);
 
     const timeoutMs = config.PRESENCE_TIMEOUT_SECONDS * 1000;
@@ -186,10 +183,6 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
         target_cid: row.target_cid, target_callsign: row.target_callsign,
         is_flow_relief: isFlow(row.requesting_callsign),
         created_at: row.created_at, rejected_at: row.rejected_at
-      })),
-      annotations: annotations.rows.map(row => ({
-        id: row.id, kind: row.kind, author: { cid: row.author_cid, callsign: row.author_callsign },
-        body: row.body, points: row.points, colour: row.colour, created_at: row.created_at, updated_at: row.updated_at
       }))
     };
   });

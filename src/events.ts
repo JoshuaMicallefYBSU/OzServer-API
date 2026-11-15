@@ -11,7 +11,7 @@ import { SERVERS, type Server } from "./auth.js";
 // subscribers this fans out to), not payload data about what changed, so it does not weaken that
 // guarantee - a client still has to re-read to find out anything more than "something on my server
 // changed".
-const EVENT_TYPES = ["sectors", "fdr", "atis", "annotations"] as const;
+const EVENT_TYPES = ["sectors", "fdr", "atis"] as const;
 export type OzEvent = { type: typeof EVENT_TYPES[number]; server: Server };
 
 const CHANNEL = "ozserver_events";
