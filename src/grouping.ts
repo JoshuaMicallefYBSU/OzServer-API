@@ -159,7 +159,7 @@ export async function transferFlightsToCurrentSectorOwners(
         AND f.controlling_callsign=$2
         AND f.server=$3
         AND f.current_sector=s.name
-        AND s.type NOT IN ${TMA_SECTOR_TYPES_SQL}
+        AND COALESCE(s.type, '') NOT IN ${TMA_SECTOR_TYPES_SQL}
         AND (o.controller_cid IS DISTINCT FROM $1 OR o.controller_callsign IS DISTINCT FROM $2)
       RETURNING f.callsign,f.current_sector,o.controller_cid AS to_cid,o.controller_callsign AS to_callsign`,
     [from.cid, from.callsign, from.server])).rows;
@@ -188,7 +188,7 @@ export async function clearFlightsWithoutCurrentSectorOwner(
             JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$3
            WHERE s.name=f.current_sector
              -- Not moved to a TMA sector's owner (see TMA_SECTOR_TYPES_SQL), so cleared instead.
-             AND s.type NOT IN ${TMA_SECTOR_TYPES_SQL})
+             AND COALESCE(s.type, '') NOT IN ${TMA_SECTOR_TYPES_SQL})
       RETURNING callsign`,
     [from.cid, from.callsign, from.server])).rows.map(row => row.callsign);
 }
