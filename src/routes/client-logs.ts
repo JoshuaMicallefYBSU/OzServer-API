@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { reportClientLog } from "../alerts.js";
 import { parseServer, tokenMatches } from "../auth.js";
 import { config } from "../config.js";
 import { pool } from "../db.js";
@@ -11,22 +12,21 @@ import { pool } from "../db.js";
 // reconnect burst arrives in one call, bounded so a looping client cannot post unbounded volume.
 const MaxLinesPerBatch = 200;
 
-// How far a line's own timestamp may sit from the server's clock before it is pulled back to it.
-// The client clock is only ever used for ordering, and a little disagreement between two clients
-// is itself worth seeing - but a clock that is days out (or a deliberately absurd `at`) would file
-// the line outside every window anyone ever queries.
+// How far a line's own timestamp may sit from the server's clock before it is replaced with the
+// server's. The client clock is used for ordering only, and a little disagreement between two
+// clients is worth seeing - but a clock that is days out (or an absurd `at`) would file the line
+// outside every window anyone queries.
 const MaxClockSkewMs = 12 * 60 * 60 * 1000;
 
-// "30 minutes", "2 hours", "1 day". Passed to Postgres as an interval, which accepts a great deal
-// more than this and answers anything it does not with an error - so an unvalidated value was a
-// 500 for a typo, and "100 years" was a scan of the whole table.
+// "30 minutes", "2 hours", "1 day". Passed to Postgres as an interval, and validated first:
+// Postgres accepts far more than this ("100 years" is a scan of the whole table) and answers
+// anything it rejects with an error.
 const sinceSchema = z.string().trim().regex(/^\d{1,4}\s*(second|minute|hour|day)s?$/i).default("30 minutes");
 const limitSchema = z.coerce.number().int().min(1).max(5000).default(500);
 
 const batchSchema = z.object({
   lines: z.array(z.object({
-    // Client clock. Trusted for ordering only - it is never used to decide anything, and two
-    // clients' clocks disagreeing is itself worth being able to see.
+    // Client clock. Used for ordering only, never to decide anything (see MaxClockSkewMs).
     at: z.coerce.date(),
     category: z.string().trim().min(1).max(32),
     message: z.string().trim().min(1).max(2000),
@@ -37,7 +37,7 @@ const batchSchema = z.object({
   })).min(1).max(MaxLinesPerBatch)
 });
 
-// The real, plugin-authenticated ingestion path - stays under pluginAuth like every other write.
+// The ingestion path - under pluginAuth like every other write.
 export async function protectedClientLogRoutes(app: FastifyInstance): Promise<void> {
   app.post("/client-logs", async (request, reply) => {
     const parsed = batchSchema.safeParse(request.body);
@@ -47,10 +47,9 @@ export async function protectedClientLogRoutes(app: FastifyInstance): Promise<vo
 
     const { lines } = parsed.data;
 
-    // One statement for the whole batch. A row per INSERT would make a reconnect burst dozens of
-    // round trips, and this runs on every controller's client continuously. `server`, like
-    // controller_cid/controller_callsign, is one value for the whole request rather than a
-    // per-line field - a single client session is never on more than one server at once.
+    // One statement for the whole batch: a row per INSERT would make a reconnect burst dozens of
+    // round trips. `server`, like controller_cid and controller_callsign, is one value for the
+    // whole request - a client session is on one server at a time.
     await pool.query(
       `INSERT INTO client_logs
          (controller_cid,controller_callsign,server,category,message,logged_at,plugin_version,session_id,sequence,context)
@@ -64,31 +63,24 @@ export async function protectedClientLogRoutes(app: FastifyInstance): Promise<vo
        lines.map(line => line.sequence ?? null),
        lines.map(line => line.context == null ? null : JSON.stringify(line.context))]);
 
+    // After the insert, so a line relayed to Discord is always one that can be looked up here.
+    for (const line of lines) reportClientLog(request.controller, line);
+
     return reply.code(204).send();
   });
 }
 
-// The read side - deliberately public, not under pluginAuth. This is a human-driven diagnostics
-// tool ("everything around a moment across all controllers", used both by hand for an
-// investigation and by /console for a live tail), not an operation any controller identity needs
-// to stand behind. It used to sit in the same pluginAuth-gated group as the write side above,
-// which meant `server` was never actually optional in the way the query logic below assumes:
-// pluginAuth demands a valid server for the caller's own identity before this handler is ever
-// reached, so a request that tried to omit it (to search across every server at once, exactly the
-// cross-server investigation case this endpoint exists for) was rejected outright with 401 -
-// caught by the console page's own first live request, not by reading the code. Moving it out to
-// the public group, alongside map.ts's own read endpoints, removes that requirement entirely: the
-// `server` query parameter below is now the only thing controlling it, genuinely optional, exactly
-// as the comment on it already claimed.
+// The read side - a diagnostics tool driven by a person (by hand for an investigation, and by
+// /console for a live tail), not an operation a controller identity stands behind. Deliberately
+// outside pluginAuth, which demands a controller identity and a server and so would make the
+// optional `server` filter below impossible to omit. CLIENT_LOGS_TOKEN gates it when set.
 export async function publicClientLogRoutes(app: FastifyInstance): Promise<void> {
-  // Reading them back. Ordered oldest-first because these are read as a narrative, and defaulting
-  // to a recent window rather than the whole table - the interesting question is almost always
-  // "what were all of them doing when this happened".
+  // Ordered oldest-first because these are read as a narrative, and limited to a recent window by
+  // default - the usual question is "what were all of them doing when this happened".
   //
-  // `server` is deliberately optional here, unlike everywhere else server touches this API: a real
-  // investigation sometimes legitimately spans servers (a controller reproducing on a SweatBox,
-  // then again on live). A required filter would split exactly that narrative in two. Included in
-  // the response columns so a row stays self-describing whenever the filter is left off.
+  // `server` is optional here, unlike everywhere else in this API: an investigation can span
+  // servers (a controller reproducing on a SweatBox, then again on live). It is included in the
+  // response so a row stays self-describing when the filter is left off.
   app.get<{ Querystring: {
     since?: string; callsign?: string; category?: string; limit?: string;
     sector?: string; fdr_callsign?: string; request_id?: string; session_id?: string; server?: string;
