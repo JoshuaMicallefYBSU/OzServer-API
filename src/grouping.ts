@@ -91,6 +91,13 @@ export async function transferFlightsInSectorsToOwner(
 
   const transferred: FlightAuthorityTransfer[] = [];
   for (const sector of sectors) {
+    // Only tags that were the previous owner's move with the sector - a sector changing hands
+    // takes its controller's aircraft with it. A sector nobody held had no tags to hand over: the
+    // flights in it were nobody's, and naming the claimer on them made the plugin take them on
+    // its next resume. N677PL, untracked and only passing through WOL, was picked up by
+    // ML-SNO_CTR that way the moment they claimed SNO.
+    if (sector.cid === null) continue;
+
     const rows = (await client.query<{
       callsign: string;
       current_sector: string | null;
@@ -102,10 +109,7 @@ export async function transferFlightsInSectorsToOwner(
            FROM flight_data_records
           WHERE current_sector=$1
             AND server=$6
-            AND (
-              ($2::integer IS NULL AND controlling_cid IS NULL)
-              OR (controlling_cid=$2 AND controlling_callsign IS NOT DISTINCT FROM $3)
-            )
+            AND controlling_cid=$2 AND controlling_callsign IS NOT DISTINCT FROM $3
             AND (controlling_cid IS DISTINCT FROM $4 OR controlling_callsign IS DISTINCT FROM $5)
        ),
        updated AS (
