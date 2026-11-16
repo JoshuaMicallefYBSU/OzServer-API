@@ -82,6 +82,12 @@ export async function reassignFreedSectors(
   return reassigned;
 }
 
+// TMA (approach and departure) sectors. Their aircraft never move with a change of sector owner:
+// the volumes stacked inside a TMA cannot be relied on to say which controller an aircraft belongs
+// to, so the controllers hand each one over themselves. The plugin keeps them with whoever has them
+// (SectorTagHandoff), and every transfer of FDR authority below leaves them alone to match.
+export const TMA_SECTOR_TYPES_SQL = "('APP','DEP')";
+
 export async function transferFlightsInSectorsToOwner(
   client: pg.PoolClient,
   sectors: Array<{ sector: string; cid: number | null; callsign: string | null }>,
@@ -110,6 +116,7 @@ export async function transferFlightsInSectorsToOwner(
           WHERE current_sector=$1
             AND server=$6
             AND controlling_cid=$2 AND controlling_callsign IS NOT DISTINCT FROM $3
+            AND current_sector NOT IN (SELECT name FROM sectors WHERE type IN ${TMA_SECTOR_TYPES_SQL})
             AND (controlling_cid IS DISTINCT FROM $4 OR controlling_callsign IS DISTINCT FROM $5)
        ),
        updated AS (
@@ -152,6 +159,7 @@ export async function transferFlightsToCurrentSectorOwners(
         AND f.controlling_callsign=$2
         AND f.server=$3
         AND f.current_sector=s.name
+        AND s.type NOT IN ${TMA_SECTOR_TYPES_SQL}
         AND (o.controller_cid IS DISTINCT FROM $1 OR o.controller_callsign IS DISTINCT FROM $2)
       RETURNING f.callsign,f.current_sector,o.controller_cid AS to_cid,o.controller_callsign AS to_callsign`,
     [from.cid, from.callsign, from.server])).rows;
@@ -178,7 +186,9 @@ export async function clearFlightsWithoutCurrentSectorOwner(
           SELECT 1
             FROM sectors s
             JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$3
-           WHERE s.name=f.current_sector)
+           WHERE s.name=f.current_sector
+             -- Not moved to a TMA sector's owner (see TMA_SECTOR_TYPES_SQL), so cleared instead.
+             AND s.type NOT IN ${TMA_SECTOR_TYPES_SQL})
       RETURNING callsign`,
     [from.cid, from.callsign, from.server])).rows.map(row => row.callsign);
 }

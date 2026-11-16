@@ -9,6 +9,7 @@ import { isWithinStartupGrace } from "../presence.js";
 import {
   clearFlightsWithoutCurrentSectorOwner,
   reassignFreedSectors,
+  TMA_SECTOR_TYPES_SQL,
   transferFlightsInSectorsToOwner,
   transferFlightsToCurrentSectorOwners
 } from "../grouping.js";
@@ -341,6 +342,7 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
   const transferredFlights = (await client.query(
     `UPDATE flight_data_records SET controlling_cid=$2,controlling_callsign=$3
       WHERE current_sector = ANY($1)
+        AND current_sector NOT IN (SELECT name FROM sectors WHERE type IN ${TMA_SECTOR_TYPES_SQL})
         AND server=$6
         AND controlling_cid=$4
         AND controlling_callsign IS NOT DISTINCT FROM $5
