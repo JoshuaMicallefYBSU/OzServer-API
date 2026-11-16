@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { DISCORD_WEBHOOK_PATTERN } from "./discord.js";
 
 const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -6,48 +7,54 @@ const schema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   DATABASE_URL: z.string().min(1),
   WEBSITE_ORIGIN: z.string().url().default("https://ozserver.org"),
-  // How long a claim to a sector nobody has actively picked up is held in reserve before
-  // runMaintenance releases it (and hands it up to a covering parent position, if one is staffed) -
-  // see maintenance.ts. Deliberately NOT what decides whether a *different* controller may claim it
-  // in the meantime; see PRESENCE_TIMEOUT_SECONDS for that.
+  // Minutes a controller's sectors are held after their client stops calling, before runMaintenance
+  // releases them (handing each to a covering parent position if one is staffed - see
+  // maintenance.ts). Does not decide whether another controller may claim them in the meantime;
+  // see PRESENCE_TIMEOUT_SECONDS.
   DISCONNECT_GRACE_MINUTES: z.coerce.number().positive().default(5),
-  // How long without a request from a controller's own client before claimGroup stops treating
-  // their sector_ownerships row as still actively held, for the purpose of letting someone ELSE
-  // claim it outright. As close to instant as is actually safe, not a moment longer: the plugin's
-  // idle poll (OzServerOwnershipTracker.PollInterval) is every 3s, so anything at or below that
-  // would let a claim snipe a genuinely-connected, idle controller's sector just because their own
-  // poll happened to land a little late - a worse bug than the one this fixes. 6s is that 3s floor
-  // doubled for network jitter or one slow response, nothing more - keep this at roughly 2x
-  // PollInterval if that ever changes again. A controller who actually crashed or dropped should
-  // not keep a sector another controller wants to pick up right now locked to them for the full
-  // DISCONNECT_GRACE_MINUTES - that window exists to eventually hand an unclaimed sector to a
-  // covering parent and to protect resume, not to block a direct claim.
+  // Seconds without a request from a controller's client before they stop counting as present, at
+  // which point another controller may claim their sectors outright (claimGroup). Keep at about
+  // twice the plugin's 3 s idle poll (OzServerOwnershipTracker.PollInterval): at or below the poll
+  // interval, a connected controller whose poll lands slightly late would lose a sector.
   PRESENCE_TIMEOUT_SECONDS: z.coerce.number().positive().default(6),
   RESUME_WINDOW_MINUTES: z.coerce.number().positive().default(5),
   FDR_RETAIN_MINUTES: z.coerce.number().positive().default(15),
   ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(60),
-  // How long an ATIS published with PUT /api/v1/vatsim/atis/:icao survives without being heard
-  // from again before runMaintenance deletes it - the only way a record ever leaves, short of
-  // being replaced by a later one. There is no withdraw: a controller signing off does not unsay
-  // the broadcast, and the last letter they published stays the best available answer for a while
-  // afterwards. Measured from the last PUT, so a plugin re-publishing an unchanged ATIS keeps it
-  // alive indefinitely, which is correct: it is still on the air.
+  // Minutes an ATIS published with PUT /api/v1/vatsim/atis/:icao is kept after its last PUT before
+  // runMaintenance deletes it. There is no withdraw, so a record otherwise leaves only by being
+  // replaced; a plugin re-publishing an unchanged ATIS keeps it alive.
   NETWORK_ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(90),
-  // Requests one address may make in any ten seconds before it is answered 429 (see app.ts). A
-  // connected plugin makes two or three a second at its busiest, and a map viewer about the same,
-  // so this is roughly ten of either behind one address - far above honest use, far below a loop.
+  // Requests one address may make in a ten second window before it is answered 429 (see app.ts).
+  // A connected plugin makes two or three a second at its busiest, and a map viewer about the
+  // same, so the default allows roughly ten of either behind one address.
   RATE_LIMIT_PER_10S: z.coerce.number().int().positive().default(300),
   // Open /events streams the process will hold at once, across every address (see events.ts).
   MAX_EVENT_SUBSCRIBERS: z.coerce.number().int().positive().default(500),
-  // When set, GET /client-logs requires it (Authorization: Bearer, or ?token=). Unset keeps the
-  // endpoint public, which is how it has run so far - it returns every controller's CID, callsign
-  // and decision log for the last day to anyone who asks, so set this once the console page can
-  // send it.
+  // When set, GET /client-logs requires it (Authorization: Bearer, or ?token=). Unset leaves the
+  // endpoint public, and it returns every controller's CID, callsign and decision log for the last
+  // day. At least 16 characters.
   CLIENT_LOGS_TOKEN: z.string().trim().min(16).optional(),
-  // When set, PUT /api/v1/vatsim/atis/:icao requires it (Authorization: Bearer, or
-  // ?token=). Unset leaves publishing an ATIS open to anyone who can reach this API, which is how
-  // it ships - set it once the ATIS plugin can send one, and give that plugin the same value.
-  ATIS_TOKEN: z.string().trim().min(16).optional()
+  // When set, PUT /api/v1/vatsim/atis/:icao requires it (Authorization: Bearer, or ?token=), and
+  // the ATIS plugin must be given the same value. Unset leaves publishing an ATIS open to anyone
+  // who can reach this API. At least 16 characters.
+  ATIS_TOKEN: z.string().trim().min(16).optional(),
+  // The GitHub repository (owner/name) whose releases GET /plugin/release offers to the plugin's
+  // updater. The plugin only downloads from its own repository, so pointing this elsewhere stops
+  // updates being offered rather than redirecting them.
+  PLUGIN_RELEASE_REPO: z.string().trim().regex(/^[\w.-]+\/[\w.-]+$/).default("JoshuaMicallefYBSU/OzServer-Plugin"),
+  // When set, no release newer than this version is offered - for holding a release back while a
+  // problem with it is looked into. It cannot downgrade anyone: the plugin only installs a version
+  // higher than the one it is running. An empty value counts as unset.
+  PLUGIN_RELEASE_MAX_VERSION: z.preprocess(value => value === "" ? undefined : value,
+    z.string().trim().regex(/^v?\d+\.\d+(\.\d+){0,2}$/i).optional()),
+  // When set, errors are relayed to this Discord webhook (see alerts.ts). The URL is a credential:
+  // anyone holding it can post to the channel. An empty value counts as unset.
+  DISCORD_WEBHOOK_URL: z.preprocess(value => value === "" ? undefined : value,
+    z.string().trim().regex(DISCORD_WEBHOOK_PATTERN, "must be a Discord webhook URL").optional()),
+  // Plugin log categories relayed to Discord, comma-separated. "Error" is what the plugin files
+  // everything it shows in the vatSys Errors window under.
+  DISCORD_LOG_CATEGORIES: z.string().default("Error")
+    .transform(value => value.split(",").map(category => category.trim()).filter(Boolean))
 });
 
 export const config = schema.parse(process.env);

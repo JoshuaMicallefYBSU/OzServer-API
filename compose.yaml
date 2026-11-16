@@ -6,9 +6,8 @@ services:
       - path: .env
         required: false
     environment:
-      # environment: wins over env_file:, so a .env copied from .env.example - which is the local
-      # dev template and sets NODE_ENV=development - can't downgrade the container out of
-      # production mode on the VPS.
+      # environment: wins over env_file:, so a .env copied from .env.example (the local dev
+      # template, which sets NODE_ENV=development) cannot take the container out of production mode.
       NODE_ENV: production
       DATABASE_URL: postgres://ozserver:${POSTGRES_PASSWORD}@postgres:5432/ozserver
     depends_on:
@@ -17,12 +16,10 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     # The API needs outbound internet: status.vatsim.net and data.vatsim.net for the public map
-    # (routes/map.ts - every controller and pilot on the network, plugin user or not), and
-    # raw.githubusercontent.com for dataset:sync. Nothing about sector ownership depends on this
-    # egress: claims, FDR authority and the disconnect sweep all read last_seen_online_at, refreshed
-    # by every controller's own authenticated request (see app.ts's heartbeat hook), not a feed that
-    # lags a real connection by tens of seconds in both directions. postgres is deliberately left
-    # off this network: it stays reachable only from `internal`.
+    # (routes/map.ts), api.github.com for the plugin release check (plugin-release.ts),
+    # raw.githubusercontent.com for dataset:sync, and discord.com when DISCORD_WEBHOOK_URL is set.
+    # Sector ownership does not depend on this egress.
+    # postgres is deliberately left off this network: it is reachable only from `internal`.
     networks: [egress, internal]
 
   postgres:

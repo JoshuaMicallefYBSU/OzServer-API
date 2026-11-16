@@ -1,13 +1,11 @@
 api.ozserver.org {
     # /api/v1/events is a Server-Sent Events stream and must not be compressed: a compressor buffers
-    # until it has enough bytes to emit, so events stall until that buffer happens to fill. The
-    # channel then looks perfectly connected and simply delivers nothing, which is the worst way for
-    # it to fail.
+    # until it has enough bytes to emit, so events stall while the channel still looks connected.
     #
-    # encode's own `match` takes RESPONSE matchers (status/header) and has no `not`, so the
-    # exclusion is done by routing instead - the SSE path gets its own handle block with no encode
-    # in it. Caddy already detects text/event-stream and streams the proxied response, so the
-    # compressor is the only thing that has to be kept away from it.
+    # encode's own `match` takes response matchers (status/header) and has no `not`, so the
+    # exclusion is done by routing: the SSE path gets its own handle block with no encode in it.
+    # Caddy already detects text/event-stream and streams the proxied response, so the compressor
+    # is the only thing that has to be kept away from it.
     @sse path /api/v1/events*
     handle @sse {
         reverse_proxy 127.0.0.1:3000

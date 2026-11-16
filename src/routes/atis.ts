@@ -26,13 +26,13 @@ export async function protectedAtisRoutes(app: FastifyInstance): Promise<void> {
   });
 }
 
-// One row per airport, published by the vatSys ATIS plugin rather than mirrored from VATSIM's
-// datafeed (see network-atis.ts). No ?server= anywhere below: an ATIS is broadcast on the live
-// network, and a plugin that is not connected to it has no ATIS to publish.
-// The broadcast itself - what a GET returns. Who published it is deliberately not selected here:
-// the ATIS is public information, the controller behind it and the build they are running are not,
-// and this endpoint needs no identity of its own to be read by anyone. They are still stored (the
-// plugin sends them, and they are what makes a bad record traceable) - just never served.
+// network_atis holds one row per airport, published by the vatSys ATIS plugin (see
+// network-atis.ts). The /vatsim/atis routes take no ?server=: an ATIS is broadcast on the live
+// network only.
+//
+// ATIS_COLUMNS is the broadcast itself - what a GET returns. Who published it is stored (it is what
+// makes a bad record traceable) but never served: the ATIS is public information, the controller
+// behind it and the build they are running are not.
 const ATIS_COLUMNS = "icao,callsign,atis_letter,type,frequency,issued,content,changed";
 const PUBLISHED_ATIS_COLUMNS = `${ATIS_COLUMNS},controller_callsign,controller_cid,client_name,client_version`;
 
@@ -54,11 +54,10 @@ type PublishedAtisRow = NetworkAtisRow & {
   client_version: string | null;
 };
 
-// Built key by key rather than handing back the row, so a column added later does not leak into a
-// public response unasked. jsonb does not keep key order (it stores keys shortest-first), so
-// content is rebuilt in the order the sections appear in the vatSys ATIS editor; a zulu ATIS's
-// content is its raw text, passed through untouched. issued is served as a DDHHMM day-time group
-// - the form an ATIS time is read in.
+// Built key by key rather than returning the row, so a column added later does not leak into a
+// public response. jsonb does not keep key order, so content is rebuilt in ATIS-editor order; a
+// zulu ATIS's content is its raw text, passed through. issued is served as a DDHHMM day-time group
+// (see atisTimestamp).
 function forApi(row: NetworkAtisRow) {
   const content = row.content;
   return {
@@ -74,8 +73,8 @@ function forApi(row: NetworkAtisRow) {
   };
 }
 
-// The answer to a PUT, which goes back to the plugin that just sent all of this - so it confirms
-// what was recorded, publisher included, in the same shape the body had.
+// The answer to a PUT goes back to the plugin that sent it, so it confirms what was recorded,
+// publisher included, in the shape the body had.
 function forPublisher(row: PublishedAtisRow) {
   return {
     ...forApi(row),
@@ -92,9 +91,7 @@ export async function publicAtisRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // Optional gate - see ATIS_TOKEN. Unset (the default) leaves publishing open to anyone who can
-  // reach this API, which is no weaker than the datafeed mirror it replaces - that published
-  // whatever VATSIM listed, and this server had no say in it at all - but it is this server's own
-  // door now, so there is something to lock once the plugin can send a token.
+  // reach this API.
   const mayPublish = (request: { headers: { authorization?: string }; query: { token?: string } }): boolean => {
     if (!config.ATIS_TOKEN) return true;
     const header = request.headers.authorization;
@@ -111,13 +108,13 @@ export async function publicAtisRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) return reply.code(422).send({ message: "Invalid ATIS.", errors: parsed.error.flatten() });
     const atis = parsed.data;
     const icao = request.params.icao.trim().toUpperCase();
-    // The URL names the record being replaced, so a body that disagrees with it is a mistake worth
-    // answering rather than quietly resolving in favour of one or the other.
+    // The URL names the record being replaced, so a body that disagrees with it is refused rather
+    // than resolved in favour of one or the other.
     if (atis.icao !== icao) {
       return reply.code(422).send({ message: `This ATIS is for ${atis.icao}, but the URL publishes ${icao}.` });
     }
-    // `created` comes from Postgres's own xmax: zero on a row this statement inserted, non-zero on
-    // one it updated - so the answer is 201 or 200 without a second query to find out which.
+    // `created` comes from Postgres's xmax: zero on a row this statement inserted, non-zero on one
+    // it updated - so the status is known without a second query.
     const row = (await pool.query(
       `INSERT INTO network_atis (icao,callsign,atis_letter,type,frequency,issued,content,changed,
          controller_callsign,controller_cid,client_name,client_version,received_at)
@@ -128,22 +125,21 @@ export async function publicAtisRoutes(app: FastifyInstance): Promise<void> {
       [icao, atis.callsign, atis.atis_letter, atis.type, atis.frequency, atis.issued,
         JSON.stringify(atis.content), atis.changed, atis.controller.callsign, atis.controller.cid,
         atis.client?.name ?? null, atis.client?.version ?? null])).rows[0] as PublishedAtisRow & { created: boolean };
-    // Rides the existing "atis" signal, so anything already re-reading on it picks this up without
-    // needing a new event type. Published after the write, never before it.
+    // Uses the existing "atis" signal, so anything already re-reading on it picks this up.
+    // Published after the write, never before it.
     await publish({ type: "atis", server: "live" });
     return reply.code(row.created ? 201 : 200).send(forPublisher(row));
   });
 
-  // There is deliberately no way to withdraw an ATIS. A controller signing off does not unsay the
-  // broadcast they were making, and the last letter they published is still the best answer to
-  // "what is YSSY running" for a while afterwards - so a record leaves only by being replaced, or
-  // by ageing out in runMaintenance (NETWORK_ATIS_RETAIN_MINUTES).
+  // There is deliberately no way to withdraw an ATIS: the last letter a controller published is
+  // still the best answer for a while after they sign off. A record leaves only by being replaced,
+  // or by ageing out in runMaintenance (NETWORK_ATIS_RETAIN_MINUTES).
 
   app.get("/vatsim/atis", async () =>
     (await pool.query<NetworkAtisRow>(`SELECT ${ATIS_COLUMNS} FROM network_atis ORDER BY icao`)).rows.map(forApi));
 
-  // One airport, or null when nobody is running its ATIS - not a 404: "there is no ATIS for YSSY
-  // right now" is an answer, and every caller here is polling rather than following a link.
+  // One airport, or null when nobody is running its ATIS - not a 404: callers are polling, and
+  // "no ATIS right now" is an answer.
   app.get<{ Params: { icao: string } }>("/vatsim/atis/:icao", async request =>
     (await pool.query<NetworkAtisRow>(`SELECT ${ATIS_COLUMNS} FROM network_atis WHERE icao=$1`,
       [request.params.icao.trim().toUpperCase()])).rows.map(forApi)[0] ?? null);

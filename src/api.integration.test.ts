@@ -4,9 +4,8 @@ import type { FastifyInstance } from "fastify";
 import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-// End-to-end tests of the routes against a real Postgres - the claim, transfer, resume and sweep
-// rules are almost entirely SQL plus the order things happen in, so there is very little of them
-// that a test without a database would actually be testing.
+// End-to-end tests of the routes against a real Postgres: the claim, transfer, resume and sweep
+// rules are almost entirely SQL plus the order things happen in.
 //
 // Needs TEST_DATABASE_URL pointing at a database this may wipe (it drops and recreates the public
 // schema). Skipped when that is not set, so `npm test` still runs everywhere; CI sets it.
@@ -47,7 +46,7 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
   beforeAll(async () => {
     process.env.DATABASE_URL = databaseUrl;
     // Short, so the startup grace that suspends presence checks and the sweep (see presence.ts) is
-    // over after the wait below - but long enough that "just claimed" still reads as present on a
+    // over after the wait below, but long enough that "just claimed" still reads as present on a
     // slow CI runner.
     process.env.PRESENCE_TIMEOUT_SECONDS = "2";
     process.env.DISCONNECT_GRACE_MINUTES = "0.05";
@@ -417,9 +416,8 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     expect(await mine(primary)).toEqual(["GRP", "INA", "OUT"]);
   });
 
-  // PUT /vatsim/atis/:icao is how an ATIS reaches this server now - published by the vatSys ATIS
-  // plugin rather than mirrored from VATSIM's datafeed, and with no controller identity in the
-  // body, so it does not go through pluginAuth the way everything above does.
+  // PUT /vatsim/atis/:icao is a public route: the vatSys ATIS plugin sends no pluginAuth identity,
+  // so these requests are built by hand rather than with post() and get().
   describe("the ATIS a vatSys ATIS plugin publishes", () => {
     const sydney = {
       icao: "YSSY", callsign: "YSSY_ATIS", atis_letter: "N", type: "atis", frequency: "126.250",

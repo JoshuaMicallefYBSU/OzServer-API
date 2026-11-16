@@ -1,22 +1,10 @@
-// VATSIM's own public view of the network - for the public map (mapRoutes) only, which has to show
-// every controller and aircraft on the network, plugin user or not, and has no other way to do that.
+// VATSIM's public datafeed, for the public map (routes/map.ts) only: the map has to show every
+// controller and aircraft on the network, plugin user or not.
 //
-// Nothing about our own sector ownership, FDR authority or disconnect handling reads this module any
-// more. Those all concern a controller this server already has a direct, continuous relationship
-// with - one running this plugin, whose every request already proves they're there - and routing
-// that question through this feed instead cost real accuracy for no benefit: it is fetched here
-// through a 15s cache stacked on top of VATSIM's own publish interval, and it lags a real connection
-// by tens of seconds in both directions. A controller who had just claimed sectors could look absent
-// from it for the better part of a minute (flights.ts, maintenance.ts, and claimGroup's staffed-
-// conflict check all hit exactly that lag at one point or another); it was never faster or more
-// accurate than last_seen_online_at, which our own claim/accept/resume/request-accept handlers and
-// the request heartbeat in app.ts already keep current in real time. If you're tempted to reach for
-// this module to answer "is controller X still around" for something OzServer already tracks
-// ownership of, don't - that question belongs to sector_ownerships.last_seen_online_at instead.
-//
-// ATIS was the one other reader until the vatSys ATIS plugin began publishing straight to this API
-// (routes/atis.ts): the feed's own `atis` array is flat broadcast text, arriving through two layers
-// of caching, where the plugin has the real thing section by section the moment it changes.
+// Do not use this to decide whether a controller OzServer tracks is still connected. The feed is
+// cached here for 15 s on top of VATSIM's own publish interval and lags a real connection by tens
+// of seconds in both directions. Sector ownership, FDR authority and disconnect handling use
+// sector_ownerships.last_seen_online_at, which the heartbeat in app.ts keeps current.
 
 type Controller = { cid: number; callsign: string; frequency?: string };
 export type Pilot = {
@@ -41,18 +29,30 @@ async function getJson<T>(url: string): Promise<T | null> {
   }
 }
 
+// One fetch per feed at a time: callers arriving during a refresh wait on the same request, so a
+// busy map does not multiply requests to VATSIM.
+let dataRefresh: Promise<VatsimData | null> | null = null;
+let transceiverRefresh: Promise<TransceiverEntry[]> | null = null;
+
 export async function vatsimData(): Promise<VatsimData | null> {
   if (dataCache.expires > Date.now()) return dataCache.value;
-  const status = await getJson<{ data?: { v3?: string[] } }>("https://status.vatsim.net/status.json");
-  const url = status?.data?.v3?.[0];
-  const value = url ? await getJson<VatsimData>(url) : null;
-  dataCache = { expires: Date.now() + CACHE_MS, value };
-  return value;
+  dataRefresh ??= (async () => {
+    const status = await getJson<{ data?: { v3?: string[] } }>("https://status.vatsim.net/status.json");
+    const url = status?.data?.v3?.[0];
+    const value = url ? await getJson<VatsimData>(url) : null;
+    dataCache = { expires: Date.now() + CACHE_MS, value };
+    return value;
+  })().finally(() => { dataRefresh = null; });
+  return dataRefresh;
 }
 
 export async function afvTransceivers(): Promise<TransceiverEntry[]> {
   if (transceiverCache.expires > Date.now()) return transceiverCache.value;
-  const value = await getJson<TransceiverEntry[]>("https://data.vatsim.net/v3/transceivers-data.json");
-  if (value) transceiverCache = { expires: Date.now() + CACHE_MS, value };
-  return transceiverCache.value;
+  transceiverRefresh ??= (async () => {
+    const value = await getJson<TransceiverEntry[]>("https://data.vatsim.net/v3/transceivers-data.json");
+    // A failed fetch keeps the last good list, and is retried no sooner than the next window.
+    transceiverCache = { expires: Date.now() + CACHE_MS, value: value ?? transceiverCache.value };
+    return transceiverCache.value;
+  })().finally(() => { transceiverRefresh = null; });
+  return transceiverRefresh;
 }

@@ -1,3 +1,4 @@
+import { discord, reportServerError } from "./alerts.js";
 import { buildApp } from "./app.js";
 import { config } from "./config.js";
 import { pool } from "./db.js";
@@ -5,12 +6,15 @@ import { closeAllClients, startEventListener, stopEventListener } from "./events
 import { runMaintenance } from "./maintenance.js";
 
 const app = await buildApp();
-// Never rejects and retries on its own for as long as the process lives (see events.ts), so a
-// database that is not up yet at boot costs push latency until it is, not the channel itself.
-// Without it clients simply fall back to their own polling.
+// Never rejects, and retries for as long as the process lives (see events.ts): a database that is
+// not up at boot delays push events rather than disabling them. Clients poll in the meantime.
 await startEventListener(app.log);
-const maintenanceTimer = setInterval(() => void runMaintenance().catch(error => app.log.error(error)), 60_000);
+const maintenanceTimer = setInterval(() => void runMaintenance().catch(error => {
+  app.log.error(error);
+  reportServerError("maintenance sweep", error);
+}), 60_000);
 maintenanceTimer.unref();
+discord.start();
 
 let shuttingDown = false;
 const shutdown = async () => {
@@ -25,6 +29,8 @@ const shutdown = async () => {
   closeAllClients();
   await stopEventListener();
   await app.close();
+  // Whatever is still queued for Discord goes out before the process does.
+  await discord.stop();
   await pool.end();
   process.exit(0);
 };

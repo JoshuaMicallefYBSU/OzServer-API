@@ -19,3 +19,13 @@ For the production cutover:
 
 This avoids transforming framework-specific tables that contain no durable user data while still
 preserving a complete rollback copy.
+
+## Cutover order
+
+1. Deploy this API to a staging hostname.
+2. Run the schema migration and dataset sync.
+3. Exercise sector claiming, transfer, reconnect, FDR, ATIS and map behaviour with staging builds.
+4. Point `api.ozserver.org` at the VPS.
+5. Deploy the website API-base change.
+6. Release a plugin build whose default base URL is `https://api.ozserver.org`.
+7. Keep the old `/api/v1` routes available temporarily for older plugin builds.

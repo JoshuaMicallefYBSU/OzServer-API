@@ -1,29 +1,207 @@
 # OzServer API
 
-The standalone API for OzServer. It replaces the API previously embedded in the website while
-preserving the plugin-facing `/api/v1` contract.
+[![CI](https://github.com/JoshuaMicallefYBSU/OzServer-API/actions/workflows/ci.yml/badge.svg)](https://github.com/JoshuaMicallefYBSU/OzServer-API/actions/workflows/ci.yml)
+
+The backend for **OzServer** — shared sector ownership, flight data and ATIS for
+[vatSys](https://virtualairtrafficsystem.com/) controllers on VATSIM's Australia Pacific airspace.
+
+Controllers run the [OzServer plugin](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin) inside
+vatSys. This API is the single record of who holds which sector, which controller has authority over
+each flight, and what every airport's ATIS is broadcasting. It also serves the public live map on
+[ozserver.org](https://ozserver.org).
+
+## Contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Getting started](#getting-started)
+- [Configuration](#configuration)
+- [API reference](#api-reference)
+- [Error reporting](#error-reporting)
+- [Tests](#tests)
+- [Deployment](#deployment)
+- [Security model](#security-model)
+- [Related repositories](#related-repositories)
+
+## Features
+
+- **Sector ownership** — claim, release, request and hand over sectors, with grouped positions,
+  top-down cover, and a single transactional lock so overlapping groups can never be claimed twice.
+- **Disconnect handling** — a controller who drops out keeps their sectors for a grace period and
+  can resume them; after that the sectors pass to whoever is covering the parent position.
+- **Flight data** — one record per aircraft with a single controlling authority, kept consistent
+  through handoffs, sector transfers and disconnects.
+- **ATIS** — the broadcast for every airport, published section by section the moment it changes.
+- **Real-time signals** — a Server-Sent Events stream tells clients *that* something changed; they
+  re-read through the ordinary endpoints.
+- **Server isolation** — the live network and each SweatBox training server are kept fully apart.
+- **Public map feed** — read-only endpoints for the website's live map.
+- **Plugin updates** — the release every plugin should be running, served from one cached lookup.
+- **Error reporting** — plugin and server errors relayed to a Discord channel as they happen.
 
 ## Architecture
 
-- Fastify and TypeScript on Node.js 22
-- PostgreSQL for persistent state
-- A single transactional advisory lock around sector mutations, preventing overlapping sector
-  groups from being claimed concurrently
-- Compact JSONB storage for flight data, avoiding a schema migration for every vatSys FDR field
-- Direct, short-lived caching of the VATSIM data and AFV transceiver feeds
-- ATIS published straight to this API by the vatSys ATIS plugin and served publicly at
-  `GET /api/v1/vatsim/atis` - see [ATIS](#atis)
-- Docker deployment behind Caddy on `api.ozserver.org`
+```mermaid
+flowchart LR
+    plugin["vatSys + OzServer plugin"] -- "HTTPS /api/v1" --> caddy["Caddy<br/>api.ozserver.org"]
+    web["ozserver.org live map"] -- "HTTPS /api/v1 (read-only)" --> caddy
+    caddy --> api["OzServer API<br/>Fastify · Node.js 22"]
+    api --> db[("PostgreSQL 17")]
+    api -. "datafeed, AFV transceivers" .-> vatsim["VATSIM"]
+    api -. "releases, sector dataset" .-> github["GitHub"]
+```
 
-## ATIS
+| | |
+| --- | --- |
+| Runtime | Node.js 22, TypeScript, [Fastify](https://fastify.dev/) 5 |
+| Storage | PostgreSQL 17 — plain SQL migrations in [`migrations/`](migrations), flight data as JSONB |
+| Validation | [Zod](https://zod.dev/) schemas on every request body |
+| Events | Postgres `LISTEN`/`NOTIFY` fanned out to Server-Sent Events subscribers |
+| Deployment | Docker Compose behind Caddy; pull-based deploys from `main` |
 
-The OzServer plugin publishes an airport's ATIS directly - relaying what badvectors/ATISPlugin is
-broadcasting, one record per airport, created or replaced in full. It publishes from a live-network
-session only: this record has no server of its own, so a SweatBox session would otherwise put
-training weather on the public map.
+Design points worth knowing before changing anything:
+
+- **The database is the source of truth.** Every sector mutation runs in one transaction under a
+  per-server advisory lock, so two controllers can never both end up owning the same sector.
+- **Presence comes from the plugin's own requests.** Every authenticated call refreshes the caller's
+  `last_seen_online_at`. VATSIM's public datafeed lags a new connection by tens of seconds, so it is
+  used only for the public map, never to decide ownership.
+- **Events carry no data.** A signal names an area (`sectors`, `fdr`, `atis`) and a server; clients
+  re-read. A missed signal costs latency, not correctness, because clients also poll.
+- **Sectors are static reference data**, synchronised from the vatSys Australia and Pacific
+  datasets with `npm run dataset:sync`. Ownership, requests, flights and ATIS are scoped per server.
+
+## Getting started
+
+Requirements: Node.js 22 and PostgreSQL 17 (or Docker for the database).
+
+```bash
+cp .env.example .env            # then set POSTGRES_PASSWORD and the matching DATABASE_URL
+docker compose up -d postgres   # or point DATABASE_URL at an existing PostgreSQL
+npm install
+npm run db:migrate
+npm run dataset:sync            # loads sectors and positions from the vatSys datasets
+npm run dev
+```
+
+The API listens on `http://localhost:3000`. `GET /health` reports the process and its database
+connection.
+
+| Script | Purpose |
+| --- | --- |
+| `npm run dev` | Run from source with reload |
+| `npm run build` / `npm start` | Compile to `dist/` and run the compiled server |
+| `npm run db:migrate` | Apply pending migrations |
+| `npm run dataset:sync` | Refresh sectors and positions from the vatSys datasets |
+| `npm run typecheck` | Type-check without emitting |
+| `npm test` | Run the test suite |
+
+The `:prod` variants (`db:migrate:prod`, `dataset:sync:prod`) run the compiled commands inside the
+production image, which has no development dependencies.
+
+## Configuration
+
+Configuration is read from the environment and validated at start-up ([`src/config.ts`](src/config.ts));
+an invalid value stops the process rather than being guessed at.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | — (required) | PostgreSQL connection string |
+| `POSTGRES_PASSWORD` | — (required by Compose) | Password for the Compose-managed database |
+| `HOST` / `PORT` | `0.0.0.0` / `3000` | Listen address |
+| `WEBSITE_ORIGIN` | `https://ozserver.org` | Origin allowed by CORS for the public endpoints |
+| `PRESENCE_TIMEOUT_SECONDS` | `6` | Silence from a controller before another may claim their sector outright. Keep at about twice the plugin's 3 s poll |
+| `DISCONNECT_GRACE_MINUTES` | `5` | Silence before a controller's sectors are released and reassigned |
+| `RESUME_WINDOW_MINUTES` | `5` | How long a dropped controller can resume their sectors and tags |
+| `FDR_RETAIN_MINUTES` | `15` | Lifetime of a flight record after its last update |
+| `ATIS_RETAIN_MINUTES` | `60` | Lifetime of an ATIS handover record after its last update |
+| `NETWORK_ATIS_RETAIN_MINUTES` | `90` | Lifetime of a published ATIS after its last publish |
+| `RATE_LIMIT_PER_10S` | `300` | Requests one address may make per ten seconds before `429` |
+| `MAX_EVENT_SUBSCRIBERS` | `500` | Event streams held open at once |
+| `CLIENT_LOGS_TOKEN` | unset | When set (16+ characters), required to read `GET /client-logs` |
+| `ATIS_TOKEN` | unset | When set (16+ characters), required to publish with `PUT /vatsim/atis/:icao` |
+| `PLUGIN_RELEASE_REPO` | `JoshuaMicallefYBSU/OzServer-Plugin` | Repository whose releases are offered to the plugin's updater |
+| `PLUGIN_RELEASE_MAX_VERSION` | unset | When set, no plugin release newer than this is offered |
+| `DISCORD_WEBHOOK_URL` | unset | When set, errors are relayed to this Discord webhook - see [Error reporting](#error-reporting) |
+| `DISCORD_LOG_CATEGORIES` | `Error` | Comma-separated plugin log categories relayed to Discord |
+
+## API reference
+
+All routes are under `/api/v1`. Responses are JSON; validation failures answer `422` with the
+offending fields, and an address over the rate limit answers `429` with `Retry-After`.
+
+`server` is one of `live`, `sb1` or `sb2` (`GET /servers` lists them with labels).
+
+### Plugin endpoints
+
+Every request identifies the calling controller with `controller_cid`, `controller_callsign` and
+`server` — in the query string for `GET`, in the JSON body otherwise. A request without them
+answers `401`.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /sectors/sync` | Everything a client needs in one read: sectors owned, sectors held by others, and pending requests |
+| `GET /sectors/mine` · `GET /sectors/controlled` · `GET /sector-requests` | The three parts of `/sectors/sync` on their own |
+| `POST /sectors/:name/claim` | Claim a sector and its group; `409` with the conflicts when another present controller holds part of it |
+| `POST /sectors/:name/release` | Release a sector |
+| `POST /sectors/:name/request` | Ask the current owner for a sector |
+| `POST /sectors/commit` | Apply a set of claims, releases and requests in one transaction |
+| `POST /sectors/release-all` | Release everything, on a deliberate disconnect |
+| `POST /sectors/resume` | Recover sectors, and the tags to restore, after a dropped connection |
+| `POST /sector-requests/:id/accept` · `/reject` · `/cancel` | Answer or withdraw one request |
+| `POST /sector-requests/accept-batch` · `/reject-batch` | Answer several requests at once |
+| `POST /sector-requests/:id/acknowledge-rejection` | Confirm a rejection was shown to the requester |
+| `POST /fdr` · `POST /fdr/batch` | Upsert flight records (up to 500 per batch); each result reports whether the push was accepted |
+| `GET /fdr/sync` | Every current flight record, without routes |
+| `GET /fdr/:callsign` | One flight record in full |
+| `POST /atis` | Record the ATIS an OzServer controller's own vatSys is running |
+| `POST /client-logs` | Forward plugin log lines (up to 200 per batch) |
+
+### Public endpoints
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /events?server=` | Server-Sent Events stream — see [Events](#events) |
+| `GET /events/status` | Number of open event streams |
+| `GET /servers` | The servers this API distinguishes, with display labels |
+| `GET /vatsim/atis` · `GET /vatsim/atis/:icao` | Published ATIS for every airport, or one (or `null`) |
+| `PUT /vatsim/atis/:icao` | Publish an airport's ATIS — see [ATIS](#atis) |
+| `GET /atis/:icao?server=` | The ATIS handover record for one airport |
+| `GET /plugin/release` | The plugin release to install — see [Plugin updates](#plugin-updates) |
+| `GET /map/sectors?server=` | Staffed sectors with their boundaries and owners |
+| `GET /map/sector-shapes` | Every sector's static geometry |
+| `GET /map/ops?server=` | Ownership, controllers and pending requests in one read |
+| `GET /map/controllers?server=` | Controllers online and the position each is working |
+| `GET /map/aircraft?server=` · `GET /map/routes?server=` | Current flight records, and their routes |
+| `GET /map/atis?server=` | Every ATIS that can be placed on the map, with whether its station is still connected |
+| `GET /map/traffic` · `GET /map/pilots` | Network traffic inside OzServer's airspace, from the VATSIM datafeed |
+| `GET /afv/transceivers` | VATSIM's AFV transceiver feed, cached |
+| `GET /client-logs` | Forwarded plugin logs for diagnostics; token-protected when `CLIENT_LOGS_TOKEN` is set |
+| `GET /health` (not under `/api/v1`) | Liveness and database connectivity |
+
+### Events
+
+`GET /api/v1/events?server=live` opens a Server-Sent Events stream. Each event is named `sectors`,
+`fdr` or `atis` and means "something in that area changed on this server — read it again":
 
 ```
+event: sectors
+data: {"type":"sectors","server":"live"}
+```
+
+The stream carries no state and needs no identity, so the plugin and a browser share it. A comment
+frame every 20 seconds keeps idle connections open. Streams are capped per address and in total; a
+client that is turned away (`503`) keeps working from its own polling.
+
+### ATIS
+
+The plugin publishes each airport's ATIS from a live-network session, one record per airport,
+created or replaced in full:
+
+```http
 PUT /api/v1/vatsim/atis/YSSY
+Content-Type: application/json
+
 {
   "icao": "YSSY",
   "callsign": "YSSY_ATIS",
@@ -38,114 +216,162 @@ PUT /api/v1/vatsim/atis/YSSY
 }
 ```
 
-Sending the same body twice is harmless: `201` the first time, `200` after, and the stored record
-is the same either way. `type` is `atis` for a sectioned broadcast, or `zulu` for the free text a
-closed tower leaves running - a `zulu` sends its broadcast text as `content` (a plain string) and
-its `changed` is always empty. `changed` is the sections this letter changed, i.e. the ones vatSys
-marks with a leading `+`; a name this API does not serve (`MODE`, `TIME_CHECK`) is dropped rather
-than refused, in `content` and in `changed` alike. `controller` is required, `frequency` and
-`client` are optional, and anything else in the body is ignored. A body whose `icao` disagrees with
-the URL, or that carries no ATIS letter, is answered `422` and stores nothing.
+- **Idempotent.** `201` the first time, `200` after; the stored record is the same either way.
+- **`type`** is `atis` for a sectioned broadcast or `zulu` for the free text a closed tower leaves
+  running. A `zulu` sends its text as a plain string in `content`, and its `changed` is always empty.
+- **`changed`** lists the sections this letter changed. Section names the API does not serve
+  (`MODE`, `TIME_CHECK`) are dropped from `content` and `changed` rather than refused.
+- **`controller`** is required; `frequency` and `client` are optional. A body whose `icao` differs
+  from the URL, or with no ATIS letter, answers `422` and stores nothing.
+- **Reading it back** returns the broadcast with `issued` as a `DDHHMM` UTC day-time group and
+  every section in ATIS-editor order (`null` for one not broadcast). `controller` and `client` are
+  stored for traceability but only ever returned to the publisher, in the `PUT` response.
+- **No withdrawal.** A record leaves by being replaced, or `NETWORK_ATIS_RETAIN_MINUTES` after the
+  last `PUT` that carried it — so re-publishing an unchanged ATIS keeps it alive while it is on air.
 
-There is no way to withdraw an ATIS: a record leaves only by being replaced, or by ageing out
-`NETWORK_ATIS_RETAIN_MINUTES` (90) after the last `PUT` that carried it - the sweep in
-`maintenance.ts`. A controller signing off does not unsay the broadcast they were making, and the
-letter they last published stays the best answer to "what is YSSY running" for a while afterwards.
-The clock runs from when the broadcast last reached this API rather than from `issued`, so a
-plugin that re-publishes an unchanged ATIS keeps it alive for as long as it is on the air, while
-one that publishes only on change has 90 minutes from each broadcast.
+`GET /map/atis` returns published ATIS placed at their airport, plus the handover record
+(`POST /atis`) for any airport with no published one, in the same shape. Each carries `connected`:
+`true` while the ATIS station is on the network, `false` for a record still held after it left.
 
-Published ATIS are drawn on the public map: `GET /api/v1/map/atis` returns them placed at their
-airport (so an airport the dataset has no position for is served by `/vatsim/atis` but cannot be
-mapped), alongside the vatSys ATIS an OzServer controller's own client pushed with `POST /atis`
-for any airport with no published one. Both come back in the same shape - a published ATIS wins
-where an airport has both. Each also carries `connected`: `true` while its ATIS station is on the
-network (listed in the VATSIM datafeed, or heard from in the last two minutes), `false` for a
-record this server is still holding after the station left. The map draws the first dark red and
-the second light grey.
+### Plugin updates
 
-Read it back with `GET /api/v1/vatsim/atis` (every airport, by ICAO) or
-`GET /api/v1/vatsim/atis/:icao` (one airport, or `null`). The response is the broadcast as
-published, with `issued` as a `DDHHMM` day-time group (`120914`, always UTC) and `content`
-carrying every section in ATIS-editor order - `null` for each one not broadcast. `controller` and
-`client` are stored but never served: the broadcast is public, who is running it is not. The `PUT`
-response is the one exception, since it answers the plugin that just sent them. Either endpoint
-changing publishes the existing `atis` server-sent event.
+The plugin updates itself. Rather than every client calling GitHub, it asks this API:
 
-Publishing is open to anything that can reach the API unless `ATIS_TOKEN` is set, in which case
-`PUT` requires it as `Authorization: Bearer <token>` (or `?token=`).
+```http
+GET /api/v1/plugin/release
+```
 
-## Local setup
+```json
+{
+  "version": "0.1.8",
+  "tag": "v0.1.8",
+  "url": "https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases/download/v0.1.8/OzServerPlugin.dll",
+  "sha256": "bb641fa7ef8352de469f04938e05f75dd437980a93e9b64b128a0ea9b5135f57",
+  "size": 308224,
+  "published_at": "2026-11-11T10:28:16Z",
+  "notes_url": "https://github.com/JoshuaMicallefYBSU/OzServer-Plugin/releases/tag/v0.1.8"
+}
+```
 
-1. Copy `.env.example` to `.env`.
-2. Set `POSTGRES_PASSWORD` and make the local `DATABASE_URL` use the same password. Docker Compose
-   overrides the API container's database hostname to `postgres` automatically.
-3. Start PostgreSQL with `docker compose up -d postgres`.
-4. Run `npm install`, `npm run db:migrate`, then `npm run dataset:sync`.
-5. Start the API with `npm run dev`.
+The answer is the newest published release of `PLUGIN_RELEASE_REPO` that has `OzServerPlugin.dll`
+attached, or `null` when there is none. The release list is read from GitHub at most once every
+five minutes, with a conditional request, and cached in memory — so publishing a GitHub release is
+still the whole release process, and it reaches clients within minutes.
 
-`GET /health` checks both the API process and its database connection.
+- **Holding a release back.** Set `PLUGIN_RELEASE_MAX_VERSION` and restart; nothing newer is
+  offered. The plugin only ever installs a higher version than it is running, so this pauses a
+  rollout but cannot downgrade anyone.
+- **The binary stays on GitHub.** This endpoint only names the download. The plugin accepts a URL
+  under its own repository's releases and verifies the SHA-256 before installing, so this server
+  cannot point a client at any other file.
+- **If GitHub has never been reachable** since start-up the endpoint answers `503`, and the plugin
+  falls back to asking GitHub directly.
+
+### Error reporting
+
+With `DISCORD_WEBHOOK_URL` set, the API posts to that Discord webhook:
+
+- **Plugin errors** — every error the plugin shows a controller is forwarded with its log
+  (`POST /client-logs`, category `Error`) and relayed with the controller's callsign, CID, server
+  and plugin version. `DISCORD_LOG_CATEGORIES` widens this to other log categories.
+- **Server errors** — any request answered `500`, and a failed maintenance sweep.
+
+Messages are batched every five seconds, identical errors inside a minute are counted rather
+than repeated, and the relay backs off when Discord rate-limits it — so a fault every client
+reports at once arrives as a handful of messages. Reporting never delays or fails a request.
+
+> [!IMPORTANT]
+> A webhook URL is a credential: anyone who has it can post to the channel. Keep it in `.env` on
+> the host, never in the repository, and regenerate it in Discord if it is ever exposed.
 
 ## Tests
 
-`npm test` runs the unit tests anywhere. The route tests in `src/api.integration.test.ts` need a
-Postgres they are allowed to wipe, and are skipped without one:
+```bash
+npm test
+```
 
-    docker run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=test postgres:17-alpine
-    TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres npm test
+Unit tests run anywhere. The route tests in [`src/api.integration.test.ts`](src/api.integration.test.ts)
+exercise the real SQL and need a PostgreSQL database they are allowed to wipe; they are skipped
+unless `TEST_DATABASE_URL` is set:
 
-CI runs them on every push and pull request.
+```bash
+docker run --rm -d -p 55432:5432 -e POSTGRES_PASSWORD=test postgres:17-alpine
+TEST_DATABASE_URL=postgres://postgres:test@localhost:55432/postgres npm test
+```
 
-## Production
+> [!WARNING]
+> The integration tests drop and recreate the `public` schema. Never point `TEST_DATABASE_URL` at a
+> database you want to keep.
 
-Use one Linux account per administrator and individual SSH public keys. Do not share private keys.
-Copy `Caddyfile.example` into the VPS Caddy configuration, point `api.ozserver.org` at the VPS, and
-run migrations before replacing the API container during a deployment.
+CI runs the type check, the full suite against PostgreSQL, and a build of the production image on
+every push to `main` and every pull request.
 
-Inside the production container, use `npm run db:migrate:prod` and
-`npm run dataset:sync:prod`; these run the compiled commands without development dependencies.
+## Deployment
 
-Back up PostgreSQL off-server daily. A database backup is required before every schema migration.
+Production runs on a single Linux host with Docker Compose, behind [Caddy](https://caddyserver.com/)
+on `api.ozserver.org`.
 
-## Migration order
+- [`compose.yaml`](compose.yaml) runs the API and PostgreSQL. The database is on an internal
+  network reachable only from the API container; the API is published on `127.0.0.1:3000` only.
+- [`Caddyfile.example`](Caddyfile.example) terminates TLS and proxies to the API. The events
+  stream is routed without compression, which would otherwise buffer it.
+- The container applies pending migrations before it starts serving, so new code never runs
+  against an old schema.
 
-1. Deploy this API to a staging hostname.
-2. Run the schema migration and dataset sync.
-3. Exercise sector claiming, transfer, reconnect, FDR, ATIS and map behavior with staging builds.
-4. Point `api.ozserver.org` at the VPS.
-5. Deploy the website API-base change.
-6. Release a plugin build whose default base URL is `https://api.ozserver.org`.
-7. Keep the old `/api/v1` routes available temporarily for older plugin builds.
+### Continuous deployment
 
-## Production deployment
+Deployment is pull-based: a systemd timer on the host runs every two minutes and redeploys when
+`origin/main` has moved.
 
-The API runs on an OVHcloud VPS (Ubuntu 24.04) at `/opt/ozserver-api`, behind Caddy on
-`api.ozserver.org`. Postgres is on a Docker network marked `internal`, so it is reachable only
-from the API container; the API itself is additionally on an `egress` network because it must
-reach the VATSIM datafeed and the vatSys dataset repositories.
+```
+git fetch  →  build image  →  up -d  →  migrate  →  health check
+```
 
-Deployment is pull-based. A systemd timer runs `ozserver-deploy` every two minutes, which
-redeploys only when `origin/main` has moved:
+The health check gates the deploy. If `/health` does not report a working database within about a
+minute, the host resets to the previous commit and rebuilds, so a bad push leaves the previous
+version serving. **A push to `main` is a production deploy** — CI on the pull request is the gate.
 
-    git fetch -> rebuild -> up -d -> db:migrate:prod -> health check
+### Operations
 
-The container also applies pending migrations itself before it starts serving (see the Dockerfile's
-`CMD`), so new code never runs against the old schema; the script's own `db:migrate:prod` then finds
-nothing left to do.
+```bash
+sudo systemctl start ozserver-deploy      # deploy now rather than waiting for the timer
+journalctl -u ozserver-deploy -n 50       # what recent deploys did
+docker compose logs api --tail 100
+docker compose exec api npm run dataset:sync:prod   # after a vatSys dataset release
+```
 
-The health check gates the deploy. If `/health` does not report `"database":"ok"` within about a
-minute, the script resets to the previous commit and rebuilds, so a bad push leaves the previous
-version serving rather than taking the API down. `flock` prevents overlapping runs.
+- `.env` lives beside `compose.yaml` on the host, outside git, and survives deploys.
+- PostgreSQL is dumped daily to the host and kept for 14 days. Those dumps cover operator error,
+  not loss of the host — keep an off-server copy, and take a backup before any schema migration.
+- Use one account per administrator with individual SSH keys.
 
-Operational commands on the VPS:
+[`MIGRATION.md`](MIGRATION.md) records the cutover from the API that was originally embedded in
+the website.
 
-    sudo systemctl start ozserver-deploy      # deploy now instead of waiting for the timer
-    journalctl -u ozserver-deploy -n 50       # what the last deploys did
-    docker compose logs api --tail 100
+## Security model
 
-`.env` lives outside git at `/opt/ozserver-api/.env` (mode 0600) and is preserved across
-deployments, since `git reset --hard` does not touch ignored files.
+- **Identity is asserted, not proven.** The plugin sends the CID and callsign of the vatSys session
+  it is running in, and the API trusts it. Checking each request against VATSIM's datafeed was
+  rejected because the feed lags a new connection long enough to refuse legitimate controllers.
+  Treat this API as a coordination service between cooperating controllers, not an authority.
+- **Rate limiting** is per address, in memory, and deliberately generous: a controller wrongly
+  turned away stops heart-beating and loses sectors.
+- **Optional shared tokens** protect the two endpoints that warrant it: `CLIENT_LOGS_TOKEN` for
+  reading forwarded logs (which name controllers) and `ATIS_TOKEN` for publishing ATIS. Both are
+  unset by default; set `CLIENT_LOGS_TOKEN` on any public deployment.
+- **CORS** allows `GET` from `WEBSITE_ORIGIN` only.
+- **No secrets in the repository.** Configuration comes from the environment; `.env` is ignored.
 
-Postgres is dumped daily by the `ozserver-db-backup` timer to `/var/backups/ozserver`, keeping 14
-days. These dumps are on the same host, so they cover operator error, not loss of the VPS - an
-off-server copy is still required.
+To report a security problem, please contact the maintainers privately rather than opening a
+public issue.
+
+## Related repositories
+
+- [OzServer-Plugin](https://github.com/JoshuaMicallefYBSU/OzServer-Plugin) — the vatSys plugin
+  controllers run.
+- [OzServer-Website](https://github.com/JoshuaMicallefYBSU/OzServer-Website) — ozserver.org and its
+  live map.
+
+## Licence
+
+No licence has been chosen yet. Until a `LICENSE` file is added, all rights are reserved.

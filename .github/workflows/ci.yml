@@ -1,8 +1,7 @@
 name: CI
 
-# Every push and every pull request. The API is deployed straight from main by a timer on the VPS,
-# so a break on main is a break in production within a minute or two - this is the only thing
-# standing in front of that.
+# Every push to main and every pull request. The API is deployed straight from main by a timer on
+# the VPS, so a break on main reaches production within a minute or two.
 on:
   push:
     branches: [main]
@@ -12,7 +11,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     # A throwaway database for src/api.integration.test.ts, which exercises the routes against real
-    # Postgres - the sector rules are mostly SQL, and nothing short of running it tests them.
+    # Postgres: the sector rules are mostly SQL.
     services:
       postgres:
         image: postgres:17-alpine
@@ -30,12 +29,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          # Matches the Dockerfile's base image, so a thing that compiles here compiles there.
+          # Matches the Dockerfile's base image.
           node-version: '22'
           cache: npm
 
-      # ci, not install: builds from the lockfile exactly, which is the same guarantee the
-      # deployment relies on.
+      # ci, not install: builds from the lockfile exactly, as the Dockerfile does.
       - run: npm ci
 
       - name: Typecheck
@@ -46,7 +44,7 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://postgres:test@localhost:5432/postgres
 
-      # Proves the image the VPS will actually build still builds, without pushing it anywhere.
-      # Catches a Dockerfile or dependency break before the deploy timer finds it in production.
+      # Proves the image the VPS will build still builds, without pushing it anywhere: a Dockerfile
+      # or dependency break is caught here rather than by the deploy timer.
       - name: Build image
         run: docker build -t ozserver-api:ci .

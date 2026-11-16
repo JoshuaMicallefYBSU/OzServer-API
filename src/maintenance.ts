@@ -12,22 +12,17 @@ import { SERVERS, type Server } from "./auth.js";
 import type { ControllerIdentity } from "./types.js";
 
 export async function runMaintenance(): Promise<void> {
-  // See presence.ts: skip the disconnect sweep entirely until this process has been up for a full
-  // grace window, so a restart of this server is never read as every controller disconnecting at
-  // once - every real client gets that same window to make a request and refresh its own row first.
+  // The disconnect sweep is skipped until this process has been up for a full grace window, so a
+  // restart is never read as every controller disconnecting at once (see presence.ts).
   const withinStartupGrace = isWithinStartupGrace(config.DISCONNECT_GRACE_MINUTES * 60_000);
   const affected = await transaction(async client => {
     // The same per-server lock every sector mutation takes (sectors.ts lockMutations), in a fixed
-    // order. The sweep deletes and re-inserts ownership rows across many sectors at once, and
-    // without it it could interleave with a claim working through the same rows in a different
-    // order - a deadlock Postgres resolves by killing one of the two, which is a claim answered 500
-    // or a sweep that silently did nothing this minute.
+    // order. The sweep deletes and re-inserts ownership rows across many sectors, and without the
+    // lock could deadlock with a claim working through the same rows in a different order.
     for (const server of SERVERS) {
       await client.query("SELECT pg_advisory_xact_lock(684276, hashtext($1))", [server]);
     }
-    // Grouped by server, not pooled into one flat list: ownership is now per-server, a single
-    // sweep pass can span multiple servers' disconnects at once, and reassignFreedSectors needs to
-    // know which server's sector_ownerships to search for each freed id - a reassignment must
+    // Grouped by server: one pass can span disconnects on several servers, and a reassignment must
     // never cross servers.
     const freedByServer = new Map<string, string[]>();
     const droppedOwners: Array<ControllerIdentity & { released_sectors: string[]; released_sector_ids: string[] }> = [];
@@ -39,22 +34,9 @@ export async function runMaintenance(): Promise<void> {
         callsign: String(owner.controller_callsign),
         server: String(owner.server)
       } as ControllerIdentity;
-      // Aged against last_seen_online_at alone, not against VATSIM's public datafeed - this used to
-      // cross-check "is this callsign/cid pair listed online right now" against that feed before
-      // trusting the age of the row at all, refreshing it only on a match. That feed is a
-      // third-party's own view, fetched here through a 15s cache stacked on top of VATSIM's own
-      // publish interval, and it lags a real connection in BOTH directions: slow to show an arrival
-      // (a controller who had just claimed sectors could look entirely absent from it, and lose
-      // those sectors to this very sweep before the feed ever caught up) and no faster to show a
-      // departure than this grace window already is on its own.
-      //
-      // last_seen_online_at is refreshed on every authenticated request a controller's own client
-      // makes - see the heartbeat hook in app.ts - which every connected client already does every
-      // couple of seconds regardless of what it's doing, independent of any outside feed's own
-      // schedule. That is a strictly faster and more direct "are they still here" signal than
-      // anything a third party can report about a connection this server isn't even part of, and it
-      // is entirely this plugin's and this server's own doing - nothing external to keep in sync
-      // with, and no separate "the feed itself is down" case to special-case around.
+      // Aged against last_seen_online_at (refreshed by every authenticated request - see app.ts),
+      // not VATSIM's datafeed: the feed lags a new connection by tens of seconds, long enough for a
+      // controller who has just claimed to look absent and lose their sectors to this sweep.
       const removed = await client.query<{ sector_id: string; name: string }>(
         `WITH deleted AS (
            DELETE FROM sector_ownerships
@@ -79,9 +61,8 @@ export async function runMaintenance(): Promise<void> {
         "DELETE FROM sector_requests WHERE (sector_id=ANY($1) OR requesting_cid=$2 OR target_cid=$2) AND server=$3",
         [removed.rows.map(row => row.sector_id), identity.cid, identity.server]);
     }
-    // Every disconnected controller's rows are gone by now, so a sub-sector left behind can be
-    // handed to whoever is still working the group above it - one pass per server, since a
-    // reassignment must never cross servers.
+    // Every disconnected controller's rows are gone by now (reassignFreedSectors requires it), so a
+    // sub-sector left behind can go to whoever is still working the group above it.
     const reassigned: string[] = [];
     for (const [server, ids] of freedByServer) {
       reassigned.push(...await reassignFreedSectors(client, ids, server));
@@ -100,21 +81,16 @@ export async function runMaintenance(): Promise<void> {
     }
     await client.query(`DELETE FROM flight_data_records WHERE last_seen_at < now()-($1*interval '1 minute')`, [config.FDR_RETAIN_MINUTES]);
     await client.query(`DELETE FROM atis_broadcasts WHERE last_seen_at < now()-($1*interval '1 minute')`, [config.ATIS_RETAIN_MINUTES]);
-    // An ATIS a plugin published stays until it is replaced or withdrawn - or until this sweep
-    // decides nobody can still be broadcasting it (see NETWORK_ATIS_RETAIN_MINUTES). Aged from
-    // when we last heard the broadcast, not from the letter's own issue time: a plugin that keeps
-    // re-publishing an unchanged ATIS is still telling us it is on the air, and ageing that out
-    // would delete and re-create the same record every pass.
+    // A published ATIS stays until it is replaced or ages out here (NETWORK_ATIS_RETAIN_MINUTES).
+    // Aged from when it was last received, not from the letter's issue time: a plugin that keeps
+    // re-publishing an unchanged ATIS is still on the air.
     const expiredAtis = (await client.query(
       `DELETE FROM network_atis WHERE received_at < now()-($1*interval '1 minute')`,
       [config.NETWORK_ATIS_RETAIN_MINUTES])).rowCount ?? 0;
     await client.query("DELETE FROM sector_requests WHERE rejected_at < now()-interval '1 day'");
-    // Kept for a day. Long enough to look into something reported the next morning, short enough
-    // that a busy evening's worth of every controller's logs is not accumulated indefinitely.
-    //
-    // By created_at, not logged_at. logged_at is the *client's* clock (see client-logs.ts), and
-    // purging on it meant a client whose clock ran ahead - or one simply sending a far-future
-    // timestamp - wrote rows this never removed.
+    // Kept for a day: long enough to look into something reported the next morning. Purged by
+    // created_at, not logged_at, which is the client's clock (see client-logs.ts) - a client whose
+    // clock runs ahead would otherwise write rows this never removes.
     await client.query("DELETE FROM client_logs WHERE created_at < now()-interval '1 day'");
     await client.query("DELETE FROM resume_snapshots WHERE created_at < now()-($1*interval '1 minute')", [config.RESUME_WINDOW_MINUTES]);
     return {
@@ -122,12 +98,10 @@ export async function runMaintenance(): Promise<void> {
       atis: expiredAtis > 0
     };
   });
-  // A disconnect sweep frees sectors without any request having been made, so nothing else would
-  // announce it - subscribers would sit on a stale picture until their own fallback poll. Published
-  // once per server actually affected by this pass, never a single unscoped event: one sweep can
-  // release sectors on more than one server at a time, and a subscriber only watches one.
+  // The sweep frees sectors without a request having been made, so nothing else announces it.
+  // Published once per server affected: one pass can release sectors on several servers, and a
+  // subscriber watches only one.
   for (const server of affected.sectors) await publish({ type: "sectors", server });
-  // And for an ATIS that just aged out - live network only, which is the only place one is
-  // published (see routes/atis.ts).
+  // An ATIS that aged out - live network only, the only place one is published (routes/atis.ts).
   if (affected.atis) await publish({ type: "atis", server: "live" });
 }

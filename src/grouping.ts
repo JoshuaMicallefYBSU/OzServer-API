@@ -1,10 +1,8 @@
 import type pg from "pg";
 import type { ControllerIdentity } from "./types.js";
 
-// A sub-sector whose controller drops off belongs back with whoever is working the group it sits
-// inside - not to nobody. Previously it simply went unowned until someone claimed it by hand, even
-// though the controller responsible for its parent group was online the whole time and already
-// covering that airspace on their own scope.
+// A sub-sector whose controller drops off goes back to whoever is working the group it sits
+// inside, who is already covering that airspace, rather than being left unowned.
 //
 // Ancestry is walked outwards one level at a time rather than jumping to any owned ancestor, so the
 // nearest staffed group wins: if both ISA and whatever bundles ISA are online, the sub-sector goes
@@ -19,11 +17,9 @@ type FlightAuthorityTransfer = {
   to: ControllerIdentity;
 };
 
-// `sectors` is shared across every server (static airspace geometry, not per-controller state -
-// see migrations/006_server_isolation.sql), so only the `sector_ownerships` side of this join is
-// scoped to `server`, and scoped in the join condition rather than a WHERE filter: a WHERE filter
-// would turn this into an inner join and drop a parent that exists but is unowned on this server,
-// which is exactly the "keep climbing" case this function relies on.
+// As in sectors.ts `covered`, only the ownership side of the join is scoped to `server`, and in the
+// join condition: a WHERE filter would drop a parent that is unowned on this server, which is the
+// "keep climbing" case this function relies on.
 async function findNearestGroupOwner(client: pg.PoolClient, name: string, server: string): Promise<Owner | null> {
   let frontier = [name];
   const seen = new Set(frontier);
@@ -67,7 +63,7 @@ export async function reassignFreedSectors(
   const reassigned: string[] = [];
 
   for (const sector of freed) {
-    // Somebody claimed it in the meantime - leave it with them rather than overriding a live claim.
+    // Somebody claimed it in the meantime - leave it with them.
     if ((await client.query("SELECT 1 FROM sector_ownerships WHERE sector_id=$1 AND server=$2", [sector.id, server])).rowCount) {
       continue;
     }

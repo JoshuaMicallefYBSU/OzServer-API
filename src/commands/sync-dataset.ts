@@ -40,16 +40,14 @@ const SHARED_EDGE_TOLERANCE = 0.01;
 // Makes neighbouring boundaries agree along the edges they share.
 //
 // The dataset describes each sector's boundary on its own, and two sectors either side of one line
-// do not always list the same corners along it: KIMBERLEY turns at 13°55'04"S 128°26'12"E, while
-// TERRITORY runs straight past that point to the start of its arc. Drawn as filled shapes, the
-// space between the two versions of the line belongs to neither sector, and the map shows a sliver
-// of nothing between them (Kununurra, east of Tasmania, Wollongong, Cape Leeuwin, ...). vatSys draws
-// each boundary as a line on its own, so it never shows; a map of filled sectors does.
+// do not always list the same corners along it. Drawn as filled shapes, the space between the two
+// versions of the line belongs to neither sector, and the map shows a sliver between them. (vatSys
+// draws each boundary as a line, so it never shows there.)
 //
 // Every corner of every boundary that lies on (within SHARED_EDGE_TOLERANCE of) another boundary's
-// edge is added to that edge too, in order along it. Shared edges then have the same corners on both
-// sides and the sliver closes. Nothing moves more than the tolerance, and these shapes are only ever
-// drawn - nothing decides ownership from them (the plugin locates aircraft from vatSys's own data).
+// edge is added to that edge too, in order along it, so shared edges have the same corners on both
+// sides. Nothing moves more than the tolerance, and these shapes are only drawn - nothing decides
+// ownership from them (the plugin locates aircraft from vatSys's own data).
 function shareEdgeCorners(rings: Point[][]): Point[][] {
   const corners = rings.flatMap((ring, ringIndex) => ring.map(point => ({ ...point, ringIndex })));
   return rings.map((ring, ringIndex) => {
@@ -58,11 +56,10 @@ function shareEdgeCorners(rings: Point[][]): Point[][] {
     for (let i = 0; i < ring.length - 1; i++) {
       const a = ring[i]!, b = ring[i + 1]!;
       out.push(a);
-      // An edge across the antimeridian (179°E to 179°W, in the Fiji and Auckland Oceanic FIRs)
-      // reads in raw longitude as a line almost all the way round the world - straight through
-      // Australia - and matching against it pulled Australian corners into the Pacific outlines,
-      // drawing spikes across the continent. Those edges border nothing in either dataset that
-      // needs matching, so they are left exactly as given.
+      // An edge across the antimeridian (in the Fiji and Auckland Oceanic FIRs) reads in raw
+      // longitude as a line almost all the way round the world, and matching against it would pull
+      // Australian corners into the Pacific outlines. Those edges border nothing that needs
+      // matching, so they are left as given.
       if (Math.abs(b.lon - a.lon) > 180) continue;
       const k = Math.cos(((a.lat + b.lat) / 2) * Math.PI / 180);
       const ax = a.lon * k, ay = a.lat, dx = b.lon * k - ax, dy = b.lat - ay;
@@ -87,15 +84,12 @@ function shareEdgeCorners(rings: Point[][]): Point[][] {
 }
 
 // Each dataset is resolved within itself: its sectors use its own volumes, and its volumes its own
-// boundaries. The two datasets reuse names freely - the Pacific one has its own ARA, WIL, TSN, COL
-// and more, with different geometry (its ARA is Arafura and Willis as one shape, for a sector it
-// hides from the Sectors window). This used to keep one volume list keyed by name across both, so
-// the Pacific ARA silently replaced the Australian one and the Australian ARA sector was drawn
-// swallowing WIL.
+// boundaries. The two datasets reuse names with different geometry (the Pacific one has its own
+// ARA, WIL, TSN, COL and more), so one volume list keyed by name across both would let a Pacific
+// volume silently replace an Australian one.
 //
-// Which profile a sector comes from - Australian positions from the AUS profile, Pacific ones from
-// the PAC profile. Each profile carries copies of its neighbour's sectors, and says which are its
-// own by showing them in the Sectors window:
+// Each profile carries copies of its neighbour's sectors, and says which are its own by showing
+// them in the Sectors window. That decides which profile a sector is taken from:
 //
 //  - the PAC profile shows only its own sectors (every Australian sector in it is hidden), so a
 //    sector PAC shows is a Pacific one and comes from PAC - including the Pacific aerodrome and
@@ -139,8 +133,8 @@ const fromPacAlsoInAus = [...pac.shown.keys()].filter(name => aus.shown.has(name
 console.log(`Sectors: ${kept.filter(k => k.dataset === aus).length} from AUS, ${kept.filter(k => k.dataset === pac).length} from PAC`
   + (fromPacAlsoInAus.length ? ` (shown in both, taken from PAC: ${fromPacAlsoInAus.join(", ")})` : ""));
 
-// Shared edges matched across exactly the boundaries that will be drawn - not every boundary either
-// file happens to contain, or a hidden duplicate's corners would be pulled into the real outlines.
+// Shared edges are matched across only the boundaries that will be drawn - not every boundary
+// either file contains, or a hidden duplicate's corners would be pulled into the real outlines.
 const used = new Map<string, { dataset: ParsedDataset; name: string }>();
 for (const { dataset, boundaryNames } of kept) {
   for (const name of boundaryNames) {
@@ -167,11 +161,11 @@ await transaction(async client => {
         callsign?.split("_").at(-1) ?? null, JSON.stringify(csv(sector.ResponsibleSectors)), JSON.stringify(boundary)]);
     seenSectors.push(name);
   }
-  // Deleting a sector cascades to whoever owns it right now, so this one statement can take live
-  // ownership away from connected controllers. It should only ever do that for a sector the dataset
-  // really dropped - not because a fetch came back with a different shape than this parser expects
-  // and "every sector" suddenly reads as "a handful". A real release removes a few sectors at most;
-  // losing more than a fifth of them in one sync is treated as a broken fetch and refused.
+  // Deleting a sector cascades to its ownership rows, so this statement can take live ownership
+  // away from connected controllers. That must only happen for a sector the dataset really dropped,
+  // not because a fetch came back in a shape this parser does not expect. A real release removes a
+  // few sectors at most; losing more than a fifth of them in one sync is treated as a broken fetch
+  // and refused.
   const known = Number((await client.query("SELECT count(*) AS count FROM sectors")).rows[0].count);
   const surviving = Number((await client.query(
     "SELECT count(*) AS count FROM sectors WHERE name=ANY($1)", [seenSectors])).rows[0].count);
@@ -181,9 +175,8 @@ await transaction(async client => {
   await client.query("DELETE FROM sectors WHERE NOT (name=ANY($1))", [seenSectors]);
 
   // Positions likewise come from their own profile's Positions.xml. The two files share no position
-  // names today; should one ever appear in both, it is not silently overwritten by whichever file is
-  // read last - the PAC entry is taken if PAC shows a sector with that position's callsign prefix,
-  // the AUS one otherwise, and the clash is reported.
+  // names today; should one appear in both, the PAC entry is taken if PAC shows a sector with that
+  // position's callsign prefix, the AUS one otherwise, and the clash is reported.
   const seenPositions: string[] = [];
   const positionProfile = new Map<string, "AUS" | "PAC">();
   const pacPrefixes = new Set([...pac.shown.values()].map(sector => String(sector["@_Callsign"] ?? "").split(/[-_]/)[0]).filter(Boolean));
