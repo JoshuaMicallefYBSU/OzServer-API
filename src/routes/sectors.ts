@@ -355,8 +355,18 @@ async function syncPayload(client: pg.Pool | pg.PoolClient, identity: Controller
         name: row.name, full_name: row.full_name, type: row.type, callsign: row.callsign,
         frequency: row.frequency, owner: { cid: row.cid, callsign: row.owner_callsign }
       }));
-  return { mine, controlled, requests: await requestsPayload(client, identity) };
+  // Everyone running the plugin right now, sectors or not (migrations/012_plugin_clients.sql). A
+  // controller tracking a tag who is not on this list never reports it, so the plugin covers for
+  // them (FdrSync.TrackedOutsideOzServer). A wider window than the disconnect sweep's: a client
+  // missing for a moment only means two reporters for a while, never none.
+  const pluginClients = (await client.query(
+    `SELECT DISTINCT controller_cid AS cid, controller_callsign AS callsign FROM plugin_clients
+      WHERE server=$1 AND last_seen_at >= now()-($2*interval '1 second') ORDER BY controller_callsign`,
+    [identity.server, PLUGIN_CLIENT_WINDOW_SECONDS])).rows;
+  return { mine, controlled, requests: await requestsPayload(client, identity), plugin_clients: pluginClients };
 }
+
+const PLUGIN_CLIENT_WINDOW_SECONDS = 15;
 
 async function releaseGroup(client: pg.PoolClient, identity: ControllerIdentity, name: string): Promise<boolean> {
   const rows = await covered(client, name, identity.server);

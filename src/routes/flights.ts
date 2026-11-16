@@ -123,9 +123,18 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
       // that ever be a moment's lag (a track the authority's client has not heard of yet), the
       // tracker's own next push puts their name straight back: nothing guards a record with no owner.
       const untrackedPush = hasOwn(flight, "controlling_cid") && flight.controlling_cid == null;
+      // In handover the report is believed too, once vatSys shows somebody other than the recorded
+      // controller tracking it (tracked_by): the handoff was accepted by a controller without the
+      // plugin, who never reports. Their acceptance is the push that would have ended the
+      // handover, so without this FDX656 stayed in handover under ML-BLA_CTR after ML_APP took it.
+      // A give-away push cannot look like this: it comes from the recorded controller themselves,
+      // still tracking.
+      const trackedBy = typeof flight.tracked_by === "string" ? flight.tracked_by.toUpperCase() : "";
+      const acceptedOutside = isHandover(recordedState) && trackedBy !== ""
+        && trackedBy !== (existing?.controlling_callsign ?? "").toUpperCase();
       const reportsUntracked = untrackedPush
         && typeof flight.authority_sector === "string" && callerOwnedSectors.has(flight.authority_sector)
-        && !isHandover(recordedState);
+        && (!isHandover(recordedState) || acceptedOutside);
       // The recorded controller has dropped off - still holding sectors (the disconnect grace
       // period), but their client has stopped calling. Somebody has to keep the aircraft's position
       // current meanwhile, and the plugin hands that to exactly one connected controller (see

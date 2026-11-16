@@ -12,6 +12,10 @@ import { mapRoutes } from "./routes/map.js";
 import { serverRoutes } from "./routes/servers.js";
 import { sectorRoutes } from "./routes/sectors.js";
 
+// When each plugin client's presence was last written - see the heartbeat hook below.
+const PLUGIN_CLIENT_REFRESH_MS = 2000;
+const pluginClientSeen = new Map<string, number>();
+
 export async function buildApp() {
   const app = Fastify({ logger: true, trustProxy: true, bodyLimit: 2 * 1024 * 1024 });
   await app.register(cors, { origin: config.WEBSITE_ORIGIN, methods: ["GET"] });
@@ -77,6 +81,23 @@ export async function buildApp() {
           [request.controller.cid, request.controller.callsign, request.controller.server]);
       } catch (error) {
         app.log.warn(error, "Could not refresh controller heartbeat.");
+      }
+      // And that this controller runs the plugin at all, sectors or not - see
+      // migrations/012_plugin_clients.sql. At most every few seconds per client: each one calls
+      // several times a second, and the list it feeds is only read against a timeout.
+      const key = `${request.controller.server}|${request.controller.callsign}|${request.controller.cid}`;
+      const now = Date.now();
+      if ((pluginClientSeen.get(key) ?? 0) > now - PLUGIN_CLIENT_REFRESH_MS) return;
+      if (pluginClientSeen.size > 10000) pluginClientSeen.clear();
+      pluginClientSeen.set(key, now);
+      try {
+        await pool.query(
+          `INSERT INTO plugin_clients (controller_cid,controller_callsign,server,last_seen_at) VALUES ($1,$2,$3,now())
+           ON CONFLICT (server,controller_callsign,controller_cid) DO UPDATE SET last_seen_at=now()`,
+          [request.controller.cid, request.controller.callsign, request.controller.server]);
+      } catch (error) {
+        pluginClientSeen.delete(key);
+        app.log.warn(error, "Could not record plugin client presence.");
       }
     });
     // One hook rather than a publish() call inside every handler. What a subscriber needs to know
