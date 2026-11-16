@@ -2,12 +2,11 @@ import { timingSafeEqual } from "node:crypto";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
-// The 3 fully isolated vatSys connection targets this API distinguishes between. See
-// NetworkServer.cs in the plugin for how a client determines its own value; a new server is a
-// one-line change here, not a migration - server is stored as free text (migrations/
-// 006_server_isolation.sql), validated only at this application layer. LocalHost is deliberately
-// not one of these - OzServer does not operate there at all (NetworkServer.Current is null for
-// it), so it never appears as a value a client could send.
+// The isolated vatSys connection targets this API distinguishes between; NetworkServer.cs in the
+// plugin determines a client's own value. Stored as free text (migrations/006_server_isolation.sql)
+// and validated only here, so adding a server is a change to this list (and its label in
+// routes/servers.ts), not a migration. LocalHost is deliberately absent: the plugin does not
+// operate there.
 export const SERVERS = ["live", "sb1", "sb2"] as const;
 export type Server = typeof SERVERS[number];
 
@@ -27,18 +26,16 @@ export function parseControllerIdentity(source: unknown): { cid: number; callsig
   };
 }
 
-// For the public (unauthenticated) routes - map.ts, atis.ts's public GET, events.ts - which don't
-// go through pluginAuth and validate their own ?server= query param by hand. Matched
-// case-sensitively against the lowercase canonical slugs: both producers (the plugin's
-// NetworkServer constants, the website's fixed <option value>s) are developer-controlled, not
-// user-typed free text, so there is nothing to normalise.
+// For the public routes, which do not go through pluginAuth and validate their own ?server= query
+// parameter. Matched case-sensitively against the lowercase slugs: both producers (the plugin's
+// NetworkServer constants and the website's fixed option values) are developer-controlled, so
+// there is nothing to normalise.
 export function parseServer(value: unknown): Server | null {
   return typeof value === "string" && (SERVERS as readonly string[]).includes(value) ? value as Server : null;
 }
 
-// For the shared-secret gates (CLIENT_LOGS_TOKEN, ATIS_TOKEN), which are a single configured
-// string rather than a per-caller credential. Compared in constant time so a wrong token cannot be
-// walked character by character from how long the answer took.
+// For the shared-secret gates (CLIENT_LOGS_TOKEN, ATIS_TOKEN). Compared in constant time so a
+// token cannot be recovered character by character from response timing.
 export function tokenMatches(presented: string | undefined, expected: string): boolean {
   if (!presented) return false;
   const left = Buffer.from(presented);

@@ -9,17 +9,15 @@ const visibleTypes = ["TWR", "APP", "DEP", "CTR", "FSS"];
 const typePriority: Record<string, number> = { FMP: 0, CTR: 1, FSS: 1, APP: 2, DEP: 2, TWR: 3, GND: 3, DEL: 3 };
 
 // atis_broadcasts keeps a frequency FSD-style - (MHz - 100) * 1000, so 132.500 is stored as 32500
-// - where a published ATIS carries the text the controller typed ("126.250"). The map wants the
-// one readable form either way.
+// - where a published ATIS carries it as text ("126.250"). The map is given the text form for both.
 const fsdFrequency = (value: number | null): string | null =>
   value === null || value === undefined ? null : (100 + value / 1000).toFixed(3);
 
 // Every sector boundary ring, for /map/traffic's point-in-airspace test. The dataset changes only
-// when sync-dataset runs, so the rings are read at most every ten minutes, not on every request.
+// when sync-dataset runs, so the rings are read at most every ten minutes.
 //
 // Longitudes are taken onto 0-360 (as is the pilot's, in insideRing): the oceanic sectors run out
-// past 180 degrees, and on -180..180 a ring crossing the antimeridian would wrap the wrong way round
-// the globe.
+// past 180 degrees, and on -180..180 a ring crossing the antimeridian would wrap the wrong way.
 type Ring = Array<[number, number]>; // [lon 0-360, lat]
 let ringCache: { expires: number; rings: Ring[] } = { expires: 0, rings: [] };
 const eastLon = (lon: number) => (lon < 0 ? lon + 360 : lon);
@@ -52,17 +50,15 @@ function insideRing(ring: Ring, lat: number, lon: number): boolean {
 
 type AtisMapRow = { icao: string; atis_letter: string; content: unknown; lat: number; lon: number };
 
-// Whether the station behind an ATIS record is on the network right now, as opposed to a record
-// this server is still holding after its controller left (a published ATIS is kept for
-// NETWORK_ATIS_RETAIN_MINUTES, a pushed one for ATIS_RETAIN_MINUTES, and neither can be withdrawn).
-// The map draws the two differently.
+// Whether the station behind an ATIS record is on the network, as opposed to a record this server
+// is still holding after its controller left (records cannot be withdrawn - they age out). The map
+// draws the two differently.
 //
-// VATSIM's datafeed lists every connected ATIS station, so on the live network that is the answer.
-// It lags a new connection by up to a minute, so a record heard from in the last two minutes counts
-// as connected without it - otherwise every ATIS would appear as "saved" first and turn "active" a
-// refresh or two later. Where the feed cannot answer (it is unreachable, or this is a SweatBox ATIS,
-// which it never lists) the plugin's own re-push decides: both ATIS paths re-send every 20 minutes
-// while still broadcasting, so one not heard from in 25 has stopped.
+// On the live network VATSIM's datafeed answers: it lists every connected ATIS station. It lags a
+// new connection by up to a minute, so a record heard from in the last two minutes counts as
+// connected regardless. Where the feed cannot answer (it is unreachable, or this is a SweatBox
+// ATIS, which it never lists) the re-push decides: both ATIS paths re-send every 20 minutes while
+// broadcasting, so one not heard from in 25 has stopped.
 const ATIS_JUST_HEARD_MS = 2 * 60_000;
 const ATIS_REPUSH_MS = 25 * 60_000;
 
@@ -101,11 +97,9 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
        JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.type=ANY($1) ORDER BY s.name`,
       [visibleTypes, server])).rows;
 
-    // The real VATSIM public datafeed only ever lists live-network connections, so it can answer
-    // "online" for `live` but would read false for every row on the other 3 servers regardless of
-    // actual presence there. For those, recency of our own last_seen_online_at (refreshed by every
-    // authenticated request - see app.ts's heartbeat hook) is the equivalent signal, the same one
-    // claim-takeover already trusts elsewhere (see sectors.ts's isPresent).
+    // VATSIM's datafeed lists live-network connections only, so it answers "online" for `live`.
+    // For the other servers, recency of last_seen_online_at is the equivalent signal (see
+    // sectors.ts isPresent).
     if (server === "live") {
       const online = new Set((await vatsimData())?.controllers?.map(controller => controller.callsign.toUpperCase()) ?? []);
       return rows.map(row => ({
@@ -154,24 +148,19 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
       [config.FDR_RETAIN_MINUTES, server])).rows;
   });
 
-  // Every sector's static geometry, regardless of staffing - unlike /map/sectors (staffed-only,
-  // with live ownership/online status), this is what the website's home page decorative map
-  // needs: every sector's shape whether or not anyone currently holds it. Global/unscoped:
-  // sectors are shared across every server (see migrations/006_server_isolation.sql), so there is
-  // nothing to scope here.
+  // Every sector's static geometry, staffed or not - unlike /map/sectors, which returns owned
+  // sectors only, with their owner and online status. Takes no ?server=: sectors are shared across
+  // every server (see migrations/006_server_isolation.sql).
   app.get("/map/sector-shapes", async () => (await pool.query(
     "SELECT name,full_name,type,callsign,frequency,responsible_sectors,boundary FROM sectors ORDER BY name")).rows);
 
-  // The /live-map page's whole live picture in one call: who holds which sector, every controller with
-  // the full set they hold, and the requests between them. Geometry is not in here - the page
-  // loads /map/sector-shapes once and joins this onto it by sector name, so this stays small enough
-  // to re-read on every "sectors" signal.
+  // The /live-map page's live picture in one call: who holds which sector, every controller with
+  // the set they hold, and the requests between them. Geometry is left to /map/sector-shapes
+  // (joined by sector name), so this stays small enough to re-read on every "sectors" signal.
   //
-  // Read-only and public like the rest of /map: nothing here is more than what every connected
-  // controller already sees in their own Sectors window, and none of it can be acted on from a
-  // browser. Presence is judged from our own heartbeat (last_seen_online_at) for every server, live
-  // included - it is the signal the disconnect sweep itself trusts, and it has none of the
-  // datafeed's publish lag.
+  // Public like the rest of /map: it shows no more than every connected controller sees in their
+  // own Sectors window. Presence is judged from last_seen_online_at for every server, live
+  // included, since it has none of the datafeed's publish lag.
   app.get<{ Querystring: { server?: string } }>("/map/ops", async (request, reply) => {
     const server = parseServer(request.query.server);
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
@@ -244,21 +233,15 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
-  // Every ATIS the map can draw, in one shape whichever way it reached this server: the ones a
-  // vatSys ATIS plugin published (network_atis - see routes/atis.ts), and, for an airport that has
-  // no published ATIS, the vatSys ATIS an OzServer controller's own client pushed
-  // (atis_broadcasts). Published wins where both exist: it is the broadcast itself, with its
-  // sections, its letter and the time the controller issued it, rather than our record of what one
-  // controller's plugin last sent us.
-  //
-  // Only an airport the dataset holds a position for can be drawn, since that is where lat/lon
-  // comes from - an ATIS published for anywhere else is still served by /vatsim/atis, just not
-  // placed on the map.
+  // Every ATIS the map can draw, in one shape: those a vatSys ATIS plugin published (network_atis
+  // - see routes/atis.ts) and, for an airport with none, the one an OzServer controller's client
+  // pushed (atis_broadcasts). Only an airport the dataset holds a position for can be drawn, since
+  // that is where lat/lon comes from; an ATIS for anywhere else is still served by /vatsim/atis.
   app.get<{ Querystring: { server?: string } }>("/map/atis", async (request, reply) => {
     const server = parseServer(request.query.server);
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
-    // ?server= scopes the atis_broadcasts half only: network_atis has no server of its own (an
-    // ATIS is a broadcast on the network), so the published ones are the same on every view.
+    // ?server= scopes the atis_broadcasts half only: network_atis has no server column, so the
+    // published ones are the same on every view.
     const published = (await pool.query(
       `SELECT a.icao,a.callsign,a.atis_letter,a.type,a.frequency,a.content,a.changed,a.issued,a.received_at,
               p.default_lat AS lat,p.default_lon AS lon
@@ -279,8 +262,8 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     return [
       ...published.map(row => mapAtis(row, row.type, row.frequency, row.issued, row.changed,
         atisConnected(row.callsign, row.received_at, onNetwork))),
-      // atis_broadcasts holds no issue time of its own, so the time it last reached us stands in,
-      // and nothing in it is marked as changed - vatSys sends that plugin the content only.
+      // atis_broadcasts holds no issue time, so the time it last reached us stands in, and it
+      // records no change markers.
       ...pushed.map(row => mapAtis(row, "atis", fsdFrequency(row.frequency), row.last_seen_at, [],
         atisConnected(`${row.icao}_ATIS`, row.last_seen_at, pushedOnNetwork)))
     ];
@@ -290,18 +273,10 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     const server = parseServer(request.query.server);
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
 
-    // A sweatbox/localhost connection never appears on VATSIM's real public datafeed, so for
-    // anything but `live` this reads straight from our own ownership ledger instead - the only
-    // record of who is actually staffing what on those servers. Same response shape as the live
-    // branch below, so the website's rendering code needs no changes, only its fetch URL.
-    //
-    // One row per CONTROLLER, not per sector they own: a controller who claimed a group (e.g. KPL
-    // owning 5 sectors) has one sector_ownerships row per covered sub-sector, but should show up
-    // once, on their own primary frequency - exactly what the live branch below already does by
-    // matching a connected controller's own callsign to a sector. Matching `s.callsign =
-    // o.controller_callsign` is the same rule applied to the ownership table instead of the VATSIM
-    // datafeed: only the one sector whose own callsign IS this controller's callsign - their "home"
-    // position - contributes a row.
+    // A SweatBox connection never appears on VATSIM's datafeed, so anything but `live` reads
+    // sector_ownerships instead, in the same response shape. One row per controller, not per
+    // sector they own: only the sector whose callsign is the controller's own (their "home"
+    // position) contributes a row, the same rule the live branch applies to the datafeed.
     if (server !== "live") {
       const rows = (await pool.query(
         `SELECT s.name AS sector_name, s.type, s.frequency, o.controller_cid AS cid, o.controller_callsign AS callsign
@@ -327,16 +302,14 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     }).sort((a, b) => (typePriority[a.type] ?? 99) - (typePriority[b.type] ?? 99) || a.sector_name.localeCompare(b.sector_name));
   });
 
-  // A bare passthrough of VATSIM's real global AFV feed - inherently meaningless for a
-  // sweatbox/localhost session (there is no AFV data for a connection that isn't on the real
-  // network), and has no database query of its own to scope. Left global/unscoped; /map/controllers'
-  // non-live branch above already covers the practical consequence with a frequency fallback.
+  // A passthrough of VATSIM's AFV feed, which covers the live network only, so it takes no
+  // ?server=. /map/controllers' non-live branch uses the sector's own frequency instead.
   app.get("/afv/transceivers", async () => afvTransceivers());
 
-  // How much of the traffic OzServer covers it can actually see: every pilot in VATSIM's datafeed
-  // who is inside one of our sectors (the airspace the dataset describes - both FIRs and the
-  // oceanic sectors), and how many of those have a recent flight record pushed by a controller's
-  // plugin. Live network only - the datafeed has nothing to say about a SweatBox.
+  // How much of the traffic in its airspace OzServer can see: every pilot in VATSIM's datafeed who
+  // is inside one of the dataset's sectors (both FIRs and the oceanic sectors), and how many of
+  // those have a recent flight record pushed by a controller's plugin. Live network only - the
+  // datafeed does not cover a SweatBox.
   app.get("/map/traffic", async () => {
     const [pilots, polygons, records] = await Promise.all([
       vatsimData().then(data => data?.pilots ?? []),
@@ -352,11 +325,10 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
-  // Airborne traffic around Australia, straight from VATSIM's public datafeed, for the homepage's
-  // decorative scope. Every pilot on the network, OzServer or not, trimmed to what a vatSys label
-  // shows: callsign and wake category, level, requested level, groundspeed, destination - plus the
-  // heading the page dead-reckons with between refreshes. Public like the rest of /map: it is the
-  // datafeed's own content, filtered.
+  // Airborne traffic around Australia from VATSIM's datafeed, for the homepage's decorative scope.
+  // Every pilot in the area, OzServer or not, trimmed to what a vatSys label shows: callsign and
+  // wake category, level, requested level, groundspeed, destination - plus the heading the page
+  // dead-reckons with between refreshes.
   app.get("/map/pilots", async () => {
     const pilots = (await vatsimData())?.pilots ?? [];
     return pilots

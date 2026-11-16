@@ -12,14 +12,14 @@ export async function eventRoutes(app: FastifyInstance): Promise<void> {
     const server = parseServer(request.query.server);
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
 
-    // See canAddClient: a subscriber that is turned away keeps working off its own fallback poll,
-    // so refusing one costs latency and nothing else.
+    // See canAddClient. A subscriber that is turned away keeps working off its fallback poll, so
+    // refusing one costs latency only.
     if (!canAddClient(request.ip)) {
       return reply.code(503).header("Retry-After", "30").send({ message: "Too many event subscribers." });
     }
 
     // Fastify must be told to stop managing this response, or it will try to send its own on top
-    // of the stream we are about to write by hand.
+    // of the stream written by hand below.
     reply.hijack();
 
     reply.raw.writeHead(200, {
@@ -27,9 +27,9 @@ export async function eventRoutes(app: FastifyInstance): Promise<void> {
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
       "X-Accel-Buffering": "no",
-      // Set by hand because reply.hijack() takes this response out of Fastify's pipeline
-      // entirely - @fastify/cors never gets to add it, and without it the browser silently
-      // refuses the EventSource connection while curl sees a perfectly healthy stream.
+      // Set by hand: reply.hijack() takes this response out of Fastify's pipeline, so
+      // @fastify/cors never adds it, and without it a browser refuses the EventSource connection
+      // (while curl sees a healthy stream).
       "Access-Control-Allow-Origin": config.WEBSITE_ORIGIN
     });
     reply.raw.write(": connected\n\n");

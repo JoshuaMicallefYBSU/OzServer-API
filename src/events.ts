@@ -3,14 +3,10 @@ import { config } from "./config.js";
 import { pool } from "./db.js";
 import { SERVERS, type Server } from "./auth.js";
 
-// Clients are told *that* something changed, never what. Every client re-reads through the
-// endpoint it already uses, which keeps this channel free of anything sensitive - so it needs no
-// identity of its own, and the browser map (whose EventSource cannot set request headers) can share
-// it - and means no DTO is duplicated here to drift out of step with its route.
-// `server` is the one exception, and a deliberate one: it is a routing dimension (which
-// subscribers this fans out to), not payload data about what changed, so it does not weaken that
-// guarantee - a client still has to re-read to find out anything more than "something on my server
-// changed".
+// Clients are told that something changed, never what: each re-reads through the endpoint it
+// already uses. That keeps this channel free of anything sensitive - so it needs no identity, and
+// the browser map (whose EventSource cannot set request headers) can share it - and duplicates no
+// DTO here. `server` is carried only to route an event to the right subscribers.
 const EVENT_TYPES = ["sectors", "fdr", "atis"] as const;
 export type OzEvent = { type: typeof EVENT_TYPES[number]; server: Server };
 
@@ -19,10 +15,9 @@ const CHANNEL = "ozserver_events";
 type Client = { write: (chunk: string) => void; end: () => void; server: Server; ip: string };
 const clients = new Set<Client>();
 
-// A stream costs a socket and a heartbeat timer for as long as it stays open, and the endpoint is
-// public - so both the total and any one address's share are bounded. A controller has one stream
-// from the plugin and perhaps a browser tab or two on the map; the per-address cap is far above
-// that and far below what it would take to starve everyone else.
+// A stream holds a socket and a heartbeat timer for as long as it stays open, and the endpoint is
+// public, so both the total (MAX_EVENT_SUBSCRIBERS) and any one address's share are bounded. A
+// controller has one stream from the plugin and perhaps a browser tab or two on the map.
 const MAX_CLIENTS_PER_IP = 8;
 
 export function canAddClient(ip: string): boolean {
@@ -41,9 +36,8 @@ export function clientCount(): number {
   return clients.size;
 }
 
-// Ends every open stream. An SSE response never finishes on its own, and Fastify's close() waits
-// for in-flight responses - so without this a shutdown sat there until Docker gave up and killed
-// the process, turning every deploy into ten seconds of refused connections.
+// Ends every open stream. An SSE response never finishes on its own and Fastify's close() waits
+// for in-flight responses, so without this a shutdown would hang until Docker killed the process.
 export function closeAllClients(): void {
   for (const client of [...clients]) {
     try {
@@ -67,15 +61,15 @@ function fanOut(event: OzEvent): void {
   }
 }
 
-// Goes through NOTIFY rather than calling fanOut directly so that a second API container, or a
-// one-off container command like dataset:sync, still reaches every connected client - not only the
-// ones attached to whichever process happened to serve the mutation.
+// Goes through NOTIFY rather than calling fanOut directly, so a second API container or a one-off
+// command like dataset:sync reaches every connected client, not only those attached to the process
+// that made the change.
 export async function publish(event: OzEvent): Promise<void> {
   try {
     await pool.query("SELECT pg_notify($1,$2)", [CHANNEL, JSON.stringify(event)]);
   } catch {
     // A failed notification must never fail the mutation that triggered it. Clients keep a slow
-    // fallback poll precisely so a missed signal costs latency, not correctness.
+    // fallback poll, so a missed signal costs latency, not correctness.
   }
 }
 
@@ -91,13 +85,10 @@ let stopped = false;
 // LISTEN holds its connection for the life of the process, so it cannot come from the pool -
 // borrowing a pooled client would either pin it forever or lose the subscription on release.
 //
-// Never rejects, and never gives up. A dropped LISTEN connection leaves every subscriber silently
-// frozen on a socket that is still open - the worst failure mode available, since it looks
-// connected - and the first version of this retried exactly once: pg reports a failed *connect*
-// through the returned promise, not the 'error' event, so if Postgres was still restarting when
-// that one retry ran, nothing was left to schedule another and the channel stayed dead until the
-// process was restarted. Every failure, at any stage, now goes through the same path and schedules
-// the next attempt.
+// Never rejects, and never gives up: a dropped LISTEN connection leaves every subscriber frozen on
+// a socket that still looks connected. pg reports a failed connect through the returned promise
+// and a later drop through the 'error' or 'end' event, so every failure, at any stage, goes through
+// the same path (`fail` in connectListener) and schedules the next attempt.
 export async function startEventListener(log: Log): Promise<void> {
   stopped = false;
   await connectListener(log, MIN_RETRY_MS, false);
@@ -128,7 +119,7 @@ async function connectListener(log: Log, retryDelay: number, isReconnect: boolea
     void client.end().catch(() => undefined);
     if (stopped || retryTimer) return;
     // Back off while it keeps failing, but start again from the minimum after a connection that
-    // actually worked - that one dropping is a fresh problem, not a continuation of the last.
+    // worked - that one dropping is a fresh problem, not a continuation of the last.
     const delay = connected ? MIN_RETRY_MS : retryDelay;
     retryTimer = setTimeout(() => {
       retryTimer = null;
@@ -165,9 +156,7 @@ async function connectListener(log: Log, retryDelay: number, isReconnect: boolea
   listener = client;
 
   // Whatever was published while nothing was listening is gone - NOTIFY is not queued for an
-  // absent listener. Telling every subscriber to re-read everything once costs each of them one
-  // round of requests, and is the difference between a brief gap and a stale picture that lasts
-  // until something else happens to change.
+  // absent listener - so every subscriber is told to re-read everything once.
   if (isReconnect) {
     for (const server of SERVERS) {
       for (const type of EVENT_TYPES) fanOut({ type, server });
