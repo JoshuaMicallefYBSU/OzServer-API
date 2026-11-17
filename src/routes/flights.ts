@@ -220,11 +220,12 @@ export async function flightRoutes(app: FastifyInstance): Promise<void> {
   app.post<{ Params: { callsign: string } }>("/fdr/:callsign/cancel", async (request, reply) => {
     const identity = request.controller;
     const callsign = request.params.callsign;
-    return transaction(async client => {
+    // Answered after COMMIT, not from inside the transaction - as in routes/sectors.ts.
+    const outcome = await transaction(async (client): Promise<{ code: number; body: unknown }> => {
       const existing = (await client.query(
         `SELECT controlling_cid,controlling_callsign,current_sector,data FROM flight_data_records
           WHERE callsign=$1 AND server=$2 FOR UPDATE`, [callsign, identity.server])).rows[0];
-      if (!existing) return reply.code(404).send({ message: "No record for this callsign." });
+      if (!existing) return { code: 404, body: { message: "No record for this callsign." } };
 
       let owner = existing.controlling_cid === identity.cid;
       if (!owner && existing.controlling_cid == null) {
@@ -246,7 +247,7 @@ export async function flightRoutes(app: FastifyInstance): Promise<void> {
           existing_authority: { cid: existing.controlling_cid ?? null, callsign: existing.controlling_callsign ?? null },
           current_sector: existing.current_sector ?? null
         });
-        return reply.code(403).send({ message: "Only the controller who owns this flight can cancel it." });
+        return { code: 403, body: { message: "Only the controller who owns this flight can cancel it." } };
       }
 
       await client.query("DELETE FROM flight_data_records WHERE callsign=$1 AND server=$2", [callsign, identity.server]);
@@ -260,8 +261,9 @@ export async function flightRoutes(app: FastifyInstance): Promise<void> {
           state: (existing.data as { state?: unknown } | undefined)?.state ?? null
         }
       });
-      return { callsign, deleted: true };
+      return { code: 200, body: { callsign, deleted: true } };
     });
+    return reply.code(outcome.code).send(outcome.body);
   });
 
   // One flight's current record, for a client that has just gained jurisdiction over a tag (a

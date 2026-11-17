@@ -21,7 +21,7 @@ const schema = z.object({
   // Minutes after a controller leaves (their last request if they dropped, or their release-all)
   // within which a different controller connecting under the same callsign takes over the
   // position: its sectors that the previous controller still held, with their tags inside them
-  // (handOverPosition in grouping.ts). Outside it, or for anything the previous controller was
+  // (handOverPosition in routes/sectors.ts). Outside it, or for anything the previous controller was
   // extending into, the tags are left with nobody.
   POSITION_HANDOVER_MINUTES: z.coerce.number().positive().default(2),
   FDR_RETAIN_MINUTES: z.coerce.number().positive().default(15),
