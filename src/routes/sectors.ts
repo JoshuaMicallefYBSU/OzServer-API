@@ -424,8 +424,9 @@ async function handOverPosition(
       ORDER BY o.last_seen_online_at DESC`,
     [identity.server, [...positionSectors], identity.cid, identity.callsign,
      config.PRESENCE_TIMEOUT_SECONDS, config.POSITION_HANDOVER_MINUTES])).rows;
-  if (dropped.length > 0) {
-    const from = { cid: Number(dropped[0].controller_cid), callsign: dropped[0].controller_callsign };
+  const latest = dropped[0];
+  if (latest) {
+    const from = { cid: Number(latest.controller_cid), callsign: latest.controller_callsign };
     const rows = dropped.filter(row => Number(row.controller_cid) === from.cid);
     const ids = rows.map(row => row.sector_id);
     const names = rows.map(row => row.name);
