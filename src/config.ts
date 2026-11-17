@@ -18,6 +18,12 @@ const schema = z.object({
   // interval, a connected controller whose poll lands slightly late would lose a sector.
   PRESENCE_TIMEOUT_SECONDS: z.coerce.number().positive().default(6),
   RESUME_WINDOW_MINUTES: z.coerce.number().positive().default(5),
+  // Minutes after a controller leaves (their last request if they dropped, or their release-all)
+  // within which a different controller connecting under the same callsign takes over the
+  // position: its sectors that the previous controller still held, with their tags inside them
+  // (handOverPosition in grouping.ts). Outside it, or for anything the previous controller was
+  // extending into, the tags are left with nobody.
+  POSITION_HANDOVER_MINUTES: z.coerce.number().positive().default(2),
   FDR_RETAIN_MINUTES: z.coerce.number().positive().default(15),
   ATIS_RETAIN_MINUTES: z.coerce.number().positive().default(60),
   // Minutes an ATIS published with PUT /api/v1/vatsim/atis/:icao is kept after its last PUT before

@@ -10,12 +10,6 @@ import type { ControllerIdentity } from "./types.js";
 const MAX_DEPTH = 8;
 
 type Owner = { controller_cid: number; controller_callsign: string };
-type FlightAuthorityTransfer = {
-  callsign: string;
-  current_sector: string | null;
-  from: ControllerIdentity;
-  to: ControllerIdentity;
-};
 
 // As in sectors.ts `covered`, only the ownership side of the join is scoped to `server`, and in the
 // join condition: a WHERE filter would drop a parent that is unowned on this server, which is the
@@ -85,110 +79,30 @@ export async function reassignFreedSectors(
 // TMA (approach and departure) sectors. Their aircraft never move with a change of sector owner:
 // the volumes stacked inside a TMA cannot be relied on to say which controller an aircraft belongs
 // to, so the controllers hand each one over themselves. The plugin keeps them with whoever has them
-// (SectorTagHandoff), and every transfer of FDR authority below leaves them alone to match.
+// (SectorTagHandoff), and a handover's transfer of FDR authority (transferRequest) leaves them
+// alone to match.
 export const TMA_SECTOR_TYPES_SQL = "('APP','DEP')";
 
-export async function transferFlightsInSectorsToOwner(
+// Leaves a controller's tags with nobody: every one, or only those whose aircraft is in one of
+// `sectors`. Run whenever airspace leaves a controller other than by a handover - their release-all,
+// the disconnect sweep, a claim on a sector of theirs after they dropped. The aircraft stay on
+// OzServer, and every client still activates them (FdrResumeActivation), but nobody is given the
+// tag: whoever now holds the airspace picks each one up by hand. The only automatic moves of a tag
+// are a handover (transferRequest), a controller's own reconnect (POST /sectors/resume) and a
+// position taken over under the same callsign (handOverPosition in routes/sectors.ts).
+export async function clearFlightsOf(
   client: pg.PoolClient,
-  sectors: Array<{ sector: string; cid: number | null; callsign: string | null }>,
-  owner: ControllerIdentity
-): Promise<FlightAuthorityTransfer[]> {
-  if (sectors.length === 0) return [];
-
-  const transferred: FlightAuthorityTransfer[] = [];
-  for (const sector of sectors) {
-    // Only tags that were the previous owner's move with the sector - a sector changing hands
-    // takes its controller's aircraft with it. A sector nobody held had no tags to hand over: the
-    // flights in it were nobody's, and naming the claimer on them made the plugin take them on
-    // its next resume. N677PL, untracked and only passing through WOL, was picked up by
-    // ML-SNO_CTR that way the moment they claimed SNO.
-    if (sector.cid === null) continue;
-
-    const rows = (await client.query<{
-      callsign: string;
-      current_sector: string | null;
-      previous_cid: number | null;
-      previous_callsign: string | null;
-    }>(
-      `WITH previous AS (
-         SELECT callsign,current_sector,controlling_cid,controlling_callsign
-           FROM flight_data_records
-          WHERE current_sector=$1
-            AND server=$6
-            AND controlling_cid=$2 AND controlling_callsign IS NOT DISTINCT FROM $3
-            AND current_sector NOT IN (SELECT name FROM sectors WHERE type IN ${TMA_SECTOR_TYPES_SQL})
-            AND (controlling_cid IS DISTINCT FROM $4 OR controlling_callsign IS DISTINCT FROM $5)
-       ),
-       updated AS (
-         UPDATE flight_data_records f
-            SET controlling_cid=$4,controlling_callsign=$5
-           FROM previous p
-          WHERE f.callsign=p.callsign AND f.server=$6
-          RETURNING f.callsign,f.current_sector,
-                    p.controlling_cid AS previous_cid,p.controlling_callsign AS previous_callsign
-       )
-       SELECT * FROM updated`,
-      [sector.sector, sector.cid, sector.callsign, owner.cid, owner.callsign, owner.server])).rows;
-
-    transferred.push(...rows.map(row => ({
-      callsign: row.callsign,
-      current_sector: row.current_sector,
-      from: { cid: row.previous_cid ?? 0, callsign: row.previous_callsign ?? "", server: owner.server },
-      to: owner
-    })));
-  }
-
-  return transferred;
-}
-
-export async function transferFlightsToCurrentSectorOwners(
-  client: pg.PoolClient,
-  from: ControllerIdentity
-): Promise<FlightAuthorityTransfer[]> {
-  const rows = (await client.query<{
-    callsign: string;
-    current_sector: string | null;
-    to_cid: number;
-    to_callsign: string;
-  }>(
-    `UPDATE flight_data_records f
-        SET controlling_cid=o.controller_cid,controlling_callsign=o.controller_callsign
-       FROM sectors s
-       JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$3
-      WHERE f.controlling_cid=$1
-        AND f.controlling_callsign=$2
-        AND f.server=$3
-        AND f.current_sector=s.name
-        AND COALESCE(s.type, '') NOT IN ${TMA_SECTOR_TYPES_SQL}
-        AND (o.controller_cid IS DISTINCT FROM $1 OR o.controller_callsign IS DISTINCT FROM $2)
-      RETURNING f.callsign,f.current_sector,o.controller_cid AS to_cid,o.controller_callsign AS to_callsign`,
-    [from.cid, from.callsign, from.server])).rows;
-
-  return rows.map(row => ({
-    callsign: row.callsign,
-    current_sector: row.current_sector,
-    from,
-    to: { cid: row.to_cid, callsign: row.to_callsign, server: from.server }
-  }));
-}
-
-export async function clearFlightsWithoutCurrentSectorOwner(
-  client: pg.PoolClient,
-  from: ControllerIdentity
+  from: ControllerIdentity,
+  sectors?: string[]
 ): Promise<string[]> {
+  if (sectors && sectors.length === 0) return [];
   return (await client.query<{ callsign: string }>(
-    `UPDATE flight_data_records f
+    `UPDATE flight_data_records
         SET controlling_cid=NULL,controlling_callsign=NULL
-      WHERE f.controlling_cid=$1
-        AND f.controlling_callsign=$2
-        AND f.server=$3
-        AND NOT EXISTS (
-          SELECT 1
-            FROM sectors s
-            JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$3
-           WHERE s.name=f.current_sector
-             -- Not moved to a TMA sector's owner (see TMA_SECTOR_TYPES_SQL), so cleared instead.
-             AND COALESCE(s.type, '') NOT IN ${TMA_SECTOR_TYPES_SQL})
+      WHERE controlling_cid=$1
+        AND controlling_callsign IS NOT DISTINCT FROM $2
+        AND server=$3
+        AND ($4::text[] IS NULL OR current_sector = ANY($4::text[]))
       RETURNING callsign`,
-    [from.cid, from.callsign, from.server])).rows.map(row => row.callsign);
+    [from.cid, from.callsign, from.server, sectors ?? null])).rows.map(row => row.callsign);
 }

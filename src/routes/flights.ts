@@ -209,6 +209,61 @@ export async function flightRoutes(app: FastifyInstance): Promise<void> {
        FROM flight_data_records WHERE server=$1 ORDER BY callsign`, [request.controller.server])).rows.map(row => ({ ...row.data, callsign: row.callsign,
          controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
          current_sector: row.current_sector, last_seen_at: row.last_seen_at })));
+  // The controller who owns a flight cancelled its FDR in vatSys (Finish, or Cancel in the flight
+  // plan window): the record is deleted outright rather than left to age out. A pilot who simply
+  // disconnects is not this - the plugin never calls it then, and the record stays for
+  // FDR_RETAIN_MINUTES so a reconnect can be picked back up.
+  //
+  // Only the owner may: the controller the record names, or - when it names nobody - one who holds
+  // the sector it is in or its data authority sector. Anyone else is refused, so one client's
+  // cancel cannot remove a flight another controller is working.
+  app.post<{ Params: { callsign: string } }>("/fdr/:callsign/cancel", async (request, reply) => {
+    const identity = request.controller;
+    const callsign = request.params.callsign;
+    return transaction(async client => {
+      const existing = (await client.query(
+        `SELECT controlling_cid,controlling_callsign,current_sector,data FROM flight_data_records
+          WHERE callsign=$1 AND server=$2 FOR UPDATE`, [callsign, identity.server])).rows[0];
+      if (!existing) return reply.code(404).send({ message: "No record for this callsign." });
+
+      let owner = existing.controlling_cid === identity.cid;
+      if (!owner && existing.controlling_cid == null) {
+        const authoritySector = (existing.data as { authority_sector?: unknown } | undefined)?.authority_sector;
+        const sectors = [existing.current_sector, typeof authoritySector === "string" ? authoritySector : null]
+          .filter((name): name is string => !!name);
+        if (sectors.length > 0) {
+          owner = (await client.query(
+            `SELECT 1 FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
+              WHERE o.controller_cid=$1 AND o.server=$2 AND s.name = ANY($3) LIMIT 1`,
+            [identity.cid, identity.server, sectors])).rowCount! > 0;
+        }
+      }
+
+      if (!owner) {
+        await writeDiagnosticLog(client, identity, "ServerFDR", `Refused to delete ${callsign}; not the owning controller`, {
+          action: "fdr_cancel_refused",
+          fdr_callsign: callsign,
+          existing_authority: { cid: existing.controlling_cid ?? null, callsign: existing.controlling_callsign ?? null },
+          current_sector: existing.current_sector ?? null
+        });
+        return reply.code(403).send({ message: "Only the controller who owns this flight can cancel it." });
+      }
+
+      await client.query("DELETE FROM flight_data_records WHERE callsign=$1 AND server=$2", [callsign, identity.server]);
+      await writeDiagnosticLog(client, identity, "ServerFDR", `Deleted ${callsign} - cancelled by its controller`, {
+        action: "fdr_cancelled",
+        fdr_callsign: callsign,
+        previous: {
+          controlling_cid: existing.controlling_cid ?? null,
+          controlling_callsign: existing.controlling_callsign ?? null,
+          current_sector: existing.current_sector ?? null,
+          state: (existing.data as { state?: unknown } | undefined)?.state ?? null
+        }
+      });
+      return { callsign, deleted: true };
+    });
+  });
+
   // One flight's current record, for a client that has just gained jurisdiction over a tag (a
   // sector transfer) and needs the clearance data (CFL in particular) the previous controller
   // entered: MMI.AcceptJurisdiction moves who tracks the tag, not vatSys's local FDR fields.

@@ -416,6 +416,70 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     expect(await mine(primary)).toEqual(["GRP", "INA", "OUT"]);
   });
 
+  describe("tags when airspace changes hands without a handover", () => {
+    // Two controllers on the same position one after the other. GRP's own position is GRP + INA
+    // (what the plugin sends as position_sectors); OUT and FAR are extensions.
+    const before: Identity = { cid: 1000005, callsign: "XX-GRP_CTR" };
+    const after: Identity = { cid: 1000006, callsign: "XX-GRP_CTR" };
+    const push = (who: Identity, callsign: string, sector: string) => post("/fdr/batch", who, {
+      flights: [{ callsign, controlling_cid: who.cid, controlling_callsign: who.callsign, current_sector: sector, state: "STATE_CONTROLLED" }]
+    });
+    const holder = async (callsign: string) => (await get(`/fdr/${callsign}`, third)).json().controlling_cid;
+    const logOn = (who: Identity) => post("/sectors/resume", who, { position_sectors: ["GRP", "INA"] });
+
+    beforeEach(async () => {
+      await post("/sectors/GRP/claim", before);
+      await post("/sectors/FAR/claim", before);
+      await push(before, "QFA1", "INA");
+      await push(before, "QFA2", "FAR");
+    });
+
+    it("hands the position and its tags to the next controller of the callsign inside the window, and nothing they extended into", async () => {
+      await goQuiet(before, 30);
+      const resumed = (await logOn(after)).json();
+      expect(resumed.resumed.sort()).toEqual(["GRP", "INA"]);
+      expect(resumed.flights).toEqual(["QFA1"]);
+      expect(await mine(after)).toEqual(["GRP", "INA"]);
+      expect(await mine(before)).toEqual(["FAR", "OUT"]);
+      expect(await holder("QFA2")).toBe(before.cid);
+    });
+
+    it("does the same after a deliberate disconnect", async () => {
+      await post("/sectors/release-all", before);
+      expect(await holder("QFA1")).toBeNull();
+      const resumed = (await logOn(after)).json();
+      expect(resumed.resumed.sort()).toEqual(["GRP", "INA"]);
+      expect(resumed.flights).toEqual(["QFA1"]);
+      expect(await holder("QFA2")).toBeNull();
+    });
+
+    it("hands nothing over after the window: the position is claimed and its tags go to nobody", async () => {
+      await goQuiet(before, 180);
+      expect((await logOn(after)).json().resumed).toEqual([]);
+      expect((await post("/sectors/GRP/claim", after)).statusCode).toBe(201);
+      expect(await holder("QFA1")).toBeNull();
+      expect(await holder("QFA2")).toBe(before.cid);
+    });
+
+    it("leaves tags with nobody when another callsign claims a dropped controller's sector", async () => {
+      await goQuiet(before, 30);
+      expect((await post("/sectors/FAR/claim", third)).statusCode).toBe(201);
+      expect(await holder("QFA2")).toBeNull();
+      expect(await holder("QFA1")).toBe(before.cid);
+    });
+
+    it("leaves tags with nobody when the sweep gives the sectors to the group above", async () => {
+      await db.query("TRUNCATE sector_ownerships, flight_data_records");
+      await post("/sectors/GRP/claim", primary, { exclude: ["INA"] });
+      await post("/sectors/INA/claim", extender);
+      await push(extender, "QFA1", "INA");
+      await goQuiet(extender);
+      await runMaintenance();
+      expect(await mine(primary)).toEqual(["GRP", "INA", "OUT"]);
+      expect(await holder("QFA1")).toBeNull();
+    });
+  });
+
   // PUT /vatsim/atis/:icao is a public route: the vatSys ATIS plugin sends no pluginAuth identity,
   // so these requests are built by hand rather than with post() and get().
   describe("the ATIS a vatSys ATIS plugin publishes", () => {

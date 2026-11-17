@@ -6,13 +6,7 @@ import { config } from "../config.js";
 import { writeDiagnosticLog } from "../diagnostics.js";
 import { pool, transaction } from "../db.js";
 import { isWithinStartupGrace } from "../presence.js";
-import {
-  clearFlightsWithoutCurrentSectorOwner,
-  reassignFreedSectors,
-  TMA_SECTOR_TYPES_SQL,
-  transferFlightsInSectorsToOwner,
-  transferFlightsToCurrentSectorOwners
-} from "../grouping.js";
+import { clearFlightsOf, reassignFreedSectors, TMA_SECTOR_TYPES_SQL } from "../grouping.js";
 import type { ControllerIdentity } from "../types.js";
 
 type SectorRow = {
@@ -55,6 +49,11 @@ const mutationSchema = z.object({
 const claimSchema = z.object({
   exclude: sectorNames.default([]),
   primary_group: sectorNames.optional()
+});
+
+// The logon position's own sectors, for handOverPosition.
+const resumeSchema = z.object({
+  position_sectors: sectorNames.default([])
 });
 
 // Validated here so a malformed id is answered as a client error, not as a 500 from a type error
@@ -218,10 +217,24 @@ async function claimGroup(
        controller_cid=excluded.controller_cid, controller_callsign=excluded.controller_callsign,
        last_seen_online_at=now(), updated_at=now()`, [row.id, identity.cid, identity.callsign, identity.server]);
   }
-  const transferredFlights = await transferFlightsInSectorsToOwner(
-    client,
-    takeable.map(row => ({ sector: row.name, cid: row.controller_cid, callsign: row.controller_callsign })),
-    identity);
+  // A previous owner here is never present (that is a conflict, above): they dropped, and their
+  // tags in what was just taken go to nobody rather than to the claimer - see clearFlightsOf. A
+  // controller taking over the position under the same callsign gets them, but through
+  // handOverPosition in the resume, before any claim of theirs.
+  const clearedFlights: string[] = [];
+  const byPreviousOwner = new Map<string, { identity: ControllerIdentity; sectors: string[] }>();
+  for (const previous of previousOwners) {
+    const key = `${previous.cid}|${previous.callsign ?? ""}`;
+    const entry = byPreviousOwner.get(key) ?? {
+      identity: { cid: previous.cid!, callsign: previous.callsign ?? "", server: identity.server } as ControllerIdentity,
+      sectors: []
+    };
+    entry.sectors.push(previous.sector);
+    byPreviousOwner.set(key, entry);
+  }
+  for (const { identity: previous, sectors } of byPreviousOwner.values()) {
+    clearedFlights.push(...await clearFlightsOf(client, previous, sectors));
+  }
 
   // Requests this claim has made meaningless. One still pending against a sector that just changed
   // hands names a target who no longer owns it: nobody can accept it (transferRequest checks both)
@@ -244,7 +257,7 @@ async function claimGroup(
       conflicts,
       exclusions,
       previous_owners: previousOwners,
-      fdr_authority_transferred: transferredFlights,
+      fdr_authority_cleared: clearedFlights,
       all_or_nothing: allOrNothing
     });
   }
@@ -361,6 +374,106 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
   });
 
   return request.name;
+}
+
+type PositionHandover = { from: { cid: number; callsign: string } | null; sectors: string[]; flights: string[] };
+
+// A controller change on a position: a different controller connecting under the callsign another
+// left within POSITION_HANDOVER_MINUTES takes over that position's sectors the previous controller
+// still held, with the previous controller's tags inside them, as if the previous controller had handed them over. Nothing the
+// previous controller was extending into comes with it: those sectors stay theirs until the
+// disconnect sweep, and their tags then go to nobody (clearFlightsOf). After the window the
+// position's sectors are claimed like any other sector of an absent owner, and their tags go to
+// nobody too.
+//
+// The window is timed from the previous controller's own last contact: last_seen_online_at if
+// they dropped (still holding sectors), or their release-all (the resume snapshot it wrote). Other
+// controllers reporting the previous controller's flights meanwhile (FdrSync's stand-in) keep each
+// flight's current_sector up to date, which decides whether it is still inside the position, but
+// do not extend the window.
+//
+// APP and DEP tags come along too. They never move with a single sector (TMA_SECTOR_TYPES_SQL),
+// but here the whole position changes hands.
+//
+// Run from POST /sectors/resume, which the plugin finishes before it claims anything, so the
+// takeover is never preempted by the logon claim - which, on an absent owner's sector, would leave
+// the tags with nobody.
+async function handOverPosition(
+  client: pg.PoolClient,
+  identity: ControllerIdentity,
+  positionSectorNames: string[]
+): Promise<PositionHandover> {
+  const none: PositionHandover = { from: null, sectors: [], flights: [] };
+  // Sent by the plugin (PrimaryPosition.DefaultSectorsForCurrentSession): a position is defined
+  // by the profile's Positions.xml, not by responsible_sectors, which also lists airspace a sector
+  // only covers. An older plugin sends none, and nothing is handed over.
+  if (positionSectorNames.length === 0) return none;
+  // Just after a restart every last_seen_online_at looks old, so none of them can be timed.
+  if (isWithinStartupGrace(config.PRESENCE_TIMEOUT_SECONDS * 1000)) return none;
+  const positionSectors = new Set(positionSectorNames);
+
+  // The previous controller dropped: their rows are still there, no longer heartbeated. Past the
+  // presence timeout, so a controller who is still connected is never taken over.
+  const dropped = (await client.query<{ sector_id: string; name: string; controller_cid: number; controller_callsign: string }>(
+    `SELECT o.sector_id,s.name,o.controller_cid,o.controller_callsign
+       FROM sector_ownerships o JOIN sectors s ON s.id=o.sector_id
+      WHERE o.server=$1 AND s.name=ANY($2::text[])
+        AND o.controller_cid<>$3 AND upper(o.controller_callsign)=upper($4)
+        AND o.last_seen_online_at < now()-($5*interval '1 second')
+        AND o.last_seen_online_at >= now()-($6*interval '1 minute')
+      ORDER BY o.last_seen_online_at DESC`,
+    [identity.server, [...positionSectors], identity.cid, identity.callsign,
+     config.PRESENCE_TIMEOUT_SECONDS, config.POSITION_HANDOVER_MINUTES])).rows;
+  if (dropped.length > 0) {
+    const from = { cid: Number(dropped[0].controller_cid), callsign: dropped[0].controller_callsign };
+    const rows = dropped.filter(row => Number(row.controller_cid) === from.cid);
+    const ids = rows.map(row => row.sector_id);
+    const names = rows.map(row => row.name);
+    await client.query(
+      `UPDATE sector_ownerships SET controller_cid=$1,controller_callsign=$2,last_seen_online_at=now(),updated_at=now()
+        WHERE sector_id=ANY($3) AND server=$4`,
+      [identity.cid, identity.callsign, ids, identity.server]);
+    // Requests to the previous controller for these sectors can no longer be accepted by anyone,
+    // and this controller's own for them are moot.
+    await client.query(
+      "DELETE FROM sector_requests WHERE sector_id=ANY($1) AND server=$2 AND (target_cid=$3 OR requesting_cid=$4)",
+      [ids, identity.server, from.cid, identity.cid]);
+    const flights = (await client.query<{ callsign: string }>(
+      `UPDATE flight_data_records SET controlling_cid=$1,controlling_callsign=$2
+        WHERE server=$3 AND controlling_cid=$4 AND controlling_callsign IS NOT DISTINCT FROM $5
+          AND current_sector=ANY($6::text[])
+        RETURNING callsign`,
+      [identity.cid, identity.callsign, identity.server, from.cid, from.callsign, names])).rows.map(row => row.callsign);
+    return { from, sectors: names, flights };
+  }
+
+  // The previous controller disconnected: release-all freed their sectors, left their tags with
+  // nobody, and listed both in their resume snapshot. Only what is still free and still nobody's
+  // is taken - a sector the group above was given, or a tag someone has picked up, stays with them.
+  const snapshot = (await client.query<{ controller_cid: number; controller_callsign: string; sectors: string[]; flights: string[] }>(
+    `SELECT controller_cid,controller_callsign,sectors,flights FROM resume_snapshots
+      WHERE server=$1 AND controller_cid<>$2 AND upper(controller_callsign)=upper($3)
+        AND created_at >= now()-($4*interval '1 minute')
+      ORDER BY created_at DESC LIMIT 1`,
+    [identity.server, identity.cid, identity.callsign, config.POSITION_HANDOVER_MINUTES])).rows[0];
+  if (!snapshot) return none;
+  const taken: string[] = [];
+  for (const name of (snapshot.sectors ?? []).filter(name => positionSectors.has(name))) {
+    const inserted = await client.query(
+      `INSERT INTO sector_ownerships (sector_id,controller_cid,controller_callsign,last_seen_online_at,server)
+       SELECT id,$2::integer,$3::text,now(),$4::text FROM sectors WHERE name=$1
+       ON CONFLICT (sector_id,server) DO NOTHING RETURNING sector_id`,
+      [name, identity.cid, identity.callsign, identity.server]);
+    if (inserted.rowCount) taken.push(name);
+  }
+  if (taken.length === 0) return none;
+  const flights = (await client.query<{ callsign: string }>(
+    `UPDATE flight_data_records SET controlling_cid=$1,controlling_callsign=$2
+      WHERE server=$3 AND callsign=ANY($4::text[]) AND controlling_cid IS NULL
+        AND current_sector=ANY($5::text[])
+      RETURNING callsign`,
+    [identity.cid, identity.callsign, identity.server, snapshot.flights ?? [], taken])).rows.map(row => row.callsign);
+  return { from: { cid: Number(snapshot.controller_cid), callsign: snapshot.controller_callsign }, sectors: taken, flights };
 }
 
 export async function sectorRoutes(app: FastifyInstance): Promise<void> {
@@ -480,13 +593,13 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     // straight back to anyone who also holds its parent, making it impossible to free one by hand.
     await reassignFreedSectors(client, freed, request.controller.server);
     await client.query("DELETE FROM sector_requests WHERE (requesting_cid=$1 OR target_cid=$1) AND server=$2", [request.controller.cid, request.controller.server]);
-    const transferredFlights = await transferFlightsToCurrentSectorOwners(client, request.controller);
-    const clearedFlights = await clearFlightsWithoutCurrentSectorOwner(client, request.controller);
+    // To nobody, not to whoever the sectors were just reassigned to (see clearFlightsOf). The
+    // snapshot above still lists them, for this controller's own resume and for handOverPosition.
+    const clearedFlights = await clearFlightsOf(client, request.controller);
     await writeDiagnosticLog(client, request.controller, "ServerSector", "Released all sectors", {
       action: "release_all",
       sectors,
       sector_ids: freed,
-      fdr_authority_transferred: transferredFlights,
       fdr_authority_cleared: clearedFlights
     });
     });
@@ -495,6 +608,9 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
 
   app.post("/sectors/resume", async request => transaction(async client => {
     await lockMutations(client, request.controller.server);
+    // Optional, and never a reason to refuse a resume: a malformed list only skips the handover.
+    const parsedBody = resumeSchema.safeParse(request.body ?? {});
+    const positionSectors = parsedBody.success ? parsedBody.data.position_sectors : [];
 
     // Closes a session this controller left under a different callsign. Ownership is decided by cid
     // alone (claimGroup, releaseGroup, sync's `mine`) but kept alive and released by cid and
@@ -513,9 +629,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       const previousCallsigns = [...new Set(superseded.map(row => row.controller_callsign))];
       await reassignFreedSectors(client, superseded.map(row => row.sector_id), request.controller.server);
       for (const callsign of previousCallsigns) {
-        const previous = { cid: request.controller.cid, callsign, server: request.controller.server };
-        await transferFlightsToCurrentSectorOwners(client, previous);
-        await clearFlightsWithoutCurrentSectorOwner(client, previous);
+        await clearFlightsOf(client, { cid: request.controller.cid, callsign, server: request.controller.server } as ControllerIdentity);
       }
       await writeDiagnosticLog(client, request.controller, "ServerSector", "Closed a previous session under another callsign", {
         action: "resume_superseded_session",
@@ -553,6 +667,12 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
         [request.controller.cid, request.controller.callsign, snapshot.flights, request.controller.server]);
     }
 
+    // After this controller's own resume, so their own snapshot wins over a predecessor's. The
+    // sectors handed over are reported as resumed, which is what puts them into vatSys, and the
+    // tags with them are picked up by the query below like the controller's own.
+    const handover = await handOverPosition(client, request.controller, positionSectors);
+    resumed.push(...handover.sectors.filter(name => !resumed.includes(name)));
+
     // Outside the snapshot branch because it answers both kinds of reconnect. An ungraceful
     // disconnect wrote no snapshot and gave nothing up, so there is nothing to restore - but vatSys
     // comes back with no jurisdiction, and the client must be told which tags are already its own
@@ -572,6 +692,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       action: "resume",
       had_snapshot: Boolean(snapshot),
       resumed,
+      position_handover: handover.from ? { from: handover.from, sectors: handover.sectors, flights: handover.flights } : null,
       restored_flights: restoredFlights
     });
 

@@ -2,11 +2,7 @@ import { config } from "./config.js";
 import { writeDiagnosticLog } from "./diagnostics.js";
 import { transaction } from "./db.js";
 import { publish } from "./events.js";
-import {
-  clearFlightsWithoutCurrentSectorOwner,
-  reassignFreedSectors,
-  transferFlightsToCurrentSectorOwners
-} from "./grouping.js";
+import { clearFlightsOf, reassignFreedSectors } from "./grouping.js";
 import { isWithinStartupGrace } from "./presence.js";
 import { SERVERS, type Server } from "./auth.js";
 import type { ControllerIdentity } from "./types.js";
@@ -67,15 +63,15 @@ export async function runMaintenance(): Promise<void> {
     for (const [server, ids] of freedByServer) {
       reassigned.push(...await reassignFreedSectors(client, ids, server));
     }
+    // Their tags go to nobody, not to whoever their sectors were just reassigned to - see
+    // clearFlightsOf.
     for (const owner of droppedOwners) {
-      const transferredFlights = await transferFlightsToCurrentSectorOwners(client, owner);
-      const clearedFlights = await clearFlightsWithoutCurrentSectorOwner(client, owner);
+      const clearedFlights = await clearFlightsOf(client, owner);
       await writeDiagnosticLog(client, owner, "ServerSector", "Disconnected controller ownership reassigned", {
         action: "disconnect_reassign",
         sectors: owner.released_sectors,
         sector_ids: owner.released_sector_ids,
         reassigned,
-        fdr_authority_transferred: transferredFlights,
         fdr_authority_cleared: clearedFlights
       });
     }
