@@ -3,6 +3,7 @@ import { buildApp } from "./app.js";
 import { config } from "./config.js";
 import { pool } from "./db.js";
 import { closeAllClients, startEventListener, stopEventListener } from "./events.js";
+import { startLiveStats } from "./live-stats.js";
 import { runMaintenance } from "./maintenance.js";
 
 const app = await buildApp();
@@ -15,6 +16,9 @@ const maintenanceTimer = setInterval(() => void runMaintenance().catch(error => 
 }), 60_000);
 maintenanceTimer.unref();
 discord.start();
+// Edits the live network stats into their Discord channel - a no-op unless DISCORD_LIVE_WEBHOOK_URL
+// is set.
+const liveStatsTimer = startLiveStats(app.log);
 
 let shuttingDown = false;
 const shutdown = async () => {
@@ -24,6 +28,7 @@ const shutdown = async () => {
   // exit is ours rather than a SIGKILL.
   setTimeout(() => process.exit(0), 8_000).unref();
   clearInterval(maintenanceTimer);
+  if (liveStatsTimer) clearInterval(liveStatsTimer);
   // Open event streams first: app.close() waits for in-flight responses, and those never end on
   // their own.
   closeAllClients();

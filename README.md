@@ -124,6 +124,9 @@ an invalid value stops the process rather than being guessed at.
 | `PLUGIN_RELEASE_MAX_VERSION` | unset | When set, no plugin release newer than this is offered |
 | `DISCORD_WEBHOOK_URL` | unset | When set, errors are relayed to this Discord webhook - see [Error reporting](#error-reporting) |
 | `DISCORD_LOG_CATEGORIES` | `Error` | Comma-separated plugin log categories relayed to Discord |
+| `DISCORD_LIVE_WEBHOOK_URL` | unset | When set, live network stats (online controllers, tags by FIR) are kept up to date in this webhook's channel - see `src/live-stats.ts` |
+| `DISCORD_LIVE_MESSAGE_IDS` | unset | Messages already in that channel to edit instead of posting new ones, as `controllers=<id>,fir_tags=<id>`. Only read until the ids are recorded in the database |
+| `LIVE_STATS_INTERVAL_SECONDS` | `60` | How often the live stats are refreshed (30 at least) |
 
 ## API reference
 

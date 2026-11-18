@@ -60,7 +60,18 @@ const schema = z.object({
   // Plugin log categories relayed to Discord, comma-separated. "Error" is what the plugin files
   // everything it shows in the vatSys Errors window under.
   DISCORD_LOG_CATEGORIES: z.string().default("Error")
-    .transform(value => value.split(",").map(category => category.trim()).filter(Boolean))
+    .transform(value => value.split(",").map(category => category.trim()).filter(Boolean)),
+  // When set, live network stats are kept up to date in this webhook's channel (live-stats.ts): a
+  // handful of embeds, edited in place. A credential, like DISCORD_WEBHOOK_URL.
+  DISCORD_LIVE_WEBHOOK_URL: z.preprocess(value => value === "" ? undefined : value,
+    z.string().trim().regex(DISCORD_WEBHOOK_PATTERN, "must be a Discord webhook URL").optional()),
+  // Messages already in the channel for embeds this database has no record of, as
+  // "key=messageId,key=messageId" - adopted on the first run instead of posting new ones.
+  DISCORD_LIVE_MESSAGE_IDS: z.string().default("")
+    .transform(value => new Map(value.split(",").map(pair => pair.trim().split("="))
+      .filter((pair): pair is [string, string] => pair.length === 2 && /^\d+$/.test(pair[1] ?? ""))
+      .map(([key, id]) => [key.trim(), id] as const))),
+  LIVE_STATS_INTERVAL_SECONDS: z.coerce.number().int().min(30).default(60)
 });
 
 export const config = schema.parse(process.env);
