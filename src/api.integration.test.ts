@@ -617,15 +617,27 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
         .toEqual([["XX-FAR_CTR", false], ["XX-GRP_CTR", true]]);
     });
 
-    it("goes only to the callsign it is addressed to", async () => {
-      await send({ title: "For you", body: "Only GRP", callsign: "xx-grp_ctr" });
-      expect(await waiting(primary)).toHaveLength(1);
+    it("goes only to the callsigns it is addressed to, and needs no title", async () => {
+      expect((await send({ body: "Only GRP and OTH", callsigns: ["xx-grp_ctr", "XX-OTH_CTR"] })).statusCode).toBe(201);
+      expect(await waiting(primary)).toEqual([expect.objectContaining({ title: "" })]);
+      expect(await waiting(third)).toHaveLength(1);
       expect(await waiting(extender)).toEqual([]);
     });
 
+    it("lists the controllers connected now, for the console to address", async () => {
+      await get("/messages", primary);
+      await get("/messages", { ...third, server: "sb1" });
+      const clients = async (server: string) => (await app.inject({
+        method: "GET", url: `/api/v1/admin/clients?server=${server}`, headers: { authorization: `Bearer ${consoleToken}` }
+      })).json() as Array<{ callsign: string; server: string }>;
+      expect((await clients("live")).map(c => c.callsign)).toContain("XX-GRP_CTR");
+      expect((await clients("live")).map(c => c.callsign)).not.toContain("XX-OTH_CTR");
+      expect((await clients("all")).map(c => c.callsign)).toEqual(expect.arrayContaining(["XX-GRP_CTR", "XX-OTH_CTR"]));
+    });
+
     it("takes a reply only when the sender asked for one", async () => {
-      const closed = (await send({ title: "FYI", body: "No answer needed" })).json().id;
-      const open = (await send({ title: "Question", body: "Seen this?", allow_reply: true })).json().id;
+      const closed = (await send({ title: "FYI", body: "No answer needed", allow_reply: false })).json().id;
+      const open = (await send({ title: "Question", body: "Seen this?" })).json().id;
       expect((await post(`/messages/${closed}/reply`, primary, { body: "ok" })).statusCode).toBe(403);
       expect((await post(`/messages/${open}/reply`, primary, { body: "Yes, at 0630" })).statusCode).toBe(201);
 

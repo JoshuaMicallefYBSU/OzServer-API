@@ -2,7 +2,7 @@ import { discord, reportServerError } from "./alerts.js";
 import { buildApp } from "./app.js";
 import { config } from "./config.js";
 import { pool } from "./db.js";
-import { closeAllClients, startEventListener, stopEventListener } from "./events.js";
+import { announceRestart, closeAllClients, startEventListener, stopEventListener } from "./events.js";
 import { startLiveStats } from "./live-stats.js";
 import { runMaintenance } from "./maintenance.js";
 
@@ -29,8 +29,10 @@ const shutdown = async () => {
   setTimeout(() => process.exit(0), 8_000).unref();
   clearInterval(maintenanceTimer);
   if (liveStatsTimer) clearInterval(liveStatsTimer);
-  // Open event streams first: app.close() waits for in-flight responses, and those never end on
-  // their own.
+  // Plugins are told first, so they hold back connection errors while this process is down
+  // (announceRestart). Then the open event streams are closed: app.close() waits for in-flight
+  // responses, and those never end on their own.
+  announceRestart();
   closeAllClients();
   await stopEventListener();
   await app.close();

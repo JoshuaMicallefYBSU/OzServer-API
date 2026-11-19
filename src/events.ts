@@ -51,6 +51,22 @@ export function closeAllClients(): void {
   clients.clear();
 }
 
+// Tells every open stream, on every server, that this process is shutting down to restart - every
+// deploy is one. The plugin holds back its "can't reach OzServer" errors until the API answers again
+// (ApiOutage), rather than putting one in front of the controller for each call that fails meanwhile.
+// Written straight to this process's own streams, not through NOTIFY: it is about this process.
+// Must run before closeAllClients.
+export function announceRestart(): void {
+  const frame = `event: restarting\ndata: ${JSON.stringify({ type: "restarting" })}\n\n`;
+  for (const client of clients) {
+    try {
+      client.write(frame);
+    } catch {
+      // Already gone.
+    }
+  }
+}
+
 function fanOut(event: OzEvent): void {
   const frame = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
   for (const client of clients) {
