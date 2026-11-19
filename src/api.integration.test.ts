@@ -42,6 +42,7 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
   const primary: Identity = { cid: 1000001, callsign: "XX-GRP_CTR" };
   const extender: Identity = { cid: 1000002, callsign: "XX-FAR_CTR" };
   const third: Identity = { cid: 1000003, callsign: "XX-OTH_CTR" };
+  const consoleToken = "test-console-token-0123456789";
 
   beforeAll(async () => {
     process.env.DATABASE_URL = databaseUrl;
@@ -50,6 +51,7 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     // slow CI runner.
     process.env.PRESENCE_TIMEOUT_SECONDS = "2";
     process.env.DISCONNECT_GRACE_MINUTES = "0.05";
+    process.env.CONSOLE_TOKEN = consoleToken;
 
     db = new pg.Client({ connectionString: databaseUrl });
     await db.connect();
@@ -578,6 +580,67 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       await put("YSSY");
       expect((await app.inject({ method: "DELETE", url: "/api/v1/vatsim/atis/YSSY" })).statusCode).toBe(404);
       expect((await published("YSSY")).json()).toMatchObject({ icao: "YSSY" });
+    });
+  });
+
+  describe("console messages", () => {
+    const send = (payload: Record<string, unknown>, token: string | null = consoleToken) => app.inject({
+      method: "POST", url: "/api/v1/admin/messages", payload: { sent_by: "Dev", ...payload },
+      headers: token ? { authorization: `Bearer ${token}` } : {}
+    });
+    const sent = async () => (await app.inject({
+      method: "GET", url: "/api/v1/admin/messages", headers: { authorization: `Bearer ${consoleToken}` }
+    })).json() as Array<{ id: number; receipts: Array<{ callsign: string; read_at: string | null }>; replies: Array<{ callsign: string; body: string }> }>;
+    const waiting = async (who: Identity) => (await get("/messages", who)).json() as Array<{ id: number; title: string }>;
+
+    beforeEach(async () => {
+      await db.query("TRUNCATE developer_messages CASCADE");
+    });
+
+    it("is closed to anyone without the console token", async () => {
+      expect((await send({ title: "Hi", body: "There" }, null)).statusCode).toBe(401);
+      expect((await send({ title: "Hi", body: "There" }, "wrong-token-wrong-token-wrong")).statusCode).toBe(401);
+      expect((await app.inject({ method: "GET", url: "/api/v1/admin/messages" })).statusCode).toBe(401);
+    });
+
+    it("reaches everyone a broadcast is for, once each, and records who read it", async () => {
+      const { id } = (await send({ title: "Notice", body: "Restart vatSys", server: "live" })).json();
+      expect((await waiting(primary)).map(m => m.id)).toEqual([id]);
+      expect((await waiting({ ...third, server: "sb1" }))).toEqual([]);
+
+      expect((await post(`/messages/${id}/read`, primary)).statusCode).toBe(204);
+      expect(await waiting(primary)).toEqual([]);
+      expect((await waiting(extender)).map(m => m.id)).toEqual([id]);
+
+      const [message] = await sent();
+      expect(message?.receipts.map(r => [r.callsign, r.read_at !== null]).sort())
+        .toEqual([["XX-FAR_CTR", false], ["XX-GRP_CTR", true]]);
+    });
+
+    it("goes only to the callsign it is addressed to", async () => {
+      await send({ title: "For you", body: "Only GRP", callsign: "xx-grp_ctr" });
+      expect(await waiting(primary)).toHaveLength(1);
+      expect(await waiting(extender)).toEqual([]);
+    });
+
+    it("takes a reply only when the sender asked for one", async () => {
+      const closed = (await send({ title: "FYI", body: "No answer needed" })).json().id;
+      const open = (await send({ title: "Question", body: "Seen this?", allow_reply: true })).json().id;
+      expect((await post(`/messages/${closed}/reply`, primary, { body: "ok" })).statusCode).toBe(403);
+      expect((await post(`/messages/${open}/reply`, primary, { body: "Yes, at 0630" })).statusCode).toBe(201);
+
+      const question = (await sent()).find(m => m.id === open);
+      expect(question?.replies).toMatchObject([{ callsign: "XX-GRP_CTR", body: "Yes, at 0630" }]);
+      // Answering it is reading it.
+      expect(await waiting(primary)).toEqual([expect.objectContaining({ id: closed })]);
+    });
+
+    it("stops reaching anyone once withdrawn", async () => {
+      const { id } = (await send({ title: "Oops", body: "Wrong channel" })).json();
+      expect((await app.inject({
+        method: "POST", url: `/api/v1/admin/messages/${id}/withdraw`, headers: { authorization: `Bearer ${consoleToken}` }
+      })).statusCode).toBe(204);
+      expect(await waiting(primary)).toEqual([]);
     });
   });
 

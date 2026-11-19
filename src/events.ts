@@ -7,7 +7,9 @@ import { SERVERS, type Server } from "./auth.js";
 // already uses. That keeps this channel free of anything sensitive - so it needs no identity, and
 // the browser map (whose EventSource cannot set request headers) can share it - and duplicates no
 // DTO here. `server` is carried only to route an event to the right subscribers.
-const EVENT_TYPES = ["sectors", "fdr", "atis"] as const;
+// "messages": a console message was sent or withdrawn (routes/messages.ts). Subscribers that do not
+// know a name ignore it - the map does, and so does a plugin older than the message system.
+const EVENT_TYPES = ["sectors", "fdr", "atis", "messages"] as const;
 export type OzEvent = { type: typeof EVENT_TYPES[number]; server: Server };
 
 const CHANNEL = "ozserver_events";

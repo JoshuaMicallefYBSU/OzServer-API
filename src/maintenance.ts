@@ -89,6 +89,9 @@ export async function runMaintenance(): Promise<void> {
     // clock runs ahead would otherwise write rows this never removes.
     await client.query("DELETE FROM client_logs WHERE created_at < now()-interval '1 day'");
     await client.query("DELETE FROM resume_snapshots WHERE created_at < now()-($1*interval '1 minute')", [config.RESUME_WINDOW_MINUTES]);
+    // Console messages, with their receipts and replies (ON DELETE CASCADE), once they have been
+    // expired for MESSAGE_RETAIN_DAYS - long enough to read the answers afterwards.
+    await client.query("DELETE FROM developer_messages WHERE expires_at < now()-($1*interval '1 day')", [config.MESSAGE_RETAIN_DAYS]);
     return {
       sectors: [...new Set(droppedOwners.map(owner => owner.server))],
       atis: expiredAtis > 0

@@ -120,6 +120,8 @@ an invalid value stops the process rather than being guessed at.
 | `MAX_EVENT_SUBSCRIBERS` | `500` | Event streams held open at once |
 | `CLIENT_LOGS_TOKEN` | unset | When set (16+ characters), required to read `GET /client-logs` |
 | `ATIS_TOKEN` | unset | When set (16+ characters), required to publish with `PUT /vatsim/atis/:icao` |
+| `CONSOLE_TOKEN` | unset | Required (24+ characters, as a bearer token) by `/admin/messages`, which the website's /console sends developer messages through. Unset turns those routes off |
+| `MESSAGE_RETAIN_DAYS` | `14` | Days a console message, with its receipts and replies, is kept after it expires |
 | `PLUGIN_RELEASE_REPO` | `JoshuaMicallefYBSU/OzServer-Plugin` | Repository whose releases are offered to the plugin's updater |
 | `PLUGIN_RELEASE_MAX_VERSION` | unset | When set, no plugin release newer than this is offered |
 | `DISCORD_WEBHOOK_URL` | unset | When set, errors are relayed to this Discord webhook - see [Error reporting](#error-reporting) |
@@ -159,6 +161,8 @@ answers `401`.
 | `GET /fdr/:callsign` | One flight record in full |
 | `POST /atis` | Record the ATIS an OzServer controller's own vatSys is running |
 | `POST /client-logs` | Forward plugin log lines (up to 200 per batch) |
+| `GET /messages` | Console messages waiting for this controller (marks them delivered) |
+| `POST /messages/:id/read` · `POST /messages/:id/reply` | Mark a console message read, or answer it (when it takes replies) |
 
 ### Public endpoints
 
@@ -180,6 +184,7 @@ answers `401`.
 | `GET /map/traffic` · `GET /map/pilots` | Network traffic inside OzServer's airspace, from the VATSIM datafeed |
 | `GET /afv/transceivers` | VATSIM's AFV transceiver feed, cached |
 | `GET /client-logs` | Forwarded plugin logs for diagnostics; token-protected when `CLIENT_LOGS_TOKEN` is set |
+| `GET /admin/messages` · `POST /admin/messages` · `POST /admin/messages/:id/withdraw` | Console messages: list with receipts and replies, send, withdraw. `CONSOLE_TOKEN` required; called by the website's server, never a browser |
 | `GET /health` (not under `/api/v1`) | Liveness and database connectivity |
 
 ### Events

@@ -10,6 +10,7 @@ import { protectedAtisRoutes, publicAtisRoutes } from "./routes/atis.js";
 import { flightRoutes } from "./routes/flights.js";
 import { eventRoutes } from "./routes/events.js";
 import { mapRoutes } from "./routes/map.js";
+import { adminMessageRoutes, protectedMessageRoutes } from "./routes/messages.js";
 import { pluginRoutes } from "./routes/plugin.js";
 import { serverRoutes } from "./routes/servers.js";
 import { sectorRoutes } from "./routes/sectors.js";
@@ -65,6 +66,9 @@ export async function buildApp() {
     await serverRoutes(publicApi);
     await pluginRoutes(publicApi);
     await publicClientLogRoutes(publicApi);
+    // Token-gated (CONSOLE_TOKEN), not plugin-authenticated: called by the website's server for the
+    // /console, which has no controller identity.
+    await adminMessageRoutes(publicApi);
   }, { prefix: "/api/v1" });
   await app.register(async pluginApi => {
     pluginApi.addHook("preHandler", pluginAuth);
@@ -123,6 +127,7 @@ export async function buildApp() {
     await flightRoutes(pluginApi);
     await protectedAtisRoutes(pluginApi);
     await protectedClientLogRoutes(pluginApi);
+    await protectedMessageRoutes(pluginApi);
   }, { prefix: "/api/v1" });
   app.setErrorHandler((error: FastifyError, request, reply) => {
     app.log.error(error);

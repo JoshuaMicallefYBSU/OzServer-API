@@ -44,6 +44,14 @@ const schema = z.object({
   // the ATIS plugin must be given the same value. Unset leaves publishing an ATIS open to anyone
   // who can reach this API. At least 16 characters.
   ATIS_TOKEN: z.string().trim().min(16).optional(),
+  // Required (Authorization: Bearer) by the /admin/messages routes the website's /console sends
+  // messages to controllers through (routes/messages.ts). Unset turns those routes off entirely:
+  // they put text into every controller's vatSys, so they are never open. At least 24 characters.
+  // The website holds the same value server-side (OZSERVER_CONSOLE_TOKEN); it never reaches a browser.
+  CONSOLE_TOKEN: z.string().trim().min(24).optional(),
+  // Days a message is kept after it expires, with its receipts and replies, so the console can
+  // still show who read and answered it.
+  MESSAGE_RETAIN_DAYS: z.coerce.number().positive().default(14),
   // The GitHub repository (owner/name) whose releases GET /plugin/release offers to the plugin's
   // updater. The plugin only downloads from its own repository, so pointing this elsewhere stops
   // updates being offered rather than redirecting them.
