@@ -8,9 +8,8 @@ CREATE TABLE IF NOT EXISTS developer_messages (
   body text NOT NULL,
   -- Null: every server.
   server text,
-  -- Null: everyone on the server(s), including anyone who connects before it expires. Otherwise
-  -- the callsigns it was sent to (upper-case), and nobody else.
-  target_callsigns text[],
+  -- Null: everyone on the server(s). Otherwise the one callsign it is for.
+  target_callsign text,
   allow_reply boolean NOT NULL DEFAULT false,
   -- Who sent it, as typed into the console - shown to the controller.
   sent_by text NOT NULL,
