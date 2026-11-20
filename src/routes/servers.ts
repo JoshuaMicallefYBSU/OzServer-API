@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { SERVERS } from "../auth.js";
+import { REGIONS } from "../regions.js";
 
 // The labels for the servers in the allowlist in auth.ts, served so the website's dropdown never
 // hardcodes its own copy. Adding a server is a one-line change here and one there, not a migration.
@@ -11,4 +12,6 @@ const LABELS: Record<string, string> = {
 
 export async function serverRoutes(app: FastifyInstance): Promise<void> {
   app.get("/servers", async () => SERVERS.map(value => ({ value, label: LABELS[value] ?? value })));
+  // The airspace regions, for the map's region toggles - see regions.ts.
+  app.get("/regions", async () => REGIONS);
 }

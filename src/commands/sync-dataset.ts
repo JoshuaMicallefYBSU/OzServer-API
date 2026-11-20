@@ -1,9 +1,14 @@
 import { XMLParser } from "fast-xml-parser";
 import { pool, transaction } from "../db.js";
+import type { Region } from "../regions.js";
 
-const datasets = [
-  "https://raw.githubusercontent.com/vatSys/australia-dataset/master/",
-  "https://raw.githubusercontent.com/vatSys/pacific-dataset/master/"
+// Each dataset and the region (map banner - see regions.ts) its sectors and positions belong to.
+// Australia and Pacific share one: they are one airspace, split across two vatSys profiles.
+type Profile = "AUS" | "PAC" | "MEX";
+const datasets: Array<{ profile: Profile; base: string; region: Region }> = [
+  { profile: "AUS", base: "https://raw.githubusercontent.com/vatSys/australia-dataset/master/", region: "australia" },
+  { profile: "PAC", base: "https://raw.githubusercontent.com/vatSys/pacific-dataset/master/", region: "australia" },
+  { profile: "MEX", base: "https://raw.githubusercontent.com/vatSys/mexico-dataset/master/", region: "mexico" }
 ];
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", trimValues: true });
 const list = <T>(value: T | T[] | undefined): T[] => value === undefined ? [] : Array.isArray(value) ? value : [value];
@@ -28,7 +33,9 @@ function coordinate(raw: string): { lat: number; lon: number } {
 async function xml(base: string, file: string): Promise<Record<string, any>> {
   const response = await fetch(base + file, { signal: AbortSignal.timeout(30_000) });
   if (!response.ok) throw new Error(`Dataset request failed: ${response.status} ${base}${file}`);
-  return parser.parse(await response.text());
+  // Comments are dropped first: the Mexico dataset has them in the middle of boundary coordinate
+  // lists (<!--MEX 40 ARC-->), where they must not end up inside a coordinate.
+  return parser.parse((await response.text()).replace(/<!--[\s\S]*?-->/g, ""));
 }
 
 type Point = { lat: number; lon: number };
@@ -96,20 +103,26 @@ function shareEdgeCorners(rings: Point[][]): Point[][] {
 //    approach positions the AUS profile also shows (AYNZA, AYPY ADC, NFFN ADC, NWWW ADC, ...);
 //  - any other sector AUS shows is an Australian one and comes from AUS;
 //  - one neither shows (KZAK, NZZO, WAAF, ...) is somebody else's airspace and is not imported.
+//
+// The MEX profile is a separate airspace with its own region, and takes every sector it shows. A
+// sector name is unique across every region (sectors.name), so a Mexico sector whose name AUS or
+// PAC already uses is skipped and reported rather than allowed to replace the Australian one.
 type ParsedDataset = {
-  profile: "AUS" | "PAC";
+  profile: Profile;
+  region: Region;
   boundaries: Map<string, Point[]>;
   volumes: Map<string, string[]>; // volume name -> boundary names
   sectors: Array<Record<string, any>>;
   shown: Map<string, Record<string, any>>; // sectors this profile shows in its Sectors window, by name
 };
 const parsed: ParsedDataset[] = [];
-for (const [index, base] of datasets.entries()) {
+for (const { profile, base, region } of datasets) {
   const volumesRoot = (await xml(base, "Volumes.xml")).Volumes;
   const sectorsRoot = (await xml(base, "Sectors.xml")).Sectors;
   const sectors = list<Record<string, any>>(sectorsRoot.Sector);
   parsed.push({
-    profile: index === 0 ? "AUS" : "PAC",
+    profile,
+    region,
     boundaries: new Map(list<Record<string, any>>(volumesRoot.Boundary).map(item => [String(item["@_Name"]),
       String(item["#text"] ?? "").split("/").filter(Boolean).map(coordinate)])),
     volumes: new Map(list<Record<string, any>>(volumesRoot.Volume).map(volume => [String(volume["@_Name"]), csv(volume.Boundaries)])),
@@ -121,6 +134,7 @@ for (const [index, base] of datasets.entries()) {
 }
 const aus = parsed.find(dataset => dataset.profile === "AUS")!;
 const pac = parsed.find(dataset => dataset.profile === "PAC")!;
+const mex = parsed.find(dataset => dataset.profile === "MEX")!;
 
 const kept: Array<{ dataset: ParsedDataset; sector: Record<string, any>; boundaryNames: string[] }> = [];
 const keep = (dataset: ParsedDataset, sector: Record<string, any>) => kept.push({
@@ -128,22 +142,30 @@ const keep = (dataset: ParsedDataset, sector: Record<string, any>) => kept.push(
 });
 for (const sector of pac.shown.values()) keep(pac, sector);
 for (const [name, sector] of aus.shown) if (!pac.shown.has(name)) keep(aus, sector);
+const australianNames = new Set(kept.map(k => String(k.sector["@_Name"])));
+const mexClashes = [...mex.shown.keys()].filter(name => australianNames.has(name));
+for (const [name, sector] of mex.shown) if (!australianNames.has(name)) keep(mex, sector);
 
 const fromPacAlsoInAus = [...pac.shown.keys()].filter(name => aus.shown.has(name));
-console.log(`Sectors: ${kept.filter(k => k.dataset === aus).length} from AUS, ${kept.filter(k => k.dataset === pac).length} from PAC`
+console.log(`Sectors: ${kept.filter(k => k.dataset === aus).length} from AUS, ${kept.filter(k => k.dataset === pac).length} from PAC, `
+  + `${kept.filter(k => k.dataset === mex).length} from MEX`
   + (fromPacAlsoInAus.length ? ` (shown in both, taken from PAC: ${fromPacAlsoInAus.join(", ")})` : ""));
+if (mexClashes.length) console.warn(`Skipped MEX sectors whose names AUS/PAC already use: ${mexClashes.join(", ")}`);
 
 // Shared edges are matched across only the boundaries that will be drawn - not every boundary
-// either file contains, or a hidden duplicate's corners would be pulled into the real outlines.
+// either file contains, or a hidden duplicate's corners would be pulled into the real outlines -
+// and only within one region: no Australian boundary borders a Mexican one.
 const used = new Map<string, { dataset: ParsedDataset; name: string }>();
 for (const { dataset, boundaryNames } of kept) {
   for (const name of boundaryNames) {
     if (dataset.boundaries.has(name)) used.set(`${dataset.profile}:${name}`, { dataset, name });
   }
 }
-const usedEntries = [...used.values()];
-const matched = shareEdgeCorners(usedEntries.map(entry => entry.dataset.boundaries.get(entry.name)!));
-usedEntries.forEach((entry, index) => entry.dataset.boundaries.set(entry.name, matched[index]!));
+for (const region of new Set(datasets.map(dataset => dataset.region))) {
+  const usedEntries = [...used.values()].filter(entry => entry.dataset.region === region);
+  const matched = shareEdgeCorners(usedEntries.map(entry => entry.dataset.boundaries.get(entry.name)!));
+  usedEntries.forEach((entry, index) => entry.dataset.boundaries.set(entry.name, matched[index]!));
+}
 
 await transaction(async client => {
   await client.query("SELECT pg_advisory_xact_lock(684277)");
@@ -153,12 +175,13 @@ await transaction(async client => {
     const callsign = sector["@_Callsign"] ? String(sector["@_Callsign"]) : null;
     const boundary = boundaryNames.flatMap(boundaryName => dataset.boundaries.has(boundaryName) ? [dataset.boundaries.get(boundaryName)] : []);
     await client.query(
-      `INSERT INTO sectors (name,full_name,callsign,frequency,type,responsible_sectors,boundary,updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (name) DO UPDATE SET
+      `INSERT INTO sectors (name,full_name,callsign,frequency,type,responsible_sectors,boundary,region,updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now()) ON CONFLICT (name) DO UPDATE SET
        full_name=$2,callsign=$3,frequency=$4,type=$5,responsible_sectors=$6,
-       boundary=CASE WHEN jsonb_array_length($7::jsonb)>0 THEN $7::jsonb ELSE sectors.boundary END,updated_at=now()`,
+       boundary=CASE WHEN jsonb_array_length($7::jsonb)>0 THEN $7::jsonb ELSE sectors.boundary END,region=$8,updated_at=now()`,
       [name, String(sector["@_FullName"] ?? ""), callsign, sector["@_Frequency"] ?? null,
-        callsign?.split("_").at(-1) ?? null, JSON.stringify(csv(sector.ResponsibleSectors)), JSON.stringify(boundary)]);
+        callsign?.split("_").at(-1) ?? null, JSON.stringify(csv(sector.ResponsibleSectors)), JSON.stringify(boundary),
+        dataset.region]);
     seenSectors.push(name);
   }
   // Deleting a sector cascades to its ownership rows, so this statement can take live ownership
@@ -174,20 +197,24 @@ await transaction(async client => {
   }
   await client.query("DELETE FROM sectors WHERE NOT (name=ANY($1))", [seenSectors]);
 
-  // Positions likewise come from their own profile's Positions.xml. The two files share no position
+  // Positions likewise come from their own profile's Positions.xml. AUS and PAC share no position
   // names today; should one appear in both, the PAC entry is taken if PAC shows a sector with that
-  // position's callsign prefix, the AUS one otherwise, and the clash is reported.
+  // position's callsign prefix, the AUS one otherwise, and the clash is reported. A MEX position
+  // whose name AUS or PAC already uses is skipped and reported, as its sectors are.
   const seenPositions: string[] = [];
-  const positionProfile = new Map<string, "AUS" | "PAC">();
+  const positionProfile = new Map<string, Profile>();
   const pacPrefixes = new Set([...pac.shown.values()].map(sector => String(sector["@_Callsign"] ?? "").split(/[-_]/)[0]).filter(Boolean));
-  for (const [index, base] of datasets.entries()) {
-    const profile = index === 0 ? "AUS" : "PAC";
+  for (const { profile, base, region } of datasets) {
     const root = (await xml(base, "Positions.xml")).Positions;
     const candidates = [...list<Record<string, any>>(root.Position),
       ...list<Record<string, any>>(root.Group).flatMap(group => list<Record<string, any>>(group.Position))];
     for (const position of candidates) {
       const name = String(position["@_Name"]);
       const already = positionProfile.get(name);
+      if (already && (already === "MEX" || profile === "MEX")) {
+        console.warn(`Position ${name} is in both ${already} and ${profile}; keeping ${already}.`);
+        continue;
+      }
       if (already) {
         const pacOwns = pacPrefixes.has(name.split(/[-_ ]/)[0] ?? "");
         console.warn(`Position ${name} is in both profiles; using ${pacOwns ? "PAC" : "AUS"}.`);
@@ -196,14 +223,14 @@ await transaction(async client => {
       positionProfile.set(name, profile);
       const center = coordinate(String(position["@_DefaultCenter"]));
       await client.query(
-        `INSERT INTO positions (name,asmgcs_airport,default_lat,default_lon,updated_at) VALUES ($1,$2,$3,$4,now())
-         ON CONFLICT (name) DO UPDATE SET asmgcs_airport=$2,default_lat=$3,default_lon=$4,updated_at=now()`,
-        [name, position["@_ASMGCSAirport"] ?? null, center.lat, center.lon]);
+        `INSERT INTO positions (name,asmgcs_airport,default_lat,default_lon,region,updated_at) VALUES ($1,$2,$3,$4,$5,now())
+         ON CONFLICT (name) DO UPDATE SET asmgcs_airport=$2,default_lat=$3,default_lon=$4,region=$5,updated_at=now()`,
+        [name, position["@_ASMGCSAirport"] ?? null, center.lat, center.lon, region]);
       seenPositions.push(name);
     }
   }
   await client.query("DELETE FROM positions WHERE NOT (name=ANY($1))", [seenPositions]);
 });
 
-console.log("vatSys Australia and Pacific sector datasets synchronized.");
+console.log("vatSys Australia, Pacific and Mexico sector datasets synchronized.");
 await pool.end();

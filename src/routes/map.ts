@@ -48,7 +48,7 @@ function insideRing(ring: Ring, lat: number, lon: number): boolean {
   return inside;
 }
 
-type AtisMapRow = { icao: string; atis_letter: string; content: unknown; lat: number; lon: number };
+type AtisMapRow = { icao: string; atis_letter: string; content: unknown; lat: number; lon: number; region: string };
 
 // Whether the station behind an ATIS record is on the network, as opposed to a record this server
 // is still holding after its controller left (records cannot be withdrawn - they age out). The map
@@ -76,6 +76,7 @@ function mapAtis(row: AtisMapRow, type: string, frequency: string | null, time: 
     icao: row.icao,
     lat: row.lat,
     lon: row.lon,
+    region: row.region,
     atis_letter: row.atis_letter,
     type,
     frequency,
@@ -121,16 +122,27 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
     // Every recent record, position or not: an activated FDR still at the gate, or a completed one,
     // is drawn at its aerodrome (dep_lat/des_lat, which the plugin sends) rather than where it is.
+    //
+    // region (the map banner it is shown under - see regions.ts) is that of the sector it is in, or
+    // failing that of a sector its controller holds, or of its departure or destination aerodrome.
+    // Null when none of those is known; the map then shows it whatever regions are switched on.
     return (await pool.query(
-      `SELECT * FROM flight_data_records WHERE server=$2 AND last_seen_at >= now()-($1*interval '1 minute')
-        ORDER BY callsign`,
+      `SELECT f.*, COALESCE(cs.region, ctl.region, dep.region, des.region) AS region
+         FROM flight_data_records f
+         LEFT JOIN sectors cs ON cs.name=f.current_sector
+         LEFT JOIN LATERAL (SELECT s.region FROM sector_ownerships o JOIN sectors s ON s.id=o.sector_id
+                             WHERE o.server=f.server AND o.controller_callsign=f.controlling_callsign LIMIT 1) ctl ON true
+         LEFT JOIN LATERAL (SELECT region FROM positions WHERE asmgcs_airport=f.data->>'dep_airport' LIMIT 1) dep ON true
+         LEFT JOIN LATERAL (SELECT region FROM positions WHERE asmgcs_airport=f.data->>'des_airport' LIMIT 1) des ON true
+        WHERE f.server=$2 AND f.last_seen_at >= now()-($1*interval '1 minute')
+        ORDER BY f.callsign`,
       [config.FDR_RETAIN_MINUTES, server])).rows.map(row => {
         // Routes are served by /map/routes instead: dozens of points per flight would multiply the
         // size of a feed the map re-reads on every FDR signal. has_route lets the map know one exists.
         const { route_points: routePoints, ...data } = (row.data ?? {}) as Record<string, unknown>;
         return { ...data, callsign: row.callsign, has_route: Array.isArray(routePoints) && routePoints.length > 1,
           controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
-          current_sector: row.current_sector, last_seen_at: row.last_seen_at };
+          current_sector: row.current_sector, last_seen_at: row.last_seen_at, region: row.region };
       });
   });
 
@@ -152,7 +164,7 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
   // sectors only, with their owner and online status. Takes no ?server=: sectors are shared across
   // every server (see migrations/006_server_isolation.sql).
   app.get("/map/sector-shapes", async () => (await pool.query(
-    "SELECT name,full_name,type,callsign,frequency,responsible_sectors,boundary FROM sectors ORDER BY name")).rows);
+    "SELECT name,full_name,type,callsign,frequency,responsible_sectors,boundary,region FROM sectors ORDER BY name")).rows);
 
   // The /live-map page's live picture in one call: who holds which sector, every controller with
   // the set they hold, and the requests between them. Geometry is left to /map/sector-shapes
@@ -244,11 +256,11 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     // published ones are the same on every view.
     const published = (await pool.query(
       `SELECT a.icao,a.callsign,a.atis_letter,a.type,a.frequency,a.content,a.changed,a.issued,a.received_at,
-              p.default_lat AS lat,p.default_lon AS lon
+              p.default_lat AS lat,p.default_lon AS lon,p.region
          FROM network_atis a JOIN positions p ON p.asmgcs_airport=a.icao`)).rows;
     const pushed = (await pool.query(
       `SELECT a.icao,a.atis_letter,a.frequency,a.content,a.last_seen_at,
-              p.default_lat AS lat,p.default_lon AS lon
+              p.default_lat AS lat,p.default_lon AS lon,p.region
          FROM atis_broadcasts a JOIN positions p ON p.asmgcs_airport=a.icao
         WHERE a.server=$2 AND a.last_seen_at >= now()-($1*interval '1 minute')
           AND NOT EXISTS (SELECT 1 FROM network_atis n WHERE n.icao=a.icao)`,
@@ -279,18 +291,18 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     // position) contributes a row, the same rule the live branch applies to the datafeed.
     if (server !== "live") {
       const rows = (await pool.query(
-        `SELECT s.name AS sector_name, s.type, s.frequency, o.controller_cid AS cid, o.controller_callsign AS callsign
+        `SELECT s.name AS sector_name, s.type, s.frequency, s.region, o.controller_cid AS cid, o.controller_callsign AS callsign
            FROM sector_ownerships o JOIN sectors s ON s.id=o.sector_id
           WHERE o.server=$1 AND s.callsign=o.controller_callsign`, [server])).rows;
       return rows.map(row => ({
         cid: row.cid, callsign: row.callsign,
         frequencies: row.frequency ? [Number(row.frequency)] : [],
-        sector_name: row.sector_name, type: row.type, is_ozserver: true
+        sector_name: row.sector_name, type: row.type, region: row.region, is_ozserver: true
       })).sort((a, b) => (typePriority[a.type] ?? 99) - (typePriority[b.type] ?? 99) || a.sector_name.localeCompare(b.sector_name));
     }
 
     const data = await vatsimData();
-    const sectors = new Map((await pool.query("SELECT name,callsign,type FROM sectors WHERE callsign IS NOT NULL")).rows.map(row => [row.callsign, row]));
+    const sectors = new Map((await pool.query("SELECT name,callsign,type,region FROM sectors WHERE callsign IS NOT NULL")).rows.map(row => [row.callsign, row]));
     const owners = new Set((await pool.query("SELECT DISTINCT controller_cid FROM sector_ownerships WHERE server=$1", [server])).rows.map(row => row.controller_cid));
     const frequencies = new Map((await afvTransceivers()).map(entry => [entry.callsign,
       [...new Set((entry.transceivers ?? []).map(item => Math.round(item.frequency / 1000) / 1000))]]));
@@ -298,7 +310,7 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
       const sector = sectors.get(controller.callsign)!;
       return { cid: controller.cid, callsign: controller.callsign,
         frequencies: frequencies.get(controller.callsign) ?? [Number(controller.frequency)],
-        sector_name: sector.name, type: sector.type, is_ozserver: owners.has(controller.cid) };
+        sector_name: sector.name, type: sector.type, region: sector.region, is_ozserver: owners.has(controller.cid) };
     }).sort((a, b) => (typePriority[a.type] ?? 99) - (typePriority[b.type] ?? 99) || a.sector_name.localeCompare(b.sector_name));
   });
 

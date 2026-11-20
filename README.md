@@ -68,8 +68,11 @@ Design points worth knowing before changing anything:
   used only for the public map, never to decide ownership.
 - **Events carry no data.** A signal names an area (`sectors`, `fdr`, `atis`) and a server; clients
   re-read. A missed signal costs latency, not correctness, because clients also poll.
-- **Sectors are static reference data**, synchronised from the vatSys Australia and Pacific
+- **Sectors are static reference data**, synchronised from the vatSys Australia, Pacific and Mexico
   datasets with `npm run dataset:sync`. Ownership, requests, flights and ATIS are scoped per server.
+- **Airspace is grouped into regions** ([`src/regions.ts`](src/regions.ts)): `australia` (the
+  Australia and Pacific datasets) and `mexico`. Every sector and position records its region, and the
+  map's region toggles are built from `GET /regions`.
 
 ## Getting started
 
@@ -171,6 +174,7 @@ answers `401`.
 | `GET /events?server=` | Server-Sent Events stream — see [Events](#events) |
 | `GET /events/status` | Number of open event streams |
 | `GET /servers` | The servers this API distinguishes, with display labels |
+| `GET /regions` | The airspace regions (Australia, Mexico), with display labels |
 | `GET /vatsim/atis` · `GET /vatsim/atis/:icao` | Published ATIS for every airport, or one (or `null`) |
 | `PUT /vatsim/atis/:icao` | Publish an airport's ATIS — see [ATIS](#atis) |
 | `GET /atis/:icao?server=` | The ATIS handover record for one airport |

@@ -22,15 +22,18 @@ import { vatsimData } from "./vatsim.js";
 
 async function collect(): Promise<{ controllers: ControllerStat[]; firs: FirStat[] }> {
   const [sectorRows, ownershipRows, flightRows, pluginRows, feed] = await Promise.all([
-    pool.query<SectorRow>("SELECT name,callsign,type,frequency,responsible_sectors FROM sectors"),
+    // Australian airspace only (the Australia and Pacific datasets - see regions.ts): this channel
+    // reports on VATPAC, and the Mexico sectors would otherwise put Mexican controllers in it.
+    pool.query<SectorRow>("SELECT name,callsign,type,frequency,responsible_sectors FROM sectors WHERE region='australia'"),
     pool.query<{ name: string; controller_callsign: string }>(
       `SELECT s.name,o.controller_callsign FROM sector_ownerships o JOIN sectors s ON s.id=o.sector_id
-        WHERE o.server='live'`),
+        WHERE o.server='live' AND s.region='australia'`),
     pool.query<{ callsign: string; controlling_callsign: string | null; current_sector: string | null;
       tracked_by: string | null; state: string | null }>(
       `SELECT callsign,controlling_callsign,current_sector,data->>'tracked_by' AS tracked_by,data->>'state' AS state
          FROM flight_data_records
         WHERE server='live' AND last_seen_at >= now()-($1*interval '1 minute')
+          AND (current_sector IS NULL OR current_sector NOT IN (SELECT name FROM sectors WHERE region<>'australia'))
         ORDER BY callsign`, [RECENT_MINUTES]),
     pool.query<{ controller_callsign: string }>(
       `SELECT DISTINCT controller_callsign FROM plugin_clients
