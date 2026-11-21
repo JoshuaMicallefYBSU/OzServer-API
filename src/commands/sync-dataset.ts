@@ -8,7 +8,8 @@ type Profile = "AUS" | "PAC" | "MEX";
 const datasets: Array<{ profile: Profile; base: string; region: Region }> = [
   { profile: "AUS", base: "https://raw.githubusercontent.com/vatSys/australia-dataset/master/", region: "australia" },
   { profile: "PAC", base: "https://raw.githubusercontent.com/vatSys/pacific-dataset/master/", region: "australia" },
-  { profile: "MEX", base: "https://raw.githubusercontent.com/vatSys/mexico-dataset/master/", region: "mexico" }
+  // VATMEX's own MMFR sector (branch "central"), not vatSys/mexico-dataset, which is far less complete.
+  { profile: "MEX", base: "https://raw.githubusercontent.com/vatmex/vatmex-mmfr-sector/central/", region: "mexico" }
 ];
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", trimValues: true });
 const list = <T>(value: T | T[] | undefined): T[] => value === undefined ? [] : Array.isArray(value) ? value : [value];

@@ -2,7 +2,7 @@
 // under (sectors.region / positions.region - see migrations/015_regions.sql):
 //
 //   australia - the vatSys Australia and Pacific datasets
-//   mexico    - the vatSys Mexico dataset
+//   mexico    - the VATMEX MMFR sector (vatmex/vatmex-mmfr-sector)
 //
 // Which dataset fills which region is decided in commands/sync-dataset.ts. Served at /regions so the
 // map builds its toggles from this list rather than keeping its own copy.
