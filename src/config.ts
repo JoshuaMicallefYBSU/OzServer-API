@@ -11,9 +11,10 @@ const schema = z.object({
   // releases them (handing each to a covering parent position if one is staffed - see
   // maintenance.ts). Does not decide whether another controller may claim them in the meantime;
   // see PRESENCE_TIMEOUT_SECONDS.
-  DISCONNECT_GRACE_MINUTES: z.coerce.number().positive().default(5),
-  // Seconds without a request from a controller's client before they stop counting as present, at
-  // which point another controller may claim their sectors outright (claimGroup). Keep at about
+  DISCONNECT_GRACE_MINUTES: z.coerce.number().positive().default(2),
+  // Seconds without a request from a controller's client before they stop counting as present and
+  // count as dropped: their sectors are kept for them until DISCONNECT_GRACE_MINUTES, but another
+  // controller may take them by saying so (take_dropped - droppedOwner in routes/sectors.ts). Keep at about
   // twice the plugin's 3 s idle poll (OzServerOwnershipTracker.PollInterval): at or below the poll
   // interval, a connected controller whose poll lands slightly late would lose a sector.
   PRESENCE_TIMEOUT_SECONDS: z.coerce.number().positive().default(6),

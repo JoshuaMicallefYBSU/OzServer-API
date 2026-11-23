@@ -9,8 +9,11 @@
 // of seconds in both directions. Sector ownership, FDR authority and disconnect handling use
 // sector_ownerships.last_seen_online_at, which the heartbeat in app.ts keeps current.
 
-// facility 0 is an observer (see external-control.ts).
-type Controller = { cid: number; callsign: string; frequency?: string; name?: string; facility?: number; text_atis?: string[] | null };
+// facility 0 is an observer, and logon_time (ISO 8601) is when this connection began (see
+// external-control.ts).
+type Controller = {
+  cid: number; callsign: string; frequency?: string; name?: string; facility?: number; text_atis?: string[] | null; logon_time?: string;
+};
 export type Pilot = {
   callsign: string; latitude: number; longitude: number; altitude: number; groundspeed: number; heading: number;
   flight_plan?: { aircraft?: string; aircraft_short?: string; altitude?: string; arrival?: string } | null;

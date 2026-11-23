@@ -113,8 +113,8 @@ an invalid value stops the process rather than being guessed at.
 | `POSTGRES_PASSWORD` | — (required by Compose) | Password for the Compose-managed database |
 | `HOST` / `PORT` | `0.0.0.0` / `3000` | Listen address |
 | `WEBSITE_ORIGIN` | `https://ozserver.org` | Origin allowed by CORS for the public endpoints |
-| `PRESENCE_TIMEOUT_SECONDS` | `6` | Silence from a controller before another may claim their sector outright. Keep at about twice the plugin's 3 s poll |
-| `DISCONNECT_GRACE_MINUTES` | `5` | Silence before a controller's sectors are released and reassigned |
+| `PRESENCE_TIMEOUT_SECONDS` | `6` | Silence from a controller before they count as dropped: their sectors are then kept for them until `DISCONNECT_GRACE_MINUTES`, but another controller may take them with `take_dropped`. Keep at about twice the plugin's 3 s poll |
+| `DISCONNECT_GRACE_MINUTES` | `2` | How long a crashed (dropped) controller's sectors are held for them before they are released and reassigned |
 | `RESUME_WINDOW_MINUTES` | `5` | How long a dropped controller can resume their sectors and tags |
 | `FDR_RETAIN_MINUTES` | `15` | Lifetime of a flight record after its last update |
 | `ATIS_RETAIN_MINUTES` | `60` | Lifetime of an ATIS handover record after its last update |
@@ -150,10 +150,10 @@ answers `401`.
 | --- | --- |
 | `GET /sectors/sync` | Everything a client needs in one read: sectors owned, sectors held by others, and pending requests |
 | `GET /sectors/mine` · `GET /sectors/controlled` · `GET /sector-requests` | The three parts of `/sectors/sync` on their own |
-| `POST /sectors/:name/claim` | Claim a sector and its group; `409` with the conflicts when another present controller holds part of it |
+| `POST /sectors/:name/claim` | Claim a sector and its group; `409` with the conflicts when another controller holds part of it. A dropped controller's sectors are conflicts too (`owner.dropped`, with `released_at`) unless the body has `take_dropped: true` |
 | `POST /sectors/:name/release` | Release a sector |
 | `POST /sectors/:name/request` | Ask the current owner for a sector |
-| `POST /sectors/commit` | Apply a set of claims, releases and requests in one transaction |
+| `POST /sectors/commit` | Apply a set of claims, releases and requests in one transaction; `take_dropped` as for a claim |
 | `POST /sectors/release-all` | Release everything, on a deliberate disconnect |
 | `POST /sectors/resume` | Recover sectors, and the tags to restore, after a dropped connection |
 | `POST /sector-requests/:id/accept` · `/reject` · `/cancel` | Answer or withdraw one request |

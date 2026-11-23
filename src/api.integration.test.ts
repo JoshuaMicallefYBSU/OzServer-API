@@ -131,11 +131,49 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     expect((await app.inject({ method: "GET", url: "/api/v1/map/ops" })).statusCode).toBe(400);
   });
 
-  it("lets a sector be claimed once its owner has gone quiet", async () => {
-    await post("/sectors/INA/claim", extender);
-    await goQuiet(extender);
-    expect((await post("/sectors/INA/claim", third)).statusCode).toBe(201);
-    expect(await mine(third)).toEqual(["INA"]);
+  describe("a sector whose owner dropped", () => {
+    beforeEach(async () => {
+      await post("/sectors/INA/claim", extender);
+      await goQuiet(extender);
+    });
+
+    it("is kept for them, and the claimer is told whose it is and until when", async () => {
+      const refused = await post("/sectors/INA/claim", third);
+      expect(refused.statusCode).toBe(409);
+      const [conflict] = refused.json().conflicts;
+      expect(conflict).toMatchObject({ sector: "INA", owner: { cid: extender.cid, callsign: extender.callsign, dropped: true } });
+      // DISCONNECT_GRACE_MINUTES after they were last heard from (0.05 here, set above).
+      expect(Date.parse(conflict.owner.released_at) - Date.parse(conflict.owner.last_seen_at)).toBe(0.05 * 60_000);
+      expect(await mine(extender)).toEqual(["INA"]);
+    });
+
+    it("is taken by a claim that says so", async () => {
+      expect((await post("/sectors/INA/claim", third, { take_dropped: true })).statusCode).toBe(201);
+      expect(await mine(third)).toEqual(["INA"]);
+      expect(await mine(extender)).toEqual([]);
+    });
+
+    it("is shown as theirs, dropped, to everyone else", async () => {
+      const controlled = (await get("/sectors/sync", third)).json().controlled;
+      expect(controlled).toContainEqual(expect.objectContaining({ name: "INA", owner: expect.objectContaining({ callsign: extender.callsign, dropped: true }) }));
+    });
+
+    it("cannot be requested from them, since nobody can answer", async () => {
+      const response = await post("/sectors/INA/request", third);
+      expect(response.statusCode).toBe(409);
+      expect(response.json().dropped).toMatchObject({ callsign: extender.callsign });
+    });
+
+    it("goes to a controller under their callsign without being asked", async () => {
+      expect((await post("/sectors/INA/claim", { cid: 1000009, callsign: extender.callsign })).statusCode).toBe(201);
+    });
+
+    it("is taken through a commit that says so, and listed as a conflict in one that does not", async () => {
+      const left = (await post("/sectors/commit", third, { claim: ["INA"] })).json().result;
+      expect(left.skipped).toEqual(["INA"]);
+      expect(left.conflicts).toMatchObject([{ sector: "INA", owner: { dropped: true } }]);
+      expect((await post("/sectors/commit", third, { claim: ["INA"], take_dropped: true })).json().result.claimed).toEqual(["INA"]);
+    });
   });
 
   describe("a primary logging on over a controller who extended into its airspace", () => {
@@ -186,16 +224,19 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect(await mine(extender)).toEqual(["OUT"]);
     });
 
-    it("still claims covered airspace nobody present is working", async () => {
+    it("claims covered airspace nobody present is working once told it is a dropped controller's", async () => {
       await goQuiet(extender);
-      expect((await post("/sectors/GRP/claim", primary, { primary_group: ["GRP", "INA"] })).statusCode).toBe(201);
+      const held = await post("/sectors/GRP/claim", primary, { primary_group: ["GRP", "INA"] });
+      expect(held.statusCode).toBe(409);
+      expect(held.json().conflicts.every((conflict: { owner: { dropped?: boolean } }) => conflict.owner.dropped)).toBe(true);
+      expect((await post("/sectors/GRP/claim", primary, { take_dropped: true })).statusCode).toBe(201);
       expect(await mine(primary)).toEqual(["GRP", "INA", "OUT"]);
     });
 
     it("clears requests left pointing at a controller whose sector was taken after they went quiet", async () => {
       expect((await post("/sectors/INA/request", third)).statusCode).toBe(201);
       await goQuiet(extender);
-      await post("/sectors/GRP/claim", primary);
+      await post("/sectors/GRP/claim", primary, { take_dropped: true });
       expect((await get("/sector-requests", third)).json().by_me).toEqual([]);
       // Which is what lets them ask the new owner instead.
       expect((await post("/sectors/INA/request", third)).statusCode).toBe(201);
@@ -559,7 +600,7 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
 
     it("leaves tags with nobody when another callsign claims a dropped controller's sector", async () => {
       await goQuiet(before, 30);
-      expect((await post("/sectors/FAR/claim", third)).statusCode).toBe(201);
+      expect((await post("/sectors/FAR/claim", third, { take_dropped: true })).statusCode).toBe(201);
       expect(await holder("QFA2")).toBeNull();
       expect(await holder("QFA1")).toBe(before.cid);
     });
@@ -806,6 +847,22 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
         { callsign: outsider, frequencies: ["128.400"], sectors: [], atis: [] }
       ]);
       await get("/sectors/sync", primary);
+      expect((await controlled(third)).filter(row => row.owner.external)).toEqual([]);
+    });
+
+    it("never counts a plugin user who has left, or dropped, as working without it", async () => {
+      // Left a minute ago (release-all), still in another plugin's vatSys list.
+      const leaver: Identity = { cid: 1000010, callsign: "XX-INA_CTR" };
+      await post("/sectors/release-all", leaver);
+      await db.query("UPDATE plugin_clients SET last_seen_at=now()-interval '1 minute' WHERE controller_cid=$1", [leaver.cid]);
+      // Dropped: still owning FAR, quiet for a minute.
+      await post("/sectors/FAR/claim", extender);
+      await goQuiet(extender);
+      await db.query("UPDATE plugin_clients SET last_seen_at=now()-interval '1 minute' WHERE controller_cid=$1", [extender.cid]);
+      await report(third, [
+        { callsign: leaver.callsign, frequencies: [], sectors: ["INA"], atis: [] },
+        { callsign: extender.callsign, frequencies: ["128.400"], sectors: ["FAR"], atis: [] }
+      ]);
       expect((await controlled(third)).filter(row => row.owner.external)).toEqual([]);
     });
   });

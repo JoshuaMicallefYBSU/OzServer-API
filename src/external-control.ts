@@ -33,6 +33,13 @@ import { latestVatsimData } from "./vatsim.js";
 //
 // What stays out: plugin users (plugin_clients), a sector a present OzServer controller holds, and
 // anything a flow position could not hold (the FMP rule in routes/sectors.ts).
+//
+// A plugin user stays out for the rest of that VATSIM session, not only while their plugin is
+// calling. Leaving cleanly releases everything (POST /sectors/release-all), and a crash keeps their
+// sectors as a dropped owner's (routes/sectors.ts). Either way VATSIM's datafeed and other plugins'
+// vatSys go on listing them for a while afterwards - a crashed client for minutes - and they were
+// counted as a controller without the plugin holding their position for all of it (ML-HYD_CTR and
+// PH_APP, 23 Nov 2026). See leftPlugin.
 
 export type ExternalController = {
   callsign: string;
@@ -53,6 +60,14 @@ export const NETWORK_REPORT_WINDOW_SECONDS = 45;
 
 // The window sectors.ts reads plugin_clients with.
 const PLUGIN_CLIENT_WINDOW_SECONDS = 15;
+
+// How far back a plugin user's last call is looked for (leftPlugin): longer than any session.
+const PLUGIN_SESSION_LOOKBACK_HOURS = 24;
+
+// How long a plugin user who left stays out where there is no VATSIM logon time to tell a new
+// session by (leftPlugin): long enough for a crashed client to fall off every vatSys list. Not
+// DISCONNECT_GRACE_MINUTES, which is how long their sectors are kept, and shorter.
+const LEFT_PLUGIN_WITHOUT_LOGON_MINUTES = 10;
 
 // What vatSys and VATSIM treat as a controller position. Observers, ATIS and pilots are not.
 const CONTROLLER_CALLSIGN = /^\w[\w-]*_(FSS|CTR|APP|DEP|TWR|GND|DEL|RMP|TMU|FMP|RDO)$/i;
@@ -265,11 +280,41 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
       WHERE o.server=$1 AND o.last_seen_online_at >= now()-($2*interval '1 second')`,
     [server, config.PRESENCE_TIMEOUT_SECONDS]);
 
+  // Every callsign's last plugin call, and every OzServer owner's callsign whether present or not:
+  // a dropped owner still holds their sectors as a plugin user (see leftPlugin).
+  const lastPluginCalls = await db.query(
+    `SELECT upper(controller_callsign) AS callsign, max(last_seen_at) AS last_seen_at FROM plugin_clients
+      WHERE server=$1 AND last_seen_at >= now()-($2*interval '1 hour') GROUP BY 1
+     UNION ALL
+     SELECT upper(controller_callsign), max(last_seen_online_at) FROM sector_ownerships WHERE server=$1 GROUP BY 1`,
+    [server, PLUGIN_SESSION_LOOKBACK_HOURS]);
+
   const plugin = new Set<string>(pluginUsers.rows.map(row => String(row.callsign)));
   // A controller present on OzServer under this callsign runs the plugin, whether or not
   // plugin_clients has caught up.
   for (const row of ownedRows.rows) plugin.add(String(row.callsign));
   const owned = new Set<string>(ownedRows.rows.map(row => String(row.name)));
+
+  const lastPluginCall = new Map<string, number>();
+  for (const row of lastPluginCalls.rows) {
+    const at = new Date(row.last_seen_at).getTime();
+    if (at > (lastPluginCall.get(String(row.callsign)) ?? 0)) lastPluginCall.set(String(row.callsign), at);
+  }
+  // As last fetched: this runs inside claims, under the mutation lock.
+  const { data, transceivers } = server === "live" ? latestVatsimData() : { data: null, transceivers: [] };
+  const feed = new Map((data?.controllers ?? []).map(atc => [atc.callsign.toUpperCase(), atc]));
+  // A plugin user who has left (or crashed), still listed by the feed or by another plugin's
+  // vatSys. Told apart from the same callsign back without the plugin by VATSIM's logon time: a
+  // session that began after the plugin's last call is a new one. Where there is no logon time
+  // (SweatBox, where only vatSys's list is reported), for LEFT_PLUGIN_WITHOUT_LOGON_MINUTES - a
+  // controller who reconnects without the plugin sooner goes unnoticed for that long.
+  const leftPlugin = (callsign: string): boolean => {
+    const last = lastPluginCall.get(callsign);
+    if (last === undefined) return false;
+    const logon = Date.parse(feed.get(callsign)?.logon_time ?? "");
+    if (!Number.isNaN(logon)) return logon <= last;
+    return Date.now() - last < LEFT_PLUGIN_WITHOUT_LOGON_MINUTES * 60_000;
+  };
 
   const frequencies = (values: unknown[]) => [...new Set(values.map(normaliseFrequency).filter((f): f is string => f !== null))];
   // Their own position: as a plugin reported it, or the sector whose callsign is theirs.
@@ -284,7 +329,7 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
   const infoLines = new Map<string, string[]>();
   for (const row of reported.rows) {
     const callsign = String(row.callsign).toUpperCase();
-    if (plugin.has(callsign) || !isControllerCallsign(callsign)) continue;
+    if (plugin.has(callsign) || leftPlugin(callsign) || !isControllerCallsign(callsign)) continue;
     infoLines.set(callsign, stringArray(row.atis));
     controllers.set(callsign, {
       callsign,
@@ -296,13 +341,10 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
   }
 
   if (server === "live") {
-    // As last fetched: this runs inside claims, under the mutation lock.
-    const { data, transceivers } = latestVatsimData();
     const afv = new Map(transceivers.map(entry => [entry.callsign.toUpperCase(), (entry.transceivers ?? []).map(t => t.frequency)]));
-    for (const atc of data?.controllers ?? []) {
-      const callsign = atc.callsign.toUpperCase();
+    for (const [callsign, atc] of feed) {
       // Facility 0 is an observer.
-      if (plugin.has(callsign) || !isControllerCallsign(callsign) || atc.facility === 0) continue;
+      if (plugin.has(callsign) || leftPlugin(callsign) || !isControllerCallsign(callsign) || atc.facility === 0) continue;
       const entry = controllers.get(callsign) ?? {
         callsign, cid: null, real_name: atc.name ?? null, frequencies: [], sectors: ownPosition(callsign, [])
       };

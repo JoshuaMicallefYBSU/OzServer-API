@@ -51,6 +51,29 @@ function heldAgainst(holding: ExternalHolding | undefined, identity: ControllerI
   return !!holding && holding.callsign.toUpperCase() !== identity.callsign.toUpperCase();
 }
 
+type ConflictOwner = { cid: number; callsign: string; external?: boolean; dropped?: boolean; last_seen_at?: string | null; released_at?: string | null };
+
+// The owner of a sector whose client went quiet without releasing it (isPresent): their
+// connection dropped, and the sector is kept for them until the disconnect sweep frees it
+// (maintenance.ts, DISCONNECT_GRACE_MINUTES after their last contact) in case they come straight
+// back. Another controller may still take it, but only by saying so (take_dropped), after the
+// plugin has told them whose it is and until when (OzServerOwnershipTracker.ConfirmTakeDroppedAsync).
+function droppedOwner(row: { controller_cid: number | null; controller_callsign: string | null; last_seen_online_at: Date | string | null }): ConflictOwner {
+  const lastSeen = row.last_seen_online_at ? new Date(row.last_seen_online_at) : null;
+  return {
+    cid: Number(row.controller_cid), callsign: row.controller_callsign ?? "", dropped: true,
+    last_seen_at: lastSeen?.toISOString() ?? null,
+    released_at: lastSeen ? new Date(lastSeen.getTime() + config.DISCONNECT_GRACE_MINUTES * 60_000).toISOString() : null
+  };
+}
+
+const hhmm = (iso: string | null | undefined) => iso ? `${iso.slice(11, 16)}Z` : "the disconnect timeout";
+
+function droppedMessage(sector: string, owner: ConflictOwner): string {
+  return `${sector} is held for ${owner.callsign}, who disconnected${owner.last_seen_at ? ` at ${hhmm(owner.last_seen_at)}` : ""}. `
+    + `It is kept for them until ${hhmm(owner.released_at)} in case they reconnect - claim it to take it now.`;
+}
+
 const sectorNames = z.array(z.string().max(32)).max(400);
 
 const mutationSchema = z.object({
@@ -60,13 +83,16 @@ const mutationSchema = z.object({
   // Applied to every sector in `claim` - see claimGroup's `exclusions`.
   exclude: sectorNames.default([]),
   // Accepted and ignored - see claimGroup.
-  primary_group: sectorNames.optional()
+  primary_group: sectorNames.optional(),
+  // See droppedOwner. Applied to every sector in `claim`.
+  take_dropped: z.boolean().default(false)
 });
 
 // The single-sector claim's body. A plain claim sends nothing but its identity.
 const claimSchema = z.object({
   exclude: sectorNames.default([]),
-  primary_group: sectorNames.optional()
+  primary_group: sectorNames.optional(),
+  take_dropped: z.boolean().default(false)
 });
 
 // The logon position's own sectors, for handOverPosition.
@@ -124,9 +150,10 @@ async function covered(client: pg.PoolClient, name: string, server: string): Pro
     [[...names], server])).rows;
 }
 
-// Whether this row's owner is still connected, for deciding whether a different controller may
-// claim their sector outright. Measured in PRESENCE_TIMEOUT_SECONDS, not DISCONNECT_GRACE_MINUTES:
-// a dropped connection must not keep a sector locked until the sweep releases it.
+// Whether this row's owner is still connected. Measured in PRESENCE_TIMEOUT_SECONDS, not
+// DISCONNECT_GRACE_MINUTES: a dropped connection must not keep a sector locked until the sweep
+// releases it - one who is not present is a dropped owner, whose sector another controller may take
+// by saying so (droppedOwner).
 function isPresent(row: SectorRow): boolean {
   // Just after a restart every row looks stale, so the owner is assumed present (see presence.ts
   // for why the window passed is this check's own threshold).
@@ -151,8 +178,9 @@ async function claimGroup(
   name: string,
   exclusions: string[] = [],
   allOrNothing = false,
-  primaryGroup?: string[]
-): Promise<{ claimed: string[]; skipped: string[]; withheld: string[]; conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }>; missing: boolean; refused: string[] }> {
+  primaryGroup?: string[],
+  takeDropped = false
+): Promise<{ claimed: string[]; skipped: string[]; withheld: string[]; conflicts: Array<{ sector: string; owner: ConflictOwner }>; missing: boolean; refused: string[] }> {
   const everything = await covered(client, name, identity.server);
   // Only a sector that does not exist is "missing". A claim whose exclusions leave nothing to take
   // (a client's retry after a 409 that contested everything) names a real sector and is not a 404.
@@ -173,7 +201,7 @@ async function claimGroup(
   const takeable: SectorRow[] = [];
   const skipped: string[] = [];
   const withheld: string[] = [];
-  const conflicts: Array<{ sector: string; owner: { cid: number; callsign: string } }> = [];
+  const conflicts: Array<{ sector: string; owner: ConflictOwner }> = [];
   // Worked out before the exclusions are applied. The client excludes a logged-on controller's
   // position as it understands it, which is not always everything this server records them
   // holding in the group; computed afterwards, the staffed sector itself would be gone and their
@@ -214,9 +242,15 @@ async function claimGroup(
       continue;
     }
     const ownerHasPositionInThisClaim = positionOwnersInClaim.has(row.controller_callsign?.toUpperCase() ?? "");
-    // An owner who is not present does not block the claim: a dropped connection is not a
-    // reservation (see isPresent).
-    if (isPresent(row)) {
+    // An owner who is not present dropped (see isPresent and droppedOwner): their sectors are kept
+    // for them until the sweep, and taken only by a claim that says so. Present or dropped, the
+    // same withholding applies - a dropped owner's position left out of a claim is handed to its
+    // claimer by the sweep anyway (reassignFreedSectors), without anybody being asked.
+    // Except to a controller under the dropped owner's own callsign, who is taking over the
+    // position, not taking it from them - as with external holdings (heldAgainst).
+    const present = isPresent(row);
+    const sameCallsign = row.controller_callsign?.toUpperCase() === identity.callsign.toUpperCase();
+    if (present || !(takeDropped || sameCallsign)) {
       // Withholding is for what a claim merely sweeps up. The sector the claim names is a conflict
       // like any other: answering 201 with it left out would read as success, and the client would
       // claim it again on every poll without a request ever being raised.
@@ -225,7 +259,10 @@ async function claimGroup(
         continue;
       }
       skipped.push(row.name);
-      conflicts.push({ sector: row.name, owner: { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } });
+      conflicts.push({
+        sector: row.name,
+        owner: present ? { cid: row.controller_cid, callsign: row.controller_callsign ?? "" } : droppedOwner(row)
+      });
     }
     else takeable.push(row);
   }
@@ -294,6 +331,7 @@ async function claimGroup(
       conflicts,
       exclusions,
       previous_owners: previousOwners,
+      took_dropped: takeDropped,
       fdr_authority_cleared: clearedFlights,
       all_or_nothing: allOrNothing
     });
@@ -327,11 +365,14 @@ async function syncPayload(client: pg.Pool | pg.PoolClient, identity: Controller
     `SELECT s.id,s.name,s.full_name FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
       WHERE o.controller_cid=$1 AND o.server=$2 ORDER BY s.name`, [identity.cid, identity.server])).rows.map(row => ({ ...row, id: Number(row.id) }));
   const controlled = (await client.query(
-    `SELECT s.name,s.full_name,s.type,s.callsign,s.frequency,o.controller_cid AS cid,o.controller_callsign AS owner_callsign
+    `SELECT s.name,s.full_name,s.type,s.callsign,s.frequency,o.controller_cid,o.controller_callsign,o.last_seen_online_at
        FROM sectors s JOIN sector_ownerships o ON o.sector_id=s.id
       WHERE o.controller_cid<>$1 AND o.server=$2 ORDER BY s.name`, [identity.cid, identity.server])).rows.map(row => ({
         name: row.name, full_name: row.full_name, type: row.type, callsign: row.callsign,
-        frequency: row.frequency, owner: { cid: row.cid, callsign: row.owner_callsign }
+        frequency: row.frequency,
+        // Marked dropped once their client has gone quiet, so the plugin offers to take it rather than
+        // request it from somebody who cannot answer (see droppedOwner).
+        owner: isPresent(row) ? { cid: row.controller_cid, callsign: row.controller_callsign } as ConflictOwner : droppedOwner(row)
       }));
   // Everyone running the plugin right now, sectors or not (migrations/012_plugin_clients.sql). A
   // controller tracking a tag who is not on this list never reports it, so the plugin covers for
@@ -543,7 +584,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) return reply.code(422).send({ message: "Invalid sector claim.", errors: parsed.error.flatten() });
     const result = await transaction(async client => {
       await lockMutations(client, request.controller.server);
-      return claimGroup(client, request.controller, request.params.name, parsed.data.exclude, true, parsed.data.primary_group);
+      return claimGroup(client, request.controller, request.params.name, parsed.data.exclude, true, parsed.data.primary_group, parsed.data.take_dropped);
     });
     if (result.missing) return reply.code(404).send({ message: "Sector not found." });
     if (result.refused.includes(request.params.name)) return reply.code(403).send({ message: flowOnlyMessage, refused: result.refused });
@@ -563,7 +604,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     const outcome = await transaction(async (client): Promise<{ code: number; body: unknown }> => {
     await lockMutations(client, request.controller.server);
     const sector = (await client.query(
-      `SELECT s.id,s.type,s.callsign,o.controller_cid,o.controller_callsign FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.name=$1`,
+      `SELECT s.id,s.type,s.callsign,o.controller_cid,o.controller_callsign,o.last_seen_online_at FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.name=$1`,
       [request.params.name, request.controller.server])).rows[0];
     if (!sector) return { code: 404, body: { message: "Sector not found." } };
     // Nobody on the other end to answer it (external-control.ts).
@@ -574,6 +615,11 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     if (!sector.controller_cid && !mayOwn(request.controller, sector)) return { code: 403, body: { message: flowOnlyMessage } };
     if (!sector.controller_cid) return { code: 400, body: { message: "Sector is unclaimed - claim it directly instead of requesting it." } };
     if (sector.controller_cid === request.controller.cid) return { code: 400, body: { message: "You already own this sector." } };
+    // Nobody to answer this one either until they reconnect, and the sweep frees it if they do not.
+    if (!isPresent(sector)) {
+      const owner = droppedOwner(sector);
+      return { code: 409, body: { message: droppedMessage(request.params.name, owner), dropped: owner } };
+    }
     await client.query("DELETE FROM sector_requests WHERE sector_id=$1 AND requesting_cid=$2 AND server=$3 AND rejected_at IS NOT NULL", [sector.id, request.controller.cid, request.controller.server]);
     const inserted = await client.query(
       `INSERT INTO sector_requests (sector_id,requesting_cid,requesting_callsign,target_cid,target_callsign,server)
@@ -600,11 +646,14 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       // Every request this commit raises shares one group id, so the controller on the other end is
       // asked once about the whole thing rather than once per sector.
       const requestGroupId = randomUUID();
-      const result = { claimed: [] as string[], released: [] as string[], requested: [] as string[], skipped: [] as string[], withheld: [] as string[], failed: [] as string[] };
+      const result = { claimed: [] as string[], released: [] as string[], requested: [] as string[], skipped: [] as string[], withheld: [] as string[], failed: [] as string[],
+        // Who holds each sector in `skipped`, as a claim's 409 lists them - a dropped owner's (droppedOwner) is
+        // taken by committing again with take_dropped.
+        conflicts: [] as Array<{ sector: string; owner: ConflictOwner }> };
       for (const name of parsed.data.release) (await releaseGroup(client, request.controller, name) ? result.released : result.failed).push(name);
       for (const name of parsed.data.claim) {
-        const claimed = await claimGroup(client, request.controller, name, parsed.data.exclude, false, parsed.data.primary_group);
-        if (claimed.missing || claimed.refused.includes(name)) result.failed.push(name); else { result.claimed.push(...claimed.claimed); result.skipped.push(...claimed.skipped); result.withheld.push(...claimed.withheld); }
+        const claimed = await claimGroup(client, request.controller, name, parsed.data.exclude, false, parsed.data.primary_group, parsed.data.take_dropped);
+        if (claimed.missing || claimed.refused.includes(name)) result.failed.push(name); else { result.claimed.push(...claimed.claimed); result.skipped.push(...claimed.skipped); result.withheld.push(...claimed.withheld); result.conflicts.push(...claimed.conflicts); }
       }
       for (const name of parsed.data.request) {
         const sector = (await client.query(
