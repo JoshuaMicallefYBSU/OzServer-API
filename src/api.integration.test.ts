@@ -89,7 +89,7 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
   });
 
   beforeEach(async () => {
-    await db.query("TRUNCATE sector_ownerships, sector_requests, flight_data_records, client_logs, resume_snapshots, network_atis, atis_broadcasts");
+    await db.query("TRUNCATE sector_ownerships, sector_requests, flight_data_records, client_logs, resume_snapshots, network_atis, atis_broadcasts, arrival_sequences, arrival_list_viewers");
   });
 
   it("rejects a request with no controller identity", async () => {
@@ -407,6 +407,94 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       const [row] = (await app.inject({ method: "GET", url: "/api/v1/map/aircraft?server=live" })).json();
       expect(row).toMatchObject({ callsign: "QFA1", has_route: true });
       expect(row.route_points).toBeUndefined();
+    });
+  });
+
+  describe("arrival lists", () => {
+    const departed = "2026-11-23T04:00:00Z";
+    const inbound = (who: Identity, callsign: string, extra: Record<string, unknown> = {}) => post("/fdr/batch", who, {
+      flights: [{ callsign, des_airport: "YSSY", state: "STATE_UNCONTROLLED", atd: departed, controlling_cid: null, controlling_callsign: null, ...extra }]
+    });
+    const list = async (who: Identity = extender) => (await get("/arrivals/YSSY", who)).json();
+    const callsigns = async (who: Identity = extender) =>
+      ((await list(who)).flights as Array<{ callsign: string; seq_index: number }>).map(f => `${f.callsign}:${f.seq_index}`);
+    const move = (who: Identity, callsign: string, seq_index: number) =>
+      post("/arrivals/YSSY/sequence", who, { callsign, seq_index });
+
+    it("lists every departed flight inbound, with its landing time, type and global ops", async () => {
+      await inbound(extender, "QFA1", { eta: "2026-11-23T05:20:00Z", aircraft_type: "A320", aircraft_wake: "M", global_op_data: "STAR RIVET" });
+      await inbound(extender, "NOTYET", { atd: undefined });
+      await inbound(extender, "DONE1", { state: "STATE_FINISHED" });
+      await post("/fdr/batch", extender, { flights: [{ callsign: "OUT1", des_airport: "YMML", state: "STATE_UNCONTROLLED", atd: departed }] });
+
+      expect((await list()).flights).toEqual([{
+        callsign: "QFA1", seq_index: -1, eta: "2026-11-23T05:20:00Z", aircraft_type: "A320", aircraft_wake: "M", global_op_data: "STAR RIVET"
+      }]);
+    });
+
+    it("keeps the order controllers drag flights into", async () => {
+      await inbound(extender, "AAA1", { eta: "2026-11-23T05:30:00Z" });
+      await inbound(extender, "BBB2", { eta: "2026-11-23T05:10:00Z" });
+      await inbound(extender, "CCC3", { eta: "2026-11-23T05:20:00Z" });
+      // Unsequenced, by landing time.
+      expect(await callsigns()).toEqual(["BBB2:-1", "CCC3:-1", "AAA1:-1"]);
+
+      expect((await move(extender, "AAA1", 0)).statusCode).toBe(200);
+      expect((await move(extender, "BBB2", 5)).statusCode).toBe(200);
+      // Dropped at the bottom: everything else shifts up one.
+      await move(third, "CCC3", 0);
+      expect(await callsigns()).toEqual(["BBB2:2", "AAA1:1", "CCC3:0"]);
+
+      // Back above the bar, and the rest closes up.
+      await move(extender, "AAA1", -1);
+      expect(await callsigns(third)).toEqual(["AAA1:-1", "BBB2:1", "CCC3:0"]);
+
+      // A flight that completes leaves the list, and the indices stay contiguous.
+      await inbound(extender, "CCC3", { state: "STATE_FINISHED" });
+      expect(await callsigns()).toEqual(["AAA1:-1", "BBB2:0"]);
+      expect((await move(extender, "CCC3", 0)).statusCode).toBe(404);
+    });
+
+    it("lets anyone reorder until the airport's FMP is online, then only the FMP", async () => {
+      const flow: Identity = { cid: 1000005, callsign: "SY_FMP" };
+      await inbound(extender, "QFA1");
+      expect((await list()).fmp).toEqual({ position: "SY_FMP", online: false, callsign: null });
+      expect((await list()).can_move).toBe(true);
+      expect((await move(third, "QFA1", 0)).statusCode).toBe(200);
+
+      // Any call puts the FMP on plugin_clients.
+      await get("/arrivals/YSSY", flow);
+      expect((await list()).fmp).toEqual({ position: "SY_FMP", online: true, callsign: "SY_FMP" });
+      expect((await list()).can_move).toBe(false);
+      const refused = await move(third, "QFA1", -1);
+      expect(refused.statusCode).toBe(403);
+      expect(refused.json().message).toContain("SY_FMP");
+      expect((await list(flow)).can_move).toBe(true);
+      expect((await move(flow, "QFA1", -1)).statusCode).toBe(200);
+
+      // Another airport's FMP changes nothing here.
+      await db.query("UPDATE plugin_clients SET last_seen_at=now()-interval '1 minute' WHERE controller_cid=$1", [flow.cid]);
+      await get("/arrivals/YSSY", { cid: 1000006, callsign: "ML_FMP" });
+      expect((await list()).can_move).toBe(true);
+
+      // plugin_clients is not truncated between tests: no flow position left behind for the others.
+      await db.query("DELETE FROM plugin_clients WHERE controller_callsign LIKE '%\\_FMP'");
+    });
+
+    it("counts the controllers with each list open", async () => {
+      const viewing = async (who: Identity, airports: string[]) =>
+        (await post("/arrivals/viewing", who, { airports })).json().viewers;
+      expect(await viewing(extender, ["YSSY", "ymml"])).toEqual({ YSSY: 1, YMML: 1 });
+      expect(await viewing(third, ["YSSY"])).toEqual({ YSSY: 2 });
+      expect((await list()).viewers).toBe(2);
+
+      // Closed: no longer counted.
+      expect(await viewing(extender, ["YMML"])).toEqual({ YMML: 1 });
+      expect((await list()).viewers).toBe(1);
+
+      // Gone quiet: not counted either.
+      await db.query("UPDATE arrival_list_viewers SET last_seen_at=now()-interval '1 minute' WHERE controller_cid=$1", [third.cid]);
+      expect((await list()).viewers).toBe(0);
     });
   });
 

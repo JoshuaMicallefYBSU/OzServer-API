@@ -5,6 +5,7 @@ import { reportServerError } from "./alerts.js";
 import { pluginAuth } from "./auth.js";
 import { pool } from "./db.js";
 import { publish } from "./events.js";
+import { arrivalRoutes } from "./routes/arrivals.js";
 import { protectedClientLogRoutes, publicClientLogRoutes } from "./routes/client-logs.js";
 import { protectedAtisRoutes, publicAtisRoutes } from "./routes/atis.js";
 import { flightRoutes } from "./routes/flights.js";
@@ -125,6 +126,7 @@ export async function buildApp() {
     });
     await sectorRoutes(pluginApi);
     await flightRoutes(pluginApi);
+    await arrivalRoutes(pluginApi);
     await protectedAtisRoutes(pluginApi);
     await protectedClientLogRoutes(pluginApi);
     await protectedMessageRoutes(pluginApi);

@@ -9,7 +9,8 @@ import { SERVERS, type Server } from "./auth.js";
 // DTO here. `server` is carried only to route an event to the right subscribers.
 // "messages": a console message was sent or withdrawn (routes/messages.ts). Subscribers that do not
 // know a name ignore it - the map does, and so does a plugin older than the message system.
-const EVENT_TYPES = ["sectors", "fdr", "atis", "messages"] as const;
+// "arrivals": an Arrival List was reordered, or opened or closed somewhere (routes/arrivals.ts).
+const EVENT_TYPES = ["sectors", "fdr", "atis", "messages", "arrivals"] as const;
 export type OzEvent = { type: typeof EVENT_TYPES[number]; server: Server };
 
 const CHANNEL = "ozserver_events";

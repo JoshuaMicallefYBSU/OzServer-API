@@ -83,6 +83,12 @@ export async function runMaintenance(): Promise<void> {
     const expiredAtis = (await client.query(
       `DELETE FROM network_atis WHERE received_at < now()-($1*interval '1 minute')`,
       [config.NETWORK_ATIS_RETAIN_MINUTES])).rowCount ?? 0;
+    // An Arrival List place outlives nothing: once its flight's record has gone, so does it. And a
+    // viewer row is only read while it is seconds old (routes/arrivals.ts).
+    await client.query(
+      `DELETE FROM arrival_sequences s WHERE NOT EXISTS
+         (SELECT 1 FROM flight_data_records f WHERE f.server=s.server AND f.callsign=s.callsign)`);
+    await client.query("DELETE FROM arrival_list_viewers WHERE last_seen_at < now()-interval '10 minutes'");
     await client.query("DELETE FROM sector_requests WHERE rejected_at < now()-interval '1 day'");
     // Kept for a day: long enough to look into something reported the next morning. Purged by
     // created_at, not logged_at, which is the client's clock (see client-logs.ts) - a client whose
