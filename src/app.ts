@@ -11,6 +11,7 @@ import { protectedAtisRoutes, publicAtisRoutes } from "./routes/atis.js";
 import { flightRoutes } from "./routes/flights.js";
 import { eventRoutes } from "./routes/events.js";
 import { mapRoutes } from "./routes/map.js";
+import { networkRoutes } from "./routes/network.js";
 import { adminMessageRoutes, protectedMessageRoutes } from "./routes/messages.js";
 import { pluginRoutes } from "./routes/plugin.js";
 import { serverRoutes } from "./routes/servers.js";
@@ -127,6 +128,7 @@ export async function buildApp() {
     await sectorRoutes(pluginApi);
     await flightRoutes(pluginApi);
     await arrivalRoutes(pluginApi);
+    await networkRoutes(pluginApi);
     await protectedAtisRoutes(pluginApi);
     await protectedClientLogRoutes(pluginApi);
     await protectedMessageRoutes(pluginApi);

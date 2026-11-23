@@ -3,6 +3,7 @@ import { parseServer } from "../auth.js";
 import { config } from "../config.js";
 import { pool } from "../db.js";
 import { atisSectionContent, atisTimestamp } from "../network-atis.js";
+import { externalHoldings } from "../external-control.js";
 import { afvTransceivers, vatsimData } from "../vatsim.js";
 
 const visibleTypes = ["TWR", "APP", "DEP", "CTR", "FSS"];
@@ -98,23 +99,36 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
        JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.type=ANY($1) ORDER BY s.name`,
       [visibleTypes, server])).rows;
 
+    // And those worked by controllers without the plugin (external-control.ts), as online and
+    // marked external.
+    const external = await externalHoldings(pool, server);
+    const externalRows = external.holdings.size === 0 ? [] : (await pool.query(
+      "SELECT * FROM sectors WHERE name=ANY($1) AND type=ANY($2) ORDER BY name", [[...external.holdings.keys()], visibleTypes])).rows
+      .map(row => {
+        const holding = external.holdings.get(row.name)!;
+        return {
+          name: row.name, full_name: row.full_name, callsign: row.callsign, frequency: row.frequency,
+          boundary: row.boundary, owner: { cid: holding.cid, callsign: holding.callsign }, online: true, external: true
+        };
+      });
+
     // VATSIM's datafeed lists live-network connections only, so it answers "online" for `live`.
     // For the other servers, recency of last_seen_online_at is the equivalent signal (see
     // sectors.ts isPresent).
     if (server === "live") {
       const online = new Set((await vatsimData())?.controllers?.map(controller => controller.callsign.toUpperCase()) ?? []);
-      return rows.map(row => ({
+      return [...rows.map(row => ({
         name: row.name, full_name: row.full_name, callsign: row.callsign, frequency: row.frequency,
         boundary: row.boundary, owner: { cid: row.controller_cid, callsign: row.controller_callsign },
         online: online.has(row.callsign?.toUpperCase())
-      }));
+      })), ...externalRows];
     }
-    return rows.map(row => ({
+    return [...rows.map(row => ({
       name: row.name, full_name: row.full_name, callsign: row.callsign, frequency: row.frequency,
       boundary: row.boundary, owner: { cid: row.controller_cid, callsign: row.controller_callsign },
       online: row.last_seen_online_at !== null
         && Date.now() - new Date(row.last_seen_online_at).getTime() < config.PRESENCE_TIMEOUT_SECONDS * 1000
-    }));
+    })), ...externalRows];
   });
 
   app.get<{ Querystring: { server?: string } }>("/map/aircraft", async (request, reply) => {
@@ -225,10 +239,16 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
+    // Airspace worked by controllers without the plugin (external-control.ts): held, but not
+    // through OzServer, so drawn apart from the ownerships above.
+    const external = await externalHoldings(pool, server);
+
     return {
       server,
       generated_at: new Date().toISOString(),
       presence_timeout_seconds: config.PRESENCE_TIMEOUT_SECONDS,
+      external: [...external.holdings.values()].sort((a, b) => a.sector.localeCompare(b.sector)),
+      external_controllers: external.controllers,
       ownerships: ownerships.rows.map(row => ({
         sector: row.name, cid: row.controller_cid, callsign: row.controller_callsign,
         since: row.updated_at ?? row.created_at, last_seen_at: row.last_seen_online_at
@@ -294,11 +314,25 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
         `SELECT s.name AS sector_name, s.type, s.frequency, s.region, o.controller_cid AS cid, o.controller_callsign AS callsign
            FROM sector_ownerships o JOIN sectors s ON s.id=o.sector_id
           WHERE o.server=$1 AND s.callsign=o.controller_callsign`, [server])).rows;
-      return rows.map(row => ({
+      // And the controllers without the plugin that the plugins can see (external-control.ts), on
+      // the position named by their callsign, or failing that the first sector they work.
+      const external = await externalHoldings(pool, server);
+      const shapes = new Map((await pool.query("SELECT name,callsign,type,region FROM sectors WHERE name=ANY($1)",
+        [external.controllers.flatMap(controller => controller.sectors)])).rows.map(row => [row.name, row]));
+      const externalRows = external.controllers.map(controller => {
+        const home = controller.sectors.map(name => shapes.get(name)).find(sector => sector?.callsign?.toUpperCase() === controller.callsign)
+          ?? shapes.get(controller.sectors[0] ?? "");
+        return {
+          cid: controller.cid, callsign: controller.callsign, frequencies: controller.frequencies.map(Number),
+          sector_name: home?.name ?? null, type: home?.type ?? null, region: home?.region ?? null, is_ozserver: false
+        };
+      });
+      return [...rows.map(row => ({
         cid: row.cid, callsign: row.callsign,
         frequencies: row.frequency ? [Number(row.frequency)] : [],
         sector_name: row.sector_name, type: row.type, region: row.region, is_ozserver: true
-      })).sort((a, b) => (typePriority[a.type] ?? 99) - (typePriority[b.type] ?? 99) || a.sector_name.localeCompare(b.sector_name));
+      })), ...externalRows].sort((a, b) => (typePriority[a.type ?? ""] ?? 99) - (typePriority[b.type ?? ""] ?? 99)
+        || (a.sector_name ?? "").localeCompare(b.sector_name ?? ""));
     }
 
     const data = await vatsimData();

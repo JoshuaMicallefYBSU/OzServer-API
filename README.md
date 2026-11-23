@@ -165,6 +165,7 @@ answers `401`.
 | `GET /arrivals/:ades` | An airport's Arrival List: every departed flight record inbound to it with its landing time, type and global ops, in sequence order; how many controllers have it open and who; whether its FMP is online, and whether the caller may reorder |
 | `POST /arrivals/:ades/sequence` | Move a flight in the sequence (`seq_index`, -1 to unsequence); anyone may unless the airport's FMP (`CB_FMP` for YSCB) is online, then only the FMP (403 otherwise) |
 | `POST /arrivals/viewing` | The Arrival Lists this controller has open; answers the viewer count for each |
+| `POST /network/controllers` | Every controller this client's vatSys can see (position, frequencies, information lines), so the airspace of those without the plugin counts as held - see `src/external-control.ts` |
 | `POST /atis` | Record the ATIS an OzServer controller's own vatSys is running |
 | `POST /client-logs` | Forward plugin log lines (up to 200 per batch) |
 | `GET /messages` | Console messages waiting for this controller (marks them delivered) |

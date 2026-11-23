@@ -1,12 +1,16 @@
 // VATSIM's public datafeed, for the public map (routes/map.ts) only: the map has to show every
 // controller and aircraft on the network, plugin user or not.
 //
+// And for the controllers without the plugin whose airspace counts as held (external-control.ts),
+// which only adds to what the plugins themselves report.
+//
 // Do not use this to decide whether a controller OzServer tracks is still connected. The feed is
 // cached here for 15 s on top of VATSIM's own publish interval and lags a real connection by tens
 // of seconds in both directions. Sector ownership, FDR authority and disconnect handling use
 // sector_ownerships.last_seen_online_at, which the heartbeat in app.ts keeps current.
 
-type Controller = { cid: number; callsign: string; frequency?: string };
+// facility 0 is an observer (see external-control.ts).
+type Controller = { cid: number; callsign: string; frequency?: string; name?: string; facility?: number; text_atis?: string[] | null };
 export type Pilot = {
   callsign: string; latitude: number; longitude: number; altitude: number; groundspeed: number; heading: number;
   flight_plan?: { aircraft?: string; aircraft_short?: string; altitude?: string; arrival?: string } | null;
@@ -44,6 +48,14 @@ export async function vatsimData(): Promise<VatsimData | null> {
     return value;
   })().finally(() => { dataRefresh = null; });
   return dataRefresh;
+}
+
+// The feeds as last fetched, without waiting for a refresh (which is started if one is due). For
+// work done holding the sector-mutation lock, which must not wait on VATSIM for up to 20 s.
+export function latestVatsimData(): { data: VatsimData | null; transceivers: TransceiverEntry[] } {
+  if (dataCache.expires <= Date.now()) void vatsimData();
+  if (transceiverCache.expires <= Date.now()) void afvTransceivers();
+  return { data: dataCache.value, transceivers: transceiverCache.value };
 }
 
 export async function afvTransceivers(): Promise<TransceiverEntry[]> {

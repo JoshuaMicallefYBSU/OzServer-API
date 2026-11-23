@@ -2,7 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { FastifyInstance } from "fastify";
 import pg from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 // End-to-end tests of the routes against a real Postgres: the claim, transfer, resume and sweep
 // rules are almost entirely SQL plus the order things happen in.
@@ -69,6 +69,11 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     await sector("INA", "XX-INA_CTR", []);
     await sector("OUT", "XX-OUT_APP", []);
     await sector("FAR", "XX-FAR_CTR", []);
+    // FAR on 128.400, and a tower elsewhere sharing it: an en-route controller on 128.400 works FAR
+    // only (external-control.ts frequencySectors). Set before the app starts, which caches sectors.
+    await db.query("UPDATE sectors SET frequency='128.400' WHERE name='FAR'");
+    await db.query(`INSERT INTO sectors (name,full_name,callsign,type,frequency,responsible_sectors)
+                    VALUES ('ZZ ADC','Zed Tower','ZZ_TWR','TWR','128.400','[]')`);
     await db.query(
       "INSERT INTO sectors (name,full_name,callsign,type,responsible_sectors) VALUES ('XX FMP','XX FMP','XX_FMP','FMP','[]')");
     // The map places an ATIS at its airport's position, so an airport the dataset has no position
@@ -742,6 +747,51 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
         method: "POST", url: `/api/v1/admin/messages/${id}/withdraw`, headers: { authorization: `Bearer ${consoleToken}` }
       })).statusCode).toBe(204);
       expect(await waiting(primary)).toEqual([]);
+    });
+  });
+
+  describe("controllers connected without the plugin", () => {
+    // Never calls the API itself: only seen in other controllers' reports.
+    const outsider = "XX-EXT_CTR";
+    const report = (who: Identity, controllers: Array<Record<string, unknown>>) =>
+      post("/network/controllers", who, { controllers });
+    const controlled = async (who: Identity) =>
+      ((await get("/sectors/sync", who)).json().controlled as Array<{ name: string; owner: { callsign: string; external?: boolean } }>);
+
+    afterEach(async () => {
+      await db.query("TRUNCATE network_controllers");
+      (await import("./external-control.js")).invalidateExternalHoldings("live");
+    });
+
+    it("holds what their information lines and their frequencies say they work", async () => {
+      expect((await report(third, [{ callsign: outsider, frequencies: ["128.400"], sectors: [], atis: ["Extending INA"] }])).statusCode).toBe(204);
+      const held = await controlled(primary);
+      expect(held.filter(row => row.owner.external).map(row => row.name).sort()).toEqual(["FAR", "INA"]);
+      expect(held.find(row => row.name === "INA")?.owner).toMatchObject({ callsign: outsider, external: true });
+    });
+
+    it("cannot be claimed or requested from them", async () => {
+      await report(third, [{ callsign: outsider, frequencies: ["128.400"], sectors: [], atis: ["Extending INA"] }]);
+      const claim = await post("/sectors/INA/claim", primary);
+      expect(claim.statusCode).toBe(409);
+      expect(claim.json().conflicts[0]).toMatchObject({ sector: "INA", owner: { callsign: outsider, external: true } });
+      // As a conflict in the group around it too: a claim of GRP does not take INA off them.
+      const group = await post("/sectors/GRP/claim", primary);
+      expect(group.statusCode).toBe(409);
+      expect(group.json().conflicts.map((c: { sector: string }) => c.sector)).toEqual(["INA"]);
+      const request = await post("/sectors/FAR/request", primary);
+      expect(request.statusCode).toBe(409);
+      expect(request.json().message).toMatch(/not using the OzServer plugin/);
+    });
+
+    it("leaves alone a controller who runs the plugin, and a sector someone on OzServer holds", async () => {
+      await post("/sectors/FAR/claim", extender);
+      await report(third, [
+        { callsign: primary.callsign, frequencies: [], sectors: ["INA"], atis: [] },
+        { callsign: outsider, frequencies: ["128.400"], sectors: [], atis: [] }
+      ]);
+      await get("/sectors/sync", primary);
+      expect((await controlled(third)).filter(row => row.owner.external)).toEqual([]);
     });
   });
 

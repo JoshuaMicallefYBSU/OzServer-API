@@ -6,6 +6,7 @@ import { config } from "../config.js";
 import { writeDiagnosticLog } from "../diagnostics.js";
 import { pool, transaction } from "../db.js";
 import { isWithinStartupGrace } from "../presence.js";
+import { externalHoldings, type ExternalHolding } from "../external-control.js";
 import { clearFlightsOf, reassignFreedSectors, TMA_SECTOR_TYPES_SQL } from "../grouping.js";
 import type { ControllerIdentity } from "../types.js";
 
@@ -32,6 +33,23 @@ function mayOwn(identity: { callsign: string }, sector: { type?: string | null; 
 }
 
 const flowOnlyMessage = "Unable to assume sector - position is FMP. An FMP can only request a sector another controller holds, as relief cover.";
+
+// A sector worked by a controller without the plugin (external-control.ts): nobody can answer a
+// request for it, so it is coordinated with them directly.
+function externalMessage(holding: ExternalHolding): string {
+  return `${holding.sector} is controlled by ${holding.callsign}, who is not using the OzServer plugin. `
+    + "Coordinate with them directly - tag handoffs and coordination have to be done manually.";
+}
+
+// An external holder in the shape every owner is reported in. They have no CID where vatSys's
+// controller list is the only source (SweatBox), and 0 is never a real one.
+const externalOwner = (holding: ExternalHolding) => ({ cid: holding.cid ?? 0, callsign: holding.callsign, external: true });
+
+// Whether a holding stands against this controller: never their own callsign, which they hold
+// themselves once their plugin's calls catch up with their vatSys logon.
+function heldAgainst(holding: ExternalHolding | undefined, identity: ControllerIdentity): holding is ExternalHolding {
+  return !!holding && holding.callsign.toUpperCase() !== identity.callsign.toUpperCase();
+}
 
 const sectorNames = z.array(z.string().max(32)).max(400);
 
@@ -164,6 +182,13 @@ async function claimGroup(
     .filter(row => row.controller_callsign
       && row.callsign?.toUpperCase() === row.controller_callsign.toUpperCase())
     .map(row => row.controller_callsign!.toUpperCase()));
+  // Sectors worked by a controller without the plugin (external-control.ts) are held exactly as a
+  // present owner's are: a conflict when named, withheld when swept up with their own position.
+  const { holdings } = await externalHoldings(client, identity.server);
+  for (const row of everything) {
+    const holding = holdings.get(row.name);
+    if (heldAgainst(holding, identity) && row.callsign?.toUpperCase() === holding.callsign) positionOwnersInClaim.add(holding.callsign);
+  }
   // No claim takes a sector off a controller who is present - not even a primary logging on to
   // their own position, since the aircraft inside would move with it mid-session. A present owner
   // is always a conflict, which the arriving client turns into a request to the holder
@@ -172,6 +197,18 @@ async function claimGroup(
   void primaryGroup;
 
   for (const row of rows) {
+    // Present OzServer owners never appear in holdings, so a row here has no owner, a gone-quiet
+    // one, or this controller.
+    const holding = holdings.get(row.name);
+    if (heldAgainst(holding, identity) && row.controller_cid !== identity.cid) {
+      if (positionOwnersInClaim.has(holding.callsign) && row.name !== name) {
+        withheld.push(row.name);
+        continue;
+      }
+      skipped.push(row.name);
+      conflicts.push({ sector: row.name, owner: externalOwner(holding) });
+      continue;
+    }
     if (row.controller_cid === null || row.controller_cid === identity.cid) {
       takeable.push(row);
       continue;
@@ -304,7 +341,25 @@ async function syncPayload(client: pg.Pool | pg.PoolClient, identity: Controller
     `SELECT DISTINCT controller_cid AS cid, controller_callsign AS callsign FROM plugin_clients
       WHERE server=$1 AND last_seen_at >= now()-($2*interval '1 second') ORDER BY controller_callsign`,
     [identity.server, PLUGIN_CLIENT_WINDOW_SECONDS])).rows;
-  return { mine, controlled, requests: await requestsPayload(client, identity), plugin_clients: pluginClients };
+  // Sectors worked by controllers without the plugin, listed as controlled like anyone else's and
+  // marked so the plugin explains instead of requesting (external-control.ts). Never this
+  // controller's own: their vatSys logon can be reported before their plugin's first call.
+  const external = await externalHoldings(client, identity.server);
+  const fullNames = new Map((await client.query(
+    "SELECT name,full_name,type,callsign,frequency FROM sectors WHERE name=ANY($1)", [[...external.holdings.keys()]]))
+    .rows.map(row => [row.name, row]));
+  for (const holding of external.holdings.values()) {
+    if (!heldAgainst(holding, identity) || controlled.some(row => row.name === holding.sector)) continue;
+    const sector = fullNames.get(holding.sector);
+    controlled.push({
+      name: holding.sector, full_name: sector?.full_name ?? "", type: sector?.type ?? null, callsign: sector?.callsign ?? null,
+      frequency: sector?.frequency ?? null, owner: externalOwner(holding)
+    });
+  }
+  return {
+    mine, controlled, requests: await requestsPayload(client, identity), plugin_clients: pluginClients,
+    external_controllers: external.controllers.filter(controller => controller.callsign !== identity.callsign.toUpperCase())
+  };
 }
 
 const PLUGIN_CLIENT_WINDOW_SECONDS = 15;
@@ -511,6 +566,10 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       `SELECT s.id,s.type,s.callsign,o.controller_cid,o.controller_callsign FROM sectors s LEFT JOIN sector_ownerships o ON o.sector_id=s.id AND o.server=$2 WHERE s.name=$1`,
       [request.params.name, request.controller.server])).rows[0];
     if (!sector) return { code: 404, body: { message: "Sector not found." } };
+    // Nobody on the other end to answer it (external-control.ts).
+    const holding = (await externalHoldings(client, request.controller.server)).holdings.get(request.params.name);
+    if (!sector.controller_cid && heldAgainst(holding, request.controller))
+      return { code: 409, body: { message: externalMessage(holding), external: externalOwner(holding) } };
     // A flow position may ask for airspace someone holds (relief cover), never claim what nobody does.
     if (!sector.controller_cid && !mayOwn(request.controller, sector)) return { code: 403, body: { message: flowOnlyMessage } };
     if (!sector.controller_cid) return { code: 400, body: { message: "Sector is unclaimed - claim it directly instead of requesting it." } };
@@ -644,7 +703,10 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     const resumed: string[] = [];
     const restoredFlights: string[] = [];
     if (snapshot && Date.now() - new Date(snapshot.created_at).getTime() <= config.RESUME_WINDOW_MINUTES * 60_000) {
+      // Not what a controller without the plugin has taken on meanwhile (external-control.ts).
+      const { holdings } = await externalHoldings(client, request.controller.server);
       for (const name of snapshot.sectors as string[]) {
+        if (heldAgainst(holdings.get(name), request.controller)) continue;
         const sector = (await client.query("SELECT id FROM sectors WHERE name=$1", [name])).rows[0];
         if (!sector) continue;
         const inserted = await client.query(
