@@ -770,6 +770,21 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect(held.find(row => row.name === "INA")?.owner).toMatchObject({ callsign: outsider, external: true });
     });
 
+    it("holds every subsector of a group they extend onto, except one someone else is working", async () => {
+      await report(third, [{ callsign: outsider, frequencies: [], sectors: [], atis: ["Extending GRP"] }]);
+      const external = async () => Object.fromEntries((await controlled(primary))
+        .filter(row => row.owner.external).map(row => [row.name, row.owner.callsign]));
+      expect(await external()).toEqual({ GRP: outsider, INA: outsider, OUT: outsider });
+
+      // Somebody else without the plugin, working INA, keeps it.
+      await report(third, [
+        { callsign: outsider, frequencies: [], sectors: [], atis: ["Extending GRP"] },
+        { callsign: "XX-SUB_CTR", frequencies: [], sectors: ["INA"], atis: [] }
+      ]);
+      (await import("./external-control.js")).invalidateExternalHoldings("live");
+      expect(await external()).toEqual({ GRP: outsider, INA: "XX-SUB_CTR", OUT: outsider });
+    });
+
     it("cannot be claimed or requested from them", async () => {
       await report(third, [{ callsign: outsider, frequencies: ["128.400"], sectors: [], atis: ["Extending INA"] }]);
       const claim = await post("/sectors/INA/claim", primary);

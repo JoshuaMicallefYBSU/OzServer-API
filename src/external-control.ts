@@ -28,6 +28,8 @@ import { latestVatsimData } from "./vatsim.js";
 //     datafeed and AFV's transceivers too (which is also how a controller nobody with the plugin
 //     can see is found). Frequencies are reused across the country, so see frequencySectors for
 //     which sector one means.
+//  4. Everything under any of those that is a group (expandHoldings), as a claim of it would take:
+//     extending onto MUN is YWE, OXL and GTH too, unless somebody else is working one of them.
 //
 // What stays out: plugin users (plugin_clients), a sector a present OzServer controller holds, and
 // anything a flow position could not hold (the FMP rule in routes/sectors.ts).
@@ -84,6 +86,8 @@ export function normaliseFrequency(value: unknown): string | null {
 
 type SectorInfo = {
   name: string; full_name: string; callsign: string | null; type: string | null; frequency: string | null;
+  // The sectors it is a group of (expandHoldings). A sector that is also a group lists itself.
+  children: string[];
   // The middle of its boundary, for telling apart sectors that share a frequency. Null without one.
   centre: { lat: number; lon: number } | null;
   // How a controller's information lines name it (atisSectors), compiled once with the index.
@@ -97,12 +101,13 @@ let sectorCache: { expires: number; value: Promise<SectorIndex> } | null = null;
 function sectorIndex(): Promise<SectorIndex> {
   if (sectorCache && sectorCache.expires > Date.now()) return sectorCache.value;
   const value = (async () => {
-    const rows = (await pool.query("SELECT name, full_name, callsign, type, frequency, boundary FROM sectors")).rows;
+    const rows = (await pool.query("SELECT name, full_name, callsign, type, frequency, responsible_sectors, boundary FROM sectors")).rows;
     const byName = new Map<string, SectorInfo>();
     const byFrequency = new Map<string, SectorInfo[]>();
     for (const row of rows) {
       const sector: SectorInfo = {
         name: row.name, full_name: row.full_name ?? "", callsign: row.callsign, type: row.type, frequency: row.frequency,
+        children: stringArray(row.responsible_sectors).filter(child => child !== row.name),
         centre: centreOf(row.boundary),
         patterns: {
           // As written in capitals, its space included ("BN SMC"); never part of a longer token.
@@ -334,11 +339,46 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
       holdings.set(name, { sector: name, callsign: controller.callsign, cid: controller.cid });
     }
   }
+  expandHoldings(holdings, owned, index);
   for (const controller of ordered) {
     controller.sectors = [...holdings.values()].filter(h => h.callsign === controller.callsign).map(h => h.sector).sort();
   }
 
   return { controllers: ordered.filter(controller => controller.sectors.length > 0), holdings };
+}
+
+// Bounded like routes/sectors.ts's covered(), against a cyclical grouping in the dataset.
+const MAX_GROUP_DEPTH = 8;
+
+// A sector held as a group holds everything under it, as a claim of it would (covered() in
+// routes/sectors.ts): ML-BLA_CTR extending onto MUN works YWE, OXL and GTH too. Runs after every
+// controller's own sectors are placed, so a subsector somebody is working stays theirs - BLA's ELW
+// with ML-ELW_CTR - and nothing under it is taken either. The same goes for one an OzServer
+// controller holds. Where two groups share a subsector, the first controller by callsign has it.
+export function expandHoldings(
+  holdings: Map<string, ExternalHolding>,
+  owned: Set<string>,
+  index: SectorIndex
+): void {
+  const direct = [...holdings.values()].sort((a, b) => a.callsign.localeCompare(b.callsign) || a.sector.localeCompare(b.sector));
+  for (const root of direct) {
+    const flow = callsignKind(root.callsign) === "FMP";
+    let frontier = [root.sector];
+    for (let depth = 0; depth < MAX_GROUP_DEPTH && frontier.length > 0; depth++) {
+      const next: string[] = [];
+      for (const name of frontier) {
+        for (const child of index.byName.get(name)?.children ?? []) {
+          const sector = index.byName.get(child);
+          if (!sector || owned.has(child) || holdings.has(child)) continue;
+          // A flow position holds flow sectors only.
+          if (flow && kindOf(sector.type) !== "FMP") continue;
+          holdings.set(child, { sector: child, callsign: root.callsign, cid: root.cid });
+          next.push(child);
+        }
+      }
+      frontier = next;
+    }
+  }
 }
 
 function stringArray(value: unknown): string[] {
