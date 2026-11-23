@@ -128,12 +128,19 @@ async function arrivalList(client: pg.PoolClient, identity: ControllerIdentity, 
     ...unsequenced.map(member => row(member, -1)),
     ...sequenced.map((member, index) => row(member, index)).reverse()
   ];
+  // Who has it open, for the window's "Connected" badge: callsigns only, as the ops picture shows
+  // them (routes/map.ts), never CIDs.
+  const viewerCallsigns = (await client.query<{ callsign: string }>(
+    `SELECT DISTINCT controller_callsign AS callsign FROM arrival_list_viewers
+      WHERE server=$1 AND ades=$2 AND last_seen_at >= now()-($3*interval '1 second') ORDER BY controller_callsign`,
+    [identity.server, ades, VIEWER_TIMEOUT_SECONDS])).rows.map(row => row.callsign);
   const viewers = (await viewerCounts(client, identity.server, [ades]))[ades] ?? 0;
   const fmp = await onlineFmp(client, identity.server, ades);
   return {
     ades,
     flights,
     viewers,
+    viewer_callsigns: viewerCallsigns,
     fmp: { position: `${ades.slice(-2)}_FMP`, online: fmp != null, callsign: fmp },
     can_move: mayMove(identity, ades, fmp)
   };

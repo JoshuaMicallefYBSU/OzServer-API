@@ -487,6 +487,7 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect(await viewing(extender, ["YSSY", "ymml"])).toEqual({ YSSY: 1, YMML: 1 });
       expect(await viewing(third, ["YSSY"])).toEqual({ YSSY: 2 });
       expect((await list()).viewers).toBe(2);
+      expect((await list()).viewer_callsigns).toEqual([extender.callsign, third.callsign].sort());
 
       // Closed: no longer counted.
       expect(await viewing(extender, ["YMML"])).toEqual({ YMML: 1 });
