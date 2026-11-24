@@ -8,10 +8,11 @@ import { latestVatsimData } from "./vatsim.js";
 // sector_ownerships alone OzServer would offer TBD and MUN to the next plugin user as free. Their
 // sectors count as held instead ("external" holdings):
 //
-//  - Nobody can claim them: claimGroup treats each as a conflict with that controller, or withholds
-//    it from a claim that only sweeps it up (routes/sectors.ts).
-//  - Nobody can request them: there is no plugin on the other end to answer. The plugin explains
-//    that coordination and tag handoffs have to be done by hand instead.
+//  - Nobody claims them unasked: claimGroup treats each as a conflict with that controller, or
+//    withholds it from a claim that only sweeps it up (routes/sectors.ts), unless the claim says
+//    to take it (take_external).
+//  - Nobody can request them: there is no plugin on the other end to answer. The plugin offers to
+//    take them instead, explaining that coordination and tag handoffs have to be done by hand.
 //  - Every plugin lists them as controlled, and the map shades them faintly.
 //
 // Nothing is stored as ownership. A holding exists only while it is worked out here, so it ends the
@@ -31,8 +32,14 @@ import { latestVatsimData } from "./vatsim.js";
 //  4. Everything under any of those that is a group (expandHoldings), as a claim of it would take:
 //     extending onto MUN is YWE, OXL and GTH too, unless somebody else is working one of them.
 //
-// What stays out: plugin users (plugin_clients), a sector a present OzServer controller holds, and
-// anything a flow position could not hold (the FMP rule in routes/sectors.ts).
+// What stays out: plugin users (plugin_clients), a sector a present OzServer controller holds, the
+// sector a plugin user is logged on as (reserved), controllers who have logged off
+// but are still listed by VATSIM (gone), and anything a flow position could not hold (the FMP rule
+// in routes/sectors.ts).
+//
+// None of it is final: OzServer only infers what these controllers work. A plugin user may take any
+// of it by saying so (take_external in routes/sectors.ts), once the plugin has told them to have
+// coordinated it with the controller first.
 //
 // A plugin user stays out for the rest of that VATSIM session, not only while their plugin is
 // calling. Leaving cleanly releases everything (POST /sectors/release-all), and a crash keeps their
@@ -68,6 +75,11 @@ const PLUGIN_SESSION_LOOKBACK_HOURS = 24;
 // session by (leftPlugin): long enough for a crashed client to fall off every vatSys list. Not
 // DISCONNECT_GRACE_MINUTES, which is how long their sectors are kept, and shorter.
 const LEFT_PLUGIN_WITHOUT_LOGON_MINUTES = 10;
+
+// How long the plugin that last reported a controller has to go on reporting without them before
+// they count as logged off: more than one report interval (15 s), so a single report that missed
+// them while their vatSys entry was being refreshed does not.
+const GONE_AFTER_SECONDS = 25;
 
 // What vatSys and VATSIM treat as a controller position. Observers, ATIS and pilots are not.
 const CONTROLLER_CALLSIGN = /^\w[\w-]*_(FSS|CTR|APP|DEP|TWR|GND|DEL|RMP|TMU|FMP|RDO)$/i;
@@ -295,6 +307,31 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
   for (const row of ownedRows.rows) plugin.add(String(row.callsign));
   const owned = new Set<string>(ownedRows.rows.map(row => String(row.name)));
 
+  // The sector a plugin user is logged on as is theirs, not a controller without the plugin's who
+  // was covering it before they arrived - vatSys gives a sector to the controller logged on as it.
+  // Nor is anything under it held by way of it (expandHoldings). ML-BLA_CTR logged on while
+  // ML-GUN_CTR was still extending onto BLA, and could not claim BLA, ELW, MAE, MAV, MAW, MDN or MDS
+  // for two and a half minutes (24 Nov 2026). A subsector the controller without the plugin names,
+  // or is on the frequency of, is still theirs.
+  const reserved = new Set<string>([...index.byName.values()]
+    .filter(sector => sector.callsign && plugin.has(sector.callsign.toUpperCase()))
+    .map(sector => sector.name));
+
+  // Controllers who have logged off, though VATSIM's datafeed and AFV go on listing them for a
+  // minute or two more (ML-GUN_CTR held GUN, SNO, MNN and ARL against ML-BLA_CTR for about two
+  // minutes after logging off, 24 Nov 2026): the plugin that last reported them is still reporting
+  // and has left them out for longer than a report interval, and no other plugin has seen them
+  // since. Their vatSys dropped them, which it does when they log off.
+  // A session VATSIM says began after that is a new one, and counts again.
+  const goneRows = await db.query(
+    `SELECT upper(n.callsign) AS callsign, n.last_seen_at FROM network_controllers n
+      WHERE n.server=$1 AND EXISTS (
+        SELECT 1 FROM network_controllers m
+         WHERE m.server=n.server AND m.reported_by_cid=n.reported_by_cid
+           AND m.last_seen_at > n.last_seen_at + ($2*interval '1 second'))`,
+    [server, GONE_AFTER_SECONDS]);
+  const lastReported = new Map<string, number>(goneRows.rows.map(row => [String(row.callsign), new Date(row.last_seen_at).getTime()]));
+
   const lastPluginCall = new Map<string, number>();
   for (const row of lastPluginCalls.rows) {
     const at = new Date(row.last_seen_at).getTime();
@@ -315,6 +352,12 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
     if (!Number.isNaN(logon)) return logon <= last;
     return Date.now() - last < LEFT_PLUGIN_WITHOUT_LOGON_MINUTES * 60_000;
   };
+  const gone = (callsign: string): boolean => {
+    const last = lastReported.get(callsign);
+    if (last === undefined) return false;
+    const logon = Date.parse(feed.get(callsign)?.logon_time ?? "");
+    return Number.isNaN(logon) || logon <= last;
+  };
 
   const frequencies = (values: unknown[]) => [...new Set(values.map(normaliseFrequency).filter((f): f is string => f !== null))];
   // Their own position: as a plugin reported it, or the sector whose callsign is theirs.
@@ -329,7 +372,7 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
   const infoLines = new Map<string, string[]>();
   for (const row of reported.rows) {
     const callsign = String(row.callsign).toUpperCase();
-    if (plugin.has(callsign) || leftPlugin(callsign) || !isControllerCallsign(callsign)) continue;
+    if (plugin.has(callsign) || leftPlugin(callsign) || gone(callsign) || !isControllerCallsign(callsign)) continue;
     infoLines.set(callsign, stringArray(row.atis));
     controllers.set(callsign, {
       callsign,
@@ -344,7 +387,7 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
     const afv = new Map(transceivers.map(entry => [entry.callsign.toUpperCase(), (entry.transceivers ?? []).map(t => t.frequency)]));
     for (const [callsign, atc] of feed) {
       // Facility 0 is an observer.
-      if (plugin.has(callsign) || leftPlugin(callsign) || !isControllerCallsign(callsign) || atc.facility === 0) continue;
+      if (plugin.has(callsign) || leftPlugin(callsign) || gone(callsign) || !isControllerCallsign(callsign) || atc.facility === 0) continue;
       const entry = controllers.get(callsign) ?? {
         callsign, cid: null, real_name: atc.name ?? null, frequencies: [], sectors: ownPosition(callsign, [])
       };
@@ -374,14 +417,14 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
     }
     for (const name of names) {
       const sector = index.byName.get(name);
-      if (!sector || owned.has(name)) continue;
+      if (!sector || owned.has(name) || reserved.has(name)) continue;
       // A flow position holds flow sectors only.
       if (callsignKind(controller.callsign) === "FMP" && kindOf(sector.type) !== "FMP") continue;
       if (holdings.has(name) && sector.callsign?.toUpperCase() !== controller.callsign) continue;
       holdings.set(name, { sector: name, callsign: controller.callsign, cid: controller.cid });
     }
   }
-  expandHoldings(holdings, owned, index);
+  expandHoldings(holdings, new Set([...owned, ...reserved]), index);
   for (const controller of ordered) {
     controller.sectors = [...holdings.values()].filter(h => h.callsign === controller.callsign).map(h => h.sector).sort();
   }

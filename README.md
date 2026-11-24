@@ -150,10 +150,10 @@ answers `401`.
 | --- | --- |
 | `GET /sectors/sync` | Everything a client needs in one read: sectors owned, sectors held by others, and pending requests |
 | `GET /sectors/mine` · `GET /sectors/controlled` · `GET /sector-requests` | The three parts of `/sectors/sync` on their own |
-| `POST /sectors/:name/claim` | Claim a sector and its group; `409` with the conflicts when another controller holds part of it. A dropped controller's sectors are conflicts too (`owner.dropped`, with `released_at`) unless the body has `take_dropped: true` |
+| `POST /sectors/:name/claim` | Claim a sector and its group; `409` with the conflicts when another controller holds part of it. A dropped controller's sectors are conflicts too (`owner.dropped`, with `released_at`) unless the body has `take_dropped: true`. So are sectors worked by a controller without the plugin (`owner.external`) unless it has `take_external: true` |
 | `POST /sectors/:name/release` | Release a sector |
 | `POST /sectors/:name/request` | Ask the current owner for a sector |
-| `POST /sectors/commit` | Apply a set of claims, releases and requests in one transaction; `take_dropped` as for a claim |
+| `POST /sectors/commit` | Apply a set of claims, releases and requests in one transaction; `take_dropped` and `take_external` as for a claim |
 | `POST /sectors/release-all` | Release everything, on a deliberate disconnect |
 | `POST /sectors/resume` | Recover sectors, and the tags to restore, after a dropped connection |
 | `POST /sector-requests/:id/accept` · `/reject` · `/cancel` | Answer or withdraw one request |

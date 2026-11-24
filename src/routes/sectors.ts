@@ -85,14 +85,17 @@ const mutationSchema = z.object({
   // Accepted and ignored - see claimGroup.
   primary_group: sectorNames.optional(),
   // See droppedOwner. Applied to every sector in `claim`.
-  take_dropped: z.boolean().default(false)
+  take_dropped: z.boolean().default(false),
+  // See claimGroup. Applied to every sector in `claim`.
+  take_external: z.boolean().default(false)
 });
 
 // The single-sector claim's body. A plain claim sends nothing but its identity.
 const claimSchema = z.object({
   exclude: sectorNames.default([]),
   primary_group: sectorNames.optional(),
-  take_dropped: z.boolean().default(false)
+  take_dropped: z.boolean().default(false),
+  take_external: z.boolean().default(false)
 });
 
 // The logon position's own sectors, for handOverPosition.
@@ -179,7 +182,8 @@ async function claimGroup(
   exclusions: string[] = [],
   allOrNothing = false,
   primaryGroup?: string[],
-  takeDropped = false
+  takeDropped = false,
+  takeExternal = false
 ): Promise<{ claimed: string[]; skipped: string[]; withheld: string[]; conflicts: Array<{ sector: string; owner: ConflictOwner }>; missing: boolean; refused: string[] }> {
   const everything = await covered(client, name, identity.server);
   // Only a sector that does not exist is "missing". A claim whose exclusions leave nothing to take
@@ -228,7 +232,14 @@ async function claimGroup(
     // Present OzServer owners never appear in holdings, so a row here has no owner, a gone-quiet
     // one, or this controller.
     const holding = holdings.get(row.name);
-    if (heldAgainst(holding, identity) && row.controller_cid !== identity.cid) {
+    // Unless the claim says to take it (take_external), once the plugin has told the controller
+    // whose it is and that they have to have coordinated it with them
+    // (OzServerOwnershipTracker.ConfirmTakeDroppedAsync). OzServer only infers what a controller
+    // without the plugin works, and cannot see them hand it over: ML-GUN_CTR handed GUN to
+    // ML-BLA_CTR by voice and logged off, and BLA could not take it until VATSIM's datafeed stopped
+    // listing GUN minutes later. Taken, it is a present owner's, which external-control.ts leaves
+    // out of every holding.
+    if (heldAgainst(holding, identity) && row.controller_cid !== identity.cid && !takeExternal) {
       if (positionOwnersInClaim.has(holding.callsign) && row.name !== name) {
         withheld.push(row.name);
         continue;
@@ -332,6 +343,7 @@ async function claimGroup(
       exclusions,
       previous_owners: previousOwners,
       took_dropped: takeDropped,
+      took_external: takeExternal,
       fdr_authority_cleared: clearedFlights,
       all_or_nothing: allOrNothing
     });
@@ -584,7 +596,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) return reply.code(422).send({ message: "Invalid sector claim.", errors: parsed.error.flatten() });
     const result = await transaction(async client => {
       await lockMutations(client, request.controller.server);
-      return claimGroup(client, request.controller, request.params.name, parsed.data.exclude, true, parsed.data.primary_group, parsed.data.take_dropped);
+      return claimGroup(client, request.controller, request.params.name, parsed.data.exclude, true, parsed.data.primary_group, parsed.data.take_dropped, parsed.data.take_external);
     });
     if (result.missing) return reply.code(404).send({ message: "Sector not found." });
     if (result.refused.includes(request.params.name)) return reply.code(403).send({ message: flowOnlyMessage, refused: result.refused });
@@ -652,7 +664,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
         conflicts: [] as Array<{ sector: string; owner: ConflictOwner }> };
       for (const name of parsed.data.release) (await releaseGroup(client, request.controller, name) ? result.released : result.failed).push(name);
       for (const name of parsed.data.claim) {
-        const claimed = await claimGroup(client, request.controller, name, parsed.data.exclude, false, parsed.data.primary_group, parsed.data.take_dropped);
+        const claimed = await claimGroup(client, request.controller, name, parsed.data.exclude, false, parsed.data.primary_group, parsed.data.take_dropped, parsed.data.take_external);
         if (claimed.missing || claimed.refused.includes(name)) result.failed.push(name); else { result.claimed.push(...claimed.claimed); result.skipped.push(...claimed.skipped); result.withheld.push(...claimed.withheld); result.conflicts.push(...claimed.conflicts); }
       }
       for (const name of parsed.data.request) {

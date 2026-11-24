@@ -799,6 +799,12 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     const controlled = async (who: Identity) =>
       ((await get("/sectors/sync", who)).json().controlled as Array<{ name: string; owner: { callsign: string; external?: boolean } }>);
 
+    // FAR is extender's logon position, never held against them while they are connected. Each
+    // test starts with them gone, so FAR is free for the outsider.
+    beforeEach(async () => {
+      await db.query("UPDATE plugin_clients SET last_seen_at=now()-interval '1 minute' WHERE controller_cid=$1", [extender.cid]);
+    });
+
     afterEach(async () => {
       await db.query("TRUNCATE network_controllers");
       (await import("./external-control.js")).invalidateExternalHoldings("live");
@@ -812,8 +818,10 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     });
 
     it("holds every subsector of a group they extend onto, except one someone else is working", async () => {
+      // Nobody is logged on as GRP (see the next test).
+      await db.query("UPDATE plugin_clients SET last_seen_at=now()-interval '1 minute' WHERE controller_cid=$1", [primary.cid]);
       await report(third, [{ callsign: outsider, frequencies: [], sectors: [], atis: ["Extending GRP"] }]);
-      const external = async () => Object.fromEntries((await controlled(primary))
+      const external = async () => Object.fromEntries((await controlled(third))
         .filter(row => row.owner.external).map(row => [row.name, row.owner.callsign]));
       expect(await external()).toEqual({ GRP: outsider, INA: outsider, OUT: outsider });
 
@@ -824,6 +832,49 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       ]);
       (await import("./external-control.js")).invalidateExternalHoldings("live");
       expect(await external()).toEqual({ GRP: outsider, INA: "XX-SUB_CTR", OUT: outsider });
+    });
+
+    it("never holds the sector a plugin user is logged on as against them, or anything by way of it", async () => {
+      // ML-GUN_CTR still extending onto BLA when ML-BLA_CTR logged on.
+      await report(third, [{ callsign: outsider, frequencies: [], sectors: [], atis: ["Extending GRP"] }]);
+      expect((await controlled(primary)).filter(row => row.owner.external)).toEqual([]);
+      expect((await post("/sectors/GRP/claim", primary)).statusCode).toBe(201);
+      expect(await mine(primary)).toEqual(["GRP", "INA", "OUT"]);
+    });
+
+    it("can be taken by a claim that says so", async () => {
+      await report(third, [{ callsign: outsider, frequencies: ["128.400"], sectors: [], atis: ["Extending INA"] }]);
+      expect((await post("/sectors/INA/claim", primary)).statusCode).toBe(409);
+      expect((await post("/sectors/INA/claim", primary, { take_external: true })).statusCode).toBe(201);
+      // Taken, it is a present owner's and no longer theirs.
+      expect((await controlled(third)).filter(row => row.owner.external).map(row => row.name)).toEqual(["FAR"]);
+
+      const commit = await post("/sectors/commit", third, { claim: ["FAR"] });
+      expect(commit.json().result.conflicts).toMatchObject([{ sector: "FAR", owner: { callsign: outsider, external: true } }]);
+      await post("/sectors/commit", third, { claim: ["FAR"], take_external: true });
+      expect(await mine(third)).toEqual(["FAR"]);
+    });
+
+    it("stops counting a controller once the plugin that saw them leaves them out", async () => {
+      const seen = { callsign: outsider, frequencies: ["128.400"], sectors: [], atis: [] };
+      const other = { callsign: "XX-ELSE_CTR", frequencies: [], sectors: [], atis: [] };
+      const held = async () => {
+        (await import("./external-control.js")).invalidateExternalHoldings("live");
+        return (await controlled(primary)).filter(row => row.owner.external).map(row => row.name);
+      };
+      await report(third, [seen, other]);
+      // Left out of one report: not enough on its own.
+      await db.query("UPDATE network_controllers SET last_seen_at=now()-interval '10 seconds' WHERE callsign=$1", [outsider]);
+      await report(third, [other]);
+      expect(await held()).toEqual(["FAR"]);
+      // Left out for longer than a report interval: logged off, though still within the window a
+      // report counts for.
+      await db.query("UPDATE network_controllers SET last_seen_at=now()-interval '30 seconds' WHERE callsign=$1", [outsider]);
+      await report(third, [other]);
+      expect(await held()).toEqual([]);
+      // Seen again: back.
+      await report(third, [seen, other]);
+      expect(await held()).toEqual(["FAR"]);
     });
 
     it("cannot be claimed or requested from them", async () => {
