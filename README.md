@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/ozserver-logo-on-dark.png">
+    <img src=".github/assets/ozserver-logo-on-light.png" alt="OzServer" width="420">
+  </picture>
+</p>
+
 # OzServer API
 
 [![CI](https://github.com/JoshuaMicallefYBSU/OzServer-API/actions/workflows/ci.yml/badge.svg)](https://github.com/JoshuaMicallefYBSU/OzServer-API/actions/workflows/ci.yml)
