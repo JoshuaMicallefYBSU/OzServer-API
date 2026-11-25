@@ -91,7 +91,21 @@ export async function runMaintenance(): Promise<void> {
     await client.query("DELETE FROM arrival_list_viewers WHERE last_seen_at < now()-interval '10 minutes'");
     // Counted only while seconds old (external-control.ts).
     await client.query("DELETE FROM network_controllers WHERE last_seen_at < now()-interval '10 minutes'");
+    // One row per callsign and CID that has ever called, read no further back than a day
+    // (PLUGIN_SESSION_LOOKBACK_HOURS in external-control.ts). Nothing removed them before.
+    await client.query("DELETE FROM plugin_clients WHERE last_seen_at < now()-interval '2 days'");
     await client.query("DELETE FROM sector_requests WHERE rejected_at < now()-interval '1 day'");
+    // A request whose requester's plugin has not called for the grace period: it closed or crashed
+    // holding nothing, so the sweep above never came across it, and the request stayed on its
+    // target's screen for good. Not straight after a restart, when nobody has called yet.
+    const abandoned = withinStartupGrace ? [] : (await client.query<{ server: Server }>(
+      `DELETE FROM sector_requests r
+        WHERE r.rejected_at IS NULL AND r.created_at < now()-($1*interval '1 minute')
+          AND NOT EXISTS (SELECT 1 FROM plugin_clients p
+                           WHERE p.server=r.server AND p.controller_cid=r.requesting_cid
+                             AND p.last_seen_at >= now()-($1*interval '1 minute'))
+        RETURNING r.server`,
+      [config.DISCONNECT_GRACE_MINUTES])).rows;
     // Kept for a day: long enough to look into something reported the next morning. Purged by
     // created_at, not logged_at, which is the client's clock (see client-logs.ts) - a client whose
     // clock runs ahead would otherwise write rows this never removes.
@@ -101,7 +115,7 @@ export async function runMaintenance(): Promise<void> {
     // expired for MESSAGE_RETAIN_DAYS - long enough to read the answers afterwards.
     await client.query("DELETE FROM developer_messages WHERE expires_at < now()-($1*interval '1 day')", [config.MESSAGE_RETAIN_DAYS]);
     return {
-      sectors: [...new Set(droppedOwners.map(owner => owner.server))],
+      sectors: [...new Set([...droppedOwners.map(owner => owner.server), ...abandoned.map(row => row.server)])],
       atis: expiredAtis > 0
     };
   });

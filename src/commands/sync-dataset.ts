@@ -23,6 +23,9 @@ function coordinate(raw: string): { lat: number; lon: number } {
     const unsigned = value.slice(1);
     const [whole = "0", fraction = "0"] = unsigned.split(".");
     if (whole.length <= 3) return sign * Number(unsigned);
+    // Degrees and decimal minutes (-3740.4+14450.6), which three positions in the Australian
+    // dataset use. Read as degrees, minutes and seconds they came out within two degrees of 0,0.
+    if (whole.length <= 5) return sign * (Number(whole.slice(0, -2)) + Number(`${whole.slice(-2)}.${fraction}`) / 60);
     const seconds = Number(`${whole.slice(-2)}.${fraction}`);
     const minutes = Number(whole.slice(-4, -2));
     const degrees = Number(whole.slice(0, -4));

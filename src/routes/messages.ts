@@ -111,9 +111,14 @@ export async function protectedMessageRoutes(app: FastifyInstance): Promise<void
     const id = idSchema.safeParse(request.params.id);
     if (!id.success) return reply.code(400).send({ message: "Invalid message id." });
     const { cid, callsign, server } = request.controller;
+    // Only a message this controller was sent: a receipt for any id, as this once wrote, showed the
+    // console a message read by someone it never went to. Withdrawn ones included - one already on
+    // a controller's screen is still dismissed.
     await pool.query(
       `INSERT INTO developer_message_receipts (message_id,controller_cid,controller_callsign,server,read_at)
-       SELECT m.id,$2,$3,$4,now() FROM developer_messages m WHERE m.id=$1
+       SELECT m.id,$2,$3,$4,now() FROM developer_messages m
+        WHERE m.id=$1 AND (m.server IS NULL OR m.server = $4)
+          AND (m.target_callsigns IS NULL OR upper($3) = ANY(m.target_callsigns))
        ON CONFLICT (message_id,server,controller_callsign,controller_cid) DO UPDATE SET read_at=COALESCE(developer_message_receipts.read_at, now())`,
       [id.data, cid, callsign, server]);
     return reply.code(204).send();

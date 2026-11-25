@@ -24,7 +24,13 @@ type VatsimData = { controllers?: Controller[]; pilots?: Pilot[]; atis?: Array<{
 type TransceiverEntry = { callsign: string; transceivers?: Array<{ frequency: number }> };
 
 const CACHE_MS = 15_000;
-let dataCache: { expires: number; value: VatsimData | null } = { expires: 0, value: null };
+// How long the last feed that did arrive stands in for one that did not. A single failed fetch
+// used to empty the cache: for the next fifteen seconds no controller known only from the feed
+// held anything (external-control.ts), so their airspace could be claimed unasked, and the map
+// showed every sector offline. Long enough to ride out a slow or failing VATSIM, short enough
+// that a controller who has logged off does not stay listed.
+const STALE_MS = 2 * 60_000;
+let dataCache: { expires: number; value: VatsimData | null; fetchedAt: number } = { expires: 0, value: null, fetchedAt: 0 };
 let transceiverCache: { expires: number; value: TransceiverEntry[] } = { expires: 0, value: [] };
 
 async function getJson<T>(url: string): Promise<T | null> {
@@ -41,16 +47,28 @@ async function getJson<T>(url: string): Promise<T | null> {
 let dataRefresh: Promise<VatsimData | null> | null = null;
 let transceiverRefresh: Promise<TransceiverEntry[]> | null = null;
 
+// The feed that last arrived, while it is recent enough to stand in.
+function recentData(): VatsimData | null {
+  return dataCache.value !== null && Date.now() - dataCache.fetchedAt < STALE_MS ? dataCache.value : null;
+}
+
 export async function vatsimData(): Promise<VatsimData | null> {
   if (dataCache.expires > Date.now()) return dataCache.value;
   dataRefresh ??= (async () => {
     const status = await getJson<{ data?: { v3?: string[] } }>("https://status.vatsim.net/status.json");
     const url = status?.data?.v3?.[0];
     const value = url ? await getJson<VatsimData>(url) : null;
-    dataCache = { expires: Date.now() + CACHE_MS, value };
-    return value;
+    // A failed fetch keeps the last good feed while it is recent, and is retried no sooner than
+    // the next window.
+    dataCache = value !== null
+      ? { expires: Date.now() + CACHE_MS, value, fetchedAt: Date.now() }
+      : { expires: Date.now() + CACHE_MS, value: recentData(), fetchedAt: dataCache.fetchedAt };
+    return dataCache.value;
   })().finally(() => { dataRefresh = null; });
-  return dataRefresh;
+  // Nobody waits on VATSIM while there is a recent feed to answer with: a refresh can take twenty
+  // seconds when VATSIM is slow, and every map request would otherwise queue behind it. getJson
+  // never rejects, so the refresh left running cannot fail unobserved.
+  return recentData() ?? dataRefresh;
 }
 
 // The feeds as last fetched, without waiting for a refresh (which is started if one is due). For
@@ -58,7 +76,7 @@ export async function vatsimData(): Promise<VatsimData | null> {
 export function latestVatsimData(): { data: VatsimData | null; transceivers: TransceiverEntry[] } {
   if (dataCache.expires <= Date.now()) void vatsimData();
   if (transceiverCache.expires <= Date.now()) void afvTransceivers();
-  return { data: dataCache.value, transceivers: transceiverCache.value };
+  return { data: recentData(), transceivers: transceiverCache.value };
 }
 
 export async function afvTransceivers(): Promise<TransceiverEntry[]> {

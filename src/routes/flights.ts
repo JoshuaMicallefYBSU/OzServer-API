@@ -8,7 +8,8 @@ import type { ControllerIdentity } from "../types.js";
 
 const flightSchema = z.object({
   callsign: z.string().trim().min(1).max(20),
-  controlling_cid: z.number().int().nullable().optional(),
+  // An integer column: one value past its range failed the whole batch it came in.
+  controlling_cid: z.number().int().min(0).max(2_147_483_647).nullable().optional(),
   controlling_callsign: z.string().max(32).nullable().optional(),
   current_sector: z.string().max(32).nullable().optional(),
   // The FDR's vatSys data authority (fdr.ControllingSector) - kept in data like any other field,

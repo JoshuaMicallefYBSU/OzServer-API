@@ -23,12 +23,18 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
 
   const body = (who: Identity, extra: Record<string, unknown> = {}) =>
     ({ ...extra, controller_cid: who.cid, controller_callsign: who.callsign, server: who.server ?? "live" });
+  // Each test calls from an address of its own. The rate limit (app.ts) counts per address over ten
+  // seconds, and the whole suite from one address passes it on a fast machine: later tests were
+  // answered 429 instead of what they were testing.
+  let testNumber = 0;
+  let remoteAddress = "127.0.0.1";
   const post = (url: string, who: Identity, extra: Record<string, unknown> = {}) =>
-    app.inject({ method: "POST", url: `/api/v1${url}`, payload: body(who, extra) });
+    app.inject({ method: "POST", url: `/api/v1${url}`, payload: body(who, extra), remoteAddress });
   const get = (url: string, who: Identity) =>
     app.inject({
       method: "GET",
-      url: `/api/v1${url}?controller_cid=${who.cid}&controller_callsign=${who.callsign}&server=${who.server ?? "live"}`
+      url: `/api/v1${url}?controller_cid=${who.cid}&controller_callsign=${who.callsign}&server=${who.server ?? "live"}`,
+      remoteAddress
     });
   const mine = async (who: Identity) =>
     ((await get("/sectors/sync", who)).json().mine as Array<{ name: string }>).map(sector => sector.name).sort();
@@ -94,6 +100,8 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
   });
 
   beforeEach(async () => {
+    testNumber++;
+    remoteAddress = `10.0.${Math.floor(testNumber / 250)}.${(testNumber % 250) + 1}`;
     await db.query("TRUNCATE sector_ownerships, sector_requests, flight_data_records, client_logs, resume_snapshots, network_atis, atis_broadcasts, arrival_sequences, arrival_list_viewers");
   });
 
@@ -261,6 +269,22 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect(await mine(member)).toEqual(["INA"]);
     });
 
+    it("leaves them their position when they have dropped and a claim takes another dropped controller's", async () => {
+      // member is logged on as INA; extender is working GRP and OUT around them. Both drop.
+      await post("/sectors/INA/claim", member);
+      await post("/sectors/GRP/claim", extender);
+      expect(await mine(extender)).toEqual(["GRP", "OUT"]);
+      await goQuiet(member);
+      await goQuiet(extender);
+      // Asked about extender only: INA was withheld, not listed.
+      const asked = await post("/sectors/GRP/claim", third);
+      expect(asked.statusCode).toBe(409);
+      expect(asked.json().conflicts.map((conflict: { sector: string }) => conflict.sector).sort()).toEqual(["GRP", "OUT"]);
+      expect((await post("/sectors/GRP/claim", third, { take_dropped: true })).statusCode).toBe(201);
+      expect(await mine(third)).toEqual(["GRP", "OUT"]);
+      expect(await mine(member)).toEqual(["INA"]);
+    });
+
     it("still leaves them the rest of what they hold there once their own sector is carved out", async () => {
       // The client excludes the sectors it knows the logged-on position is made of. What that
       // controller holds inside the group beyond those is still theirs, and not a conflict.
@@ -283,6 +307,30 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     expect((await post(`/sector-requests/${id}/accept`, extender)).statusCode).toBe(200);
     expect(await mine(third)).toEqual(["INA"]);
     expect(await mine(extender)).toEqual([]);
+  });
+
+  it("does not hand a sector to a requester whose plugin has gone", async () => {
+    await post("/sectors/INA/claim", extender);
+    const gone: Identity = { cid: 1000014, callsign: "XX-GON_CTR" };
+    const id = (await post("/sectors/INA/request", gone)).json().id;
+    await db.query("UPDATE plugin_clients SET last_seen_at=now()-interval '1 minute' WHERE controller_cid=$1", [gone.cid]);
+
+    expect((await post(`/sector-requests/${id}/accept`, extender)).statusCode).toBe(403);
+    expect(await mine(extender)).toEqual(["INA"]);
+    // And it stops being offered.
+    expect((await get("/sector-requests", extender)).json().from_me).toEqual([]);
+  });
+
+  it("drops a request nobody is waiting on any more, at the sweep", async () => {
+    await post("/sectors/INA/claim", extender);
+    const gone: Identity = { cid: 1000015, callsign: "XX-LFT_CTR" };
+    await post("/sectors/INA/request", gone);
+    await post("/sectors/INA/request", third);
+    await db.query("UPDATE sector_requests SET created_at=now()-interval '10 minutes'");
+    await db.query("UPDATE plugin_clients SET last_seen_at=now()-interval '10 minutes' WHERE controller_cid=$1", [gone.cid]);
+    await get("/sectors/sync", extender);
+    await runMaintenance();
+    expect((await get("/sector-requests", extender)).json().from_me.map((row: { requesting_cid: number }) => row.requesting_cid)).toEqual([third.cid]);
   });
 
   describe("a flow (FMP) position", () => {
@@ -760,14 +808,17 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     });
 
     it("lists the controllers connected now, for the console to address", async () => {
+      // On SweatBox 1 only. Not one of the shared identities: plugin_clients is not truncated
+      // between tests, and those have all just called on live.
+      const training: Identity = { cid: 1000011, callsign: "XX-SBX_CTR", server: "sb1" };
       await get("/messages", primary);
-      await get("/messages", { ...third, server: "sb1" });
+      await get("/messages", training);
       const clients = async (server: string) => (await app.inject({
         method: "GET", url: `/api/v1/admin/clients?server=${server}`, headers: { authorization: `Bearer ${consoleToken}` }
       })).json() as Array<{ callsign: string; server: string }>;
       expect((await clients("live")).map(c => c.callsign)).toContain("XX-GRP_CTR");
-      expect((await clients("live")).map(c => c.callsign)).not.toContain("XX-OTH_CTR");
-      expect((await clients("all")).map(c => c.callsign)).toEqual(expect.arrayContaining(["XX-GRP_CTR", "XX-OTH_CTR"]));
+      expect((await clients("live")).map(c => c.callsign)).not.toContain("XX-SBX_CTR");
+      expect((await clients("all")).map(c => c.callsign)).toEqual(expect.arrayContaining(["XX-GRP_CTR", "XX-SBX_CTR"]));
     });
 
     it("takes a reply only when the sender asked for one", async () => {
@@ -799,10 +850,18 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     const controlled = async (who: Identity) =>
       ((await get("/sectors/sync", who)).json().controlled as Array<{ name: string; owner: { callsign: string; external?: boolean } }>);
 
-    // FAR is extender's logon position, never held against them while they are connected. Each
-    // test starts with them gone, so FAR is free for the outsider.
+    // Marks a controller as running the plugin right now. Written directly: the heartbeat in app.ts
+    // records a client at most every two seconds, so a call made here may not.
+    const present = (who: Identity) => db.query(
+      `INSERT INTO plugin_clients (controller_cid,controller_callsign,server,last_seen_at) VALUES ($1,$2,$3,now())
+       ON CONFLICT (server,controller_callsign,controller_cid) DO UPDATE SET last_seen_at=now()`,
+      [who.cid, who.callsign, who.server ?? "live"]);
+
+    // The sector a plugin user is logged on as is never held against them, and plugin_clients is
+    // not truncated between tests: the earlier ones leave controllers logged on as GRP, INA and FAR
+    // under several CIDs. Each test starts with everyone gone, so those are free for the outsider.
     beforeEach(async () => {
-      await db.query("UPDATE plugin_clients SET last_seen_at=now()-interval '1 minute' WHERE controller_cid=$1", [extender.cid]);
+      await db.query("UPDATE plugin_clients SET last_seen_at=now()-interval '1 minute'");
     });
 
     afterEach(async () => {
@@ -836,10 +895,21 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
 
     it("never holds the sector a plugin user is logged on as against them, or anything by way of it", async () => {
       // ML-GUN_CTR still extending onto BLA when ML-BLA_CTR logged on.
+      await present(primary);
       await report(third, [{ callsign: outsider, frequencies: [], sectors: [], atis: ["Extending GRP"] }]);
       expect((await controlled(primary)).filter(row => row.owner.external)).toEqual([]);
       expect((await post("/sectors/GRP/claim", primary)).statusCode).toBe(201);
       expect(await mine(primary)).toEqual(["GRP", "INA", "OUT"]);
+    });
+
+    it("frees a position for its controller on their plugin's very first call", async () => {
+      await report(third, [{ callsign: outsider, frequencies: [], sectors: [], atis: ["Extending GRP"] }]);
+      expect((await controlled(third)).filter(row => row.owner.external).map(row => row.name).sort()).toEqual(["GRP", "INA", "OUT"]);
+      // Never seen before, and claiming at once: the holdings worked out a moment ago, before
+      // anyone was logged on as GRP, must not be what the claim is judged against.
+      const arriving: Identity = { cid: 1000012, callsign: primary.callsign };
+      expect((await post("/sectors/GRP/claim", arriving)).statusCode).toBe(201);
+      expect(await mine(arriving)).toEqual(["GRP", "INA", "OUT"]);
     });
 
     it("can be taken by a claim that says so", async () => {
@@ -875,6 +945,30 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       // Seen again: back.
       await report(third, [seen, other]);
       expect(await held()).toEqual(["FAR"]);
+      // The same when they were the only controller that plugin could see: its reports go on, empty.
+      await db.query("TRUNCATE network_controllers");
+      await report(third, [seen]);
+      expect(await held()).toEqual(["FAR"]);
+      await db.query("UPDATE network_controllers SET last_seen_at=now()-interval '30 seconds' WHERE callsign=$1", [outsider]);
+      await report(third, []);
+      expect(await held()).toEqual([]);
+    });
+
+    it("reads nothing into a controller who could not be working this airspace", async () => {
+      // A unit the dataset has no position in, whose information line happens to name a sector here.
+      await report(third, [
+        { callsign: "QQ_APP", frequencies: ["128.400"], sectors: [], atis: ["Covering INA and FAR"] },
+        { callsign: outsider, frequencies: [], sectors: [], atis: ["Extending INA"] }
+      ]);
+      expect((await controlled(primary)).filter(row => row.owner.external).map(row => [row.name, row.owner.callsign]))
+        .toEqual([["INA", outsider]]);
+    });
+
+    it("cuts a long name or information line to length instead of refusing the whole report", async () => {
+      expect((await report(third, [
+        { callsign: outsider, real_name: "N".repeat(200), frequencies: [], sectors: [], atis: [`Extending INA ${"x".repeat(600)}`] }
+      ])).statusCode).toBe(204);
+      expect((await controlled(primary)).filter(row => row.owner.external).map(row => row.name)).toEqual(["INA"]);
     });
 
     it("cannot be claimed or requested from them", async () => {
@@ -916,6 +1010,36 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       ]);
       expect((await controlled(third)).filter(row => row.owner.external)).toEqual([]);
     });
+  });
+
+  it("answers a fault of its own without saying what it was", async () => {
+    await db.query("ALTER TABLE resume_snapshots RENAME TO resume_snapshots_away");
+    try {
+      const response = await post("/sectors/release-all", primary);
+      expect(response.statusCode).toBe(500);
+      expect(response.json()).toEqual({ message: "Internal server error." });
+    } finally {
+      await db.query("ALTER TABLE resume_snapshots_away RENAME TO resume_snapshots");
+    }
+  });
+
+  it("refuses an identity or a number no column could hold, rather than failing on it", async () => {
+    const tooBig = { cid: 99999999999, callsign: "XX-BIG_CTR" };
+    expect((await get("/sectors/sync", tooBig)).statusCode).toBe(401);
+    expect((await post("/sectors/GRP/claim", { cid: 1000013, callsign: "XX-NUL\u0000_CTR" })).statusCode).toBe(401);
+    expect((await post("/fdr/batch", primary, { flights: [{ callsign: "QFA1", controlling_cid: 99999999999 }] })).statusCode).toBe(422);
+    expect((await post("/atis", primary, { icao: "YSSY", atis_letter: "A", content: {}, frequency: 99999999999 })).statusCode).toBe(422);
+  });
+
+  it("serves the routes of every flight even when one record's next waypoint is not a number", async () => {
+    await post("/fdr/batch", primary, { flights: [
+      { callsign: "QFA1", route_points: [{ n: "TESAT", lat: -33.9, lon: 151.2 }], route_next_index: "soon" },
+      { callsign: "QFA2", route_points: [{ n: "TESAT", lat: -33.9, lon: 151.2 }], route_next_index: 1 }
+    ] });
+    const response = await app.inject({ method: "GET", url: "/api/v1/map/routes?server=live" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().map((row: { callsign: string; route_next_index: number | null }) => [row.callsign, row.route_next_index]))
+      .toEqual([["QFA1", null], ["QFA2", 1]]);
   });
 
   it("limits how fast one address may call", async () => {

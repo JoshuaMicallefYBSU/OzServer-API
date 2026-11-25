@@ -105,7 +105,7 @@ const resumeSchema = z.object({
 
 // Validated here so a malformed id is answered as a client error, not as a 500 from a type error
 // inside a query.
-const requestIdSchema = z.coerce.number().int().positive();
+const requestIdSchema = z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const requestIdsSchema = z.object({ request_ids: z.array(requestIdSchema).max(400).default([]) });
 
 async function lockMutations(client: pg.PoolClient, server: string): Promise<void> {
@@ -227,6 +227,8 @@ async function claimGroup(
   // (OzServerOwnershipTracker.HandleConflictAsync). primary_group is therefore accepted from
   // clients that send it, and ignored.
   void primaryGroup;
+  // The position the named sector is, as a callsign: its holder is the one being taken over.
+  const namedPosition = everything.find(row => row.name === name)?.callsign?.toUpperCase() ?? null;
 
   for (const row of rows) {
     // Present OzServer owners never appear in holdings, so a row here has no owner, a gone-quiet
@@ -239,14 +241,21 @@ async function claimGroup(
     // ML-BLA_CTR by voice and logged off, and BLA could not take it until VATSIM's datafeed stopped
     // listing GUN minutes later. Taken, it is a present owner's, which external-control.ts leaves
     // out of every holding.
-    if (heldAgainst(holding, identity) && row.controller_cid !== identity.cid && !takeExternal) {
-      if (positionOwnersInClaim.has(holding.callsign) && row.name !== name) {
-        withheld.push(row.name);
+    //
+    // Saying so takes what the controller was asked about: the sector the claim names, what would
+    // otherwise be a conflict, and all of the holder whose position the named sector is. Not what
+    // was withheld for somebody else logged on inside the group - that was never shown to them.
+    if (heldAgainst(holding, identity) && row.controller_cid !== identity.cid) {
+      const sweptUp = positionOwnersInClaim.has(holding.callsign) && row.name !== name;
+      if (!(takeExternal && (!sweptUp || holding.callsign === namedPosition))) {
+        if (sweptUp) {
+          withheld.push(row.name);
+          continue;
+        }
+        skipped.push(row.name);
+        conflicts.push({ sector: row.name, owner: externalOwner(holding) });
         continue;
       }
-      skipped.push(row.name);
-      conflicts.push({ sector: row.name, owner: externalOwner(holding) });
-      continue;
     }
     if (row.controller_cid === null || row.controller_cid === identity.cid) {
       takeable.push(row);
@@ -259,9 +268,16 @@ async function claimGroup(
     // claimer by the sweep anyway (reassignFreedSectors), without anybody being asked.
     // Except to a controller under the dropped owner's own callsign, who is taking over the
     // position, not taking it from them - as with external holdings (heldAgainst).
+    //
+    // take_dropped, like take_external above, takes what the controller was asked about and no
+    // more. Another dropped controller logged on inside the group was withheld, not listed as a
+    // conflict, so was never part of what they agreed to: taken regardless, as it once was, a
+    // controller reconnecting moments later found their position and its tags gone.
     const present = isPresent(row);
     const sameCallsign = row.controller_callsign?.toUpperCase() === identity.callsign.toUpperCase();
-    if (present || !(takeDropped || sameCallsign)) {
+    const agreed = takeDropped && (!ownerHasPositionInThisClaim || row.name === name
+      || row.controller_callsign?.toUpperCase() === namedPosition);
+    if (present || !(agreed || sameCallsign)) {
       // Withholding is for what a claim merely sweeps up. The sector the claim names is a conflict
       // like any other: answering 201 with it left out would read as success, and the client would
       // claim it again on every poll without a request ever being raised.
@@ -402,7 +418,10 @@ async function syncPayload(client: pg.Pool | pg.PoolClient, identity: Controller
     "SELECT name,full_name,type,callsign,frequency FROM sectors WHERE name=ANY($1)", [[...external.holdings.keys()]]))
     .rows.map(row => [row.name, row]));
   for (const holding of external.holdings.values()) {
-    if (!heldAgainst(holding, identity) || controlled.some(row => row.name === holding.sector)) continue;
+    // Nor one this controller holds: the holdings are a moment old, and a sector just taken from
+    // such a controller would be listed as both theirs and this controller's.
+    if (!heldAgainst(holding, identity) || controlled.some(row => row.name === holding.sector)
+      || mine.some(row => row.name === holding.sector)) continue;
     const sector = fullNames.get(holding.sector);
     controlled.push({
       name: holding.sector, full_name: sector?.full_name ?? "", type: sector?.type ?? null, callsign: sector?.callsign ?? null,
@@ -438,9 +457,30 @@ async function transferRequest(client: pg.PoolClient, identity: ControllerIdenti
     `SELECT r.*,s.name FROM sector_requests r JOIN sectors s ON s.id=r.sector_id WHERE r.id=$1 AND r.server=$2 FOR UPDATE`,
     [id, identity.server]);
   const request = result.rows[0];
-  if (!request || request.target_cid !== identity.cid) return null;
+  // Not one already refused: it is kept only so the requester can be told (rejected_at).
+  if (!request || request.target_cid !== identity.cid || request.rejected_at) return null;
   const owner = await client.query("SELECT controller_cid FROM sector_ownerships WHERE sector_id=$1 AND server=$2 FOR UPDATE", [request.sector_id, identity.server]);
   if (owner.rows[0]?.controller_cid !== identity.cid) return null;
+  // Nor one from a controller who is no longer there to receive it. Their plugin polls every few
+  // seconds while a request is pending, so one that has gone quiet has closed or crashed; accepted
+  // anyway, the sectors and the tags in them went to nobody at all until the disconnect sweep
+  // caught up. The request goes, so it stops being offered. Not judged just after a restart, until
+  // every connected plugin has had the chance to call again (as isPresent).
+  if (!isWithinStartupGrace(config.PRESENCE_TIMEOUT_SECONDS * 1000)) {
+    const requesterPresent = (await client.query(
+      `SELECT 1 FROM plugin_clients WHERE server=$1 AND controller_cid=$2 AND last_seen_at >= now()-($3*interval '1 second') LIMIT 1`,
+      [identity.server, request.requesting_cid, PLUGIN_CLIENT_WINDOW_SECONDS])).rowCount;
+    if (!requesterPresent) {
+      await client.query("DELETE FROM sector_requests WHERE id=$1", [id]);
+      await writeDiagnosticLog(client, identity, "ServerSector", `Request #${id} for ${request.name} dropped; ${request.requesting_callsign} is no longer connected`, {
+        action: "request_requester_gone",
+        request_id: id,
+        sector: request.name,
+        from: { cid: request.requesting_cid, callsign: request.requesting_callsign }
+      });
+      return null;
+    }
+  }
   // Only what the accepting controller holds, not the requested sector's whole closure: that would
   // take a third controller's sector off them, and grant an unowned sector regardless of who is
   // logged on as it. What is left unowned is claimed through the ordinary path, where the staffing
@@ -749,6 +789,11 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
     if (superseded.length > 0) {
       const previousCallsigns = [...new Set(superseded.map(row => row.controller_callsign))];
       await reassignFreedSectors(client, superseded.map(row => row.sector_id), request.controller.server);
+      // Requests for those sectors named this controller as their owner: nobody could accept one
+      // now, and its requester could not ask again while it stood (one request per sector).
+      await client.query(
+        "DELETE FROM sector_requests WHERE sector_id=ANY($1) AND server=$2 AND rejected_at IS NULL",
+        [superseded.map(row => row.sector_id), request.controller.server]);
       for (const callsign of previousCallsigns) {
         await clearFlightsOf(client, { cid: request.controller.cid, callsign, server: request.controller.server } as ControllerIdentity);
       }
@@ -831,7 +876,7 @@ export async function sectorRoutes(app: FastifyInstance): Promise<void> {
       return sector ? syncPayload(client, request.controller) : null;
     });
     return sync ? { message: "Ownership transferred.", sync }
-      : reply.code(403).send({ message: "Only the sector's current owner may accept this request." });
+      : reply.code(403).send({ message: "This request can no longer be accepted: it was withdrawn or already answered, its controller has disconnected, or the sector is no longer yours." });
   });
 
   app.post("/sector-requests/accept-batch", async (request, reply) => {

@@ -4,7 +4,7 @@ import { config } from "../config.js";
 import { pool } from "../db.js";
 import { atisSectionContent, atisTimestamp } from "../network-atis.js";
 import { externalHoldings } from "../external-control.js";
-import { afvTransceivers, vatsimData } from "../vatsim.js";
+import { afvTransceivers, vatsimData, type Pilot } from "../vatsim.js";
 
 const visibleTypes = ["TWR", "APP", "DEP", "CTR", "FSS"];
 const typePriority: Record<string, number> = { FMP: 0, CTR: 1, FSS: 1, APP: 2, DEP: 2, TWR: 3, GND: 3, DEL: 3 };
@@ -19,7 +19,9 @@ const fsdFrequency = (value: number | null): string | null =>
 //
 // Longitudes are taken onto 0-360 (as is the pilot's, in insideRing): the oceanic sectors run out
 // past 180 degrees, and on -180..180 a ring crossing the antimeridian would wrap the wrong way.
-type Ring = Array<[number, number]>; // [lon 0-360, lat]
+// With its bounding box: most pilots are nowhere near most sectors, and the box rules a ring out
+// without walking its points.
+type Ring = { points: Array<[number, number]>; minLon: number; maxLon: number; minLat: number; maxLat: number }; // [lon 0-360, lat]
 let ringCache: { expires: number; rings: Ring[] } = { expires: 0, rings: [] };
 const eastLon = (lon: number) => (lon < 0 ? lon + 360 : lon);
 
@@ -30,7 +32,18 @@ async function sectorPolygons(): Promise<Ring[]> {
   for (const row of rows) {
     for (const ring of (Array.isArray(row.boundary) ? row.boundary : [])) {
       if (!Array.isArray(ring) || ring.length < 3) continue;
-      rings.push(ring.map((point: { lat: number; lon: number }) => [eastLon(Number(point.lon)), Number(point.lat)]));
+      const points: Array<[number, number]> = ring
+        .map((point: { lat: number; lon: number }): [number, number] => [eastLon(Number(point.lon)), Number(point.lat)])
+        .filter(([lon, lat]: [number, number]) => Number.isFinite(lon) && Number.isFinite(lat));
+      if (points.length < 3) continue;
+      let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity;
+      for (const [lon, lat] of points) {
+        if (lon < minLon) minLon = lon;
+        if (lon > maxLon) maxLon = lon;
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+      }
+      rings.push({ points, minLon, maxLon, minLat, maxLat });
     }
   }
   ringCache = { expires: Date.now() + 10 * 60_000, rings };
@@ -40,12 +53,31 @@ async function sectorPolygons(): Promise<Ring[]> {
 // Ray casting: odd crossings of a ray running east from the point means inside.
 function insideRing(ring: Ring, lat: number, lon: number): boolean {
   const x = eastLon(lon);
+  if (x < ring.minLon || x > ring.maxLon || lat < ring.minLat || lat > ring.maxLat) return false;
+  const points = ring.points;
   let inside = false;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
     // Both indices are in range by construction; the assertion is for noUncheckedIndexedAccess.
-    const [xi, yi] = ring[i]!, [xj, yj] = ring[j]!;
+    const [xi, yi] = points[i]!, [xj, yj] = points[j]!;
     if ((yi > lat) !== (yj > lat) && x < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) inside = !inside;
   }
+  return inside;
+}
+
+// The pilots inside the dataset's airspace, worked out once per datafeed rather than once per
+// request. Every open homepage asks /map/traffic every 15 s, and testing each pilot against each
+// boundary on every one of those calls held the event loop for a fifth of a second at a time -
+// time taken from every controller's heartbeat. Keyed on the feed's own pilot list and the ring
+// list, both of which are replaced, never changed in place, when they are refreshed.
+let trafficCache: { pilots: Pilot[]; rings: Ring[]; inside: string[] } | null = null;
+
+function pilotsInAirspace(pilots: Pilot[], rings: Ring[]): string[] {
+  if (trafficCache && trafficCache.pilots === pilots && trafficCache.rings === rings) return trafficCache.inside;
+  const inside = pilots
+    .filter(pilot => Number.isFinite(pilot.latitude) && Number.isFinite(pilot.longitude)
+      && rings.some(ring => insideRing(ring, pilot.latitude, pilot.longitude)))
+    .map(pilot => String(pilot.callsign).toUpperCase());
+  trafficCache = { pilots, rings, inside };
   return inside;
 }
 
@@ -165,8 +197,15 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
   app.get<{ Querystring: { server?: string } }>("/map/routes", async (request, reply) => {
     const server = parseServer(request.query.server);
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
+    // A record's data is whatever its plugin sent (flightSchema passes unknown fields through), so
+    // the index is read only where it is a number in range: cast blindly, one record carrying
+    // anything else failed this query for every viewer until it aged out.
     return (await pool.query(
-      `SELECT callsign, data->'route_points' AS route_points, (data->>'route_next_index')::int AS route_next_index
+      `SELECT callsign, data->'route_points' AS route_points,
+              CASE WHEN jsonb_typeof(data->'route_next_index')='number' THEN
+                CASE WHEN (data->>'route_next_index')::numeric BETWEEN 0 AND 100000
+                     THEN floor((data->>'route_next_index')::numeric)::int END
+              END AS route_next_index
          FROM flight_data_records
         WHERE server=$2 AND last_seen_at >= now()-($1*interval '1 minute')
           AND jsonb_typeof(data->'route_points')='array'
@@ -358,16 +397,16 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
   // datafeed does not cover a SweatBox.
   app.get("/map/traffic", async () => {
     const [pilots, polygons, records] = await Promise.all([
-      vatsimData().then(data => data?.pilots ?? []),
+      vatsimData().then(data => data?.pilots ?? null),
       sectorPolygons(),
       pool.query("SELECT callsign FROM flight_data_records WHERE server='live' AND last_seen_at >= now()-($1*interval '1 minute')",
         [config.FDR_RETAIN_MINUTES])
     ]);
     const seen = new Set(records.rows.map(row => String(row.callsign).toUpperCase()));
-    const inside = pilots.filter(pilot => polygons.some(ring => insideRing(ring, pilot.latitude, pilot.longitude)));
+    const inside = pilots ? pilotsInAirspace(pilots, polygons) : [];
     return {
       in_firs: inside.length,
-      seen_by_ozserver: inside.filter(pilot => seen.has(pilot.callsign.toUpperCase())).length
+      seen_by_ozserver: inside.filter(callsign => seen.has(callsign)).length
     };
   });
 

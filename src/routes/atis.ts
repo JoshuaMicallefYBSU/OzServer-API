@@ -11,7 +11,7 @@ const atisSchema = z.object({
   // A broadcast with no letter is not a broadcast - rejected rather than stored.
   atis_letter: z.string().trim().length(1).transform(value => value.toUpperCase()),
   content: z.record(z.string(), z.string().nullable()),
-  frequency: z.number().int().nullable().optional()
+  frequency: z.number().int().min(0).max(2_147_483_647).nullable().optional()
 }).passthrough();
 
 export async function protectedAtisRoutes(app: FastifyInstance): Promise<void> {

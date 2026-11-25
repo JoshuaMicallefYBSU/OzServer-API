@@ -41,7 +41,7 @@ import { latestVatsimData } from "./vatsim.js";
 // of it by saying so (take_external in routes/sectors.ts), once the plugin has told them to have
 // coordinated it with the controller first.
 //
-// A plugin user stays out for the rest of that VATSIM session, not only while their plugin is
+// A plugin user stays out for a while after their plugin's last call, not only while it is
 // calling. Leaving cleanly releases everything (POST /sectors/release-all), and a crash keeps their
 // sectors as a dropped owner's (routes/sectors.ts). Either way VATSIM's datafeed and other plugins'
 // vatSys go on listing them for a while afterwards - a crashed client for minutes - and they were
@@ -71,8 +71,8 @@ const PLUGIN_CLIENT_WINDOW_SECONDS = 15;
 // How far back a plugin user's last call is looked for (leftPlugin): longer than any session.
 const PLUGIN_SESSION_LOOKBACK_HOURS = 24;
 
-// How long a plugin user who left stays out where there is no VATSIM logon time to tell a new
-// session by (leftPlugin): long enough for a crashed client to fall off every vatSys list. Not
+// How long a plugin user who left stays out, unless VATSIM's logon time shows a new session sooner
+// (leftPlugin): long enough for a crashed client to fall off every vatSys list. Not
 // DISCONNECT_GRACE_MINUTES, which is how long their sectors are kept, and shorter.
 const LEFT_PLUGIN_WITHOUT_LOGON_MINUTES = 10;
 
@@ -80,6 +80,9 @@ const LEFT_PLUGIN_WITHOUT_LOGON_MINUTES = 10;
 // they count as logged off: more than one report interval (15 s), so a single report that missed
 // them while their vatSys entry was being refreshed does not.
 const GONE_AFTER_SECONDS = 25;
+
+// How long a controller dropped from a plugin's reports goes on counting as logged off (`gone`).
+const GONE_FOR_SECONDS = 180;
 
 // What vatSys and VATSIM treat as a controller position. Observers, ATIS and pilots are not.
 const CONTROLLER_CALLSIGN = /^\w[\w-]*_(FSS|CTR|APP|DEP|TWR|GND|DEL|RMP|TMU|FMP|RDO)$/i;
@@ -104,7 +107,9 @@ const unitOf = (callsign: string | null | undefined) => callsign?.split("_")[0]?
 // or FSD's offset from 100 MHz (34200). Null for anything that is not an airband channel - 199.998
 // is an observer's "no frequency".
 export function normaliseFrequency(value: unknown): string | null {
-  const n = Number(value);
+  // "134,2": vatSys formats a frequency in the controller's own locale, and plugins up to 0.3.1
+  // report it as formatted.
+  const n = Number(typeof value === "string" ? value.replace(",", ".") : value);
   if (!Number.isFinite(n) || n <= 0) return null;
   const mhz = n >= 1e7 ? n / 1e6 : n >= 1e5 ? n / 1e3 : n >= 1e4 ? 100 + n / 1e3 : n;
   if (mhz < 108 || mhz >= 137) return null;
@@ -120,7 +125,11 @@ type SectorInfo = {
   // How a controller's information lines name it (atisSectors), compiled once with the index.
   patterns: { name: RegExp; callsign: RegExp | null; fullName: RegExp | null };
 };
-type SectorIndex = { byName: Map<string, SectorInfo>; byFrequency: Map<string, SectorInfo[]> };
+type SectorIndex = {
+  byName: Map<string, SectorInfo>; byFrequency: Map<string, SectorInfo[]>;
+  // Every unit the dataset has a position in ("ML", "SY", "NWWW") - see worksHere.
+  units: Set<string>;
+};
 
 // The dataset changes only when sync-dataset runs, so it is read at most every ten minutes.
 let sectorCache: { expires: number; value: Promise<SectorIndex> } | null = null;
@@ -149,7 +158,8 @@ function sectorIndex(): Promise<SectorIndex> {
       const frequency = normaliseFrequency(sector.frequency);
       if (frequency) byFrequency.set(frequency, [...(byFrequency.get(frequency) ?? []), sector]);
     }
-    return { byName, byFrequency };
+    const units = new Set([...byName.values()].map(sector => unitOf(sector.callsign)).filter(unit => unit !== ""));
+    return { byName, byFrequency, units };
   })();
   sectorCache = { expires: Date.now() + 10 * 60_000, value };
   value.catch(() => { sectorCache = null; });
@@ -265,6 +275,18 @@ export function invalidateExternalHoldings(server: string): void {
   cache.delete(server);
 }
 
+// When each plugin last reported the controllers it can see (POST /network/controllers), whoever
+// was in the report - see `gone`. Kept here rather than read off the rows it wrote: a plugin that
+// can see nobody else writes none, and the one controller it had been seeing, now logged off, was
+// then never told from one still there (ML-BLA_CTR alone with ML-GUN_CTR, the case this is for).
+// Lost on a restart, which only means nobody counts as gone until the plugins' next reports.
+const lastNetworkReport = new Map<string, number>();
+
+export function noteNetworkReport(server: string, cid: number): void {
+  if (lastNetworkReport.size > 5000) lastNetworkReport.clear();
+  lastNetworkReport.set(`${server}|${cid}`, Date.now());
+}
+
 export function externalHoldings(db: pg.Pool | pg.PoolClient, server: string): Promise<ExternalHoldings> {
   const hit = cache.get(server);
   if (hit && hit.expires > Date.now()) return hit.value;
@@ -323,14 +345,18 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
   // and has left them out for longer than a report interval, and no other plugin has seen them
   // since. Their vatSys dropped them, which it does when they log off.
   // A session VATSIM says began after that is a new one, and counts again.
-  const goneRows = await db.query(
-    `SELECT upper(n.callsign) AS callsign, n.last_seen_at FROM network_controllers n
-      WHERE n.server=$1 AND EXISTS (
-        SELECT 1 FROM network_controllers m
-         WHERE m.server=n.server AND m.reported_by_cid=n.reported_by_cid
-           AND m.last_seen_at > n.last_seen_at + ($2*interval '1 second'))`,
-    [server, GONE_AFTER_SECONDS]);
-  const lastReported = new Map<string, number>(goneRows.rows.map(row => [String(row.callsign), new Date(row.last_seen_at).getTime()]));
+  // Only for GONE_FOR_SECONDS: by then VATSIM has stopped listing a controller who did log off, and
+  // one the plugin merely stopped seeing - it moved, or they went out of its range - counts again.
+  const lastSeenRows = await db.query(
+    `SELECT upper(callsign) AS callsign, last_seen_at, reported_by_cid FROM network_controllers
+      WHERE server=$1 AND last_seen_at >= now()-($2*interval '1 second')`,
+    [server, GONE_FOR_SECONDS]);
+  const lastReported = new Map<string, number>();
+  for (const row of lastSeenRows.rows) {
+    const seenAt = new Date(row.last_seen_at).getTime();
+    const reporterLast = lastNetworkReport.get(`${server}|${row.reported_by_cid}`);
+    if (reporterLast !== undefined && reporterLast - seenAt > GONE_AFTER_SECONDS * 1000) lastReported.set(String(row.callsign), seenAt);
+  }
 
   const lastPluginCall = new Map<string, number>();
   for (const row of lastPluginCalls.rows) {
@@ -342,14 +368,20 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
   const feed = new Map((data?.controllers ?? []).map(atc => [atc.callsign.toUpperCase(), atc]));
   // A plugin user who has left (or crashed), still listed by the feed or by another plugin's
   // vatSys. Told apart from the same callsign back without the plugin by VATSIM's logon time: a
-  // session that began after the plugin's last call is a new one. Where there is no logon time
-  // (SweatBox, where only vatSys's list is reported), for LEFT_PLUGIN_WITHOUT_LOGON_MINUTES - a
-  // controller who reconnects without the plugin sooner goes unnoticed for that long.
+  // session that began after the plugin's last call is a new one. Otherwise they stay out for
+  // LEFT_PLUGIN_WITHOUT_LOGON_MINUTES - so where there is no logon time (SweatBox, where only
+  // vatSys's list is reported), a controller who reconnects without the plugin sooner goes
+  // unnoticed for that long.
+  //
+  // In the same session, only for that long too. A controller who turns OzServer off (Tools >
+  // Disable OzServer releases everything and stays connected), or whose plugin can no longer reach
+  // this API, is from then on a controller without the plugin: left out for the whole session,
+  // their airspace was neither theirs nor held for them, and anyone's claim took it unasked.
   const leftPlugin = (callsign: string): boolean => {
     const last = lastPluginCall.get(callsign);
     if (last === undefined) return false;
     const logon = Date.parse(feed.get(callsign)?.logon_time ?? "");
-    if (!Number.isNaN(logon)) return logon <= last;
+    if (!Number.isNaN(logon) && logon > last) return false;
     return Date.now() - last < LEFT_PLUGIN_WITHOUT_LOGON_MINUTES * 60_000;
   };
   const gone = (callsign: string): boolean => {
@@ -370,9 +402,18 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
   const controllers = new Map<string, ExternalController>();
   // Each controller's information lines (atisSectors), as a plugin's vatSys shows them.
   const infoLines = new Map<string, string[]>();
+  // Whether a controller could be working any of this airspace at all: their callsign is one of the
+  // dataset's units'. Plugins on a busy night list controllers a continent away, and VATSIM's
+  // datafeed lists the world; all of them used to have their information lines read for sector
+  // names. DEN_APP "covering DEN/APA" held Denman, and anything "providing ... Port ..." a sector
+  // called Port, against whoever tried to claim them.
+  const worksHere = (callsign: string) => index.units.has(unitOf(callsign));
+
   for (const row of reported.rows) {
     const callsign = String(row.callsign).toUpperCase();
     if (plugin.has(callsign) || leftPlugin(callsign) || gone(callsign) || !isControllerCallsign(callsign)) continue;
+    // A plugin that places them on a position of its profile's is believed whatever the callsign.
+    if (!worksHere(callsign) && !stringArray(row.sectors).some(name => index.byName.has(name))) continue;
     infoLines.set(callsign, stringArray(row.atis));
     controllers.set(callsign, {
       callsign,
@@ -388,13 +429,15 @@ async function computeExternalHoldings(db: pg.Pool | pg.PoolClient, server: stri
     for (const [callsign, atc] of feed) {
       // Facility 0 is an observer.
       if (plugin.has(callsign) || leftPlugin(callsign) || gone(callsign) || !isControllerCallsign(callsign) || atc.facility === 0) continue;
+      if (!controllers.has(callsign) && !worksHere(callsign)) continue;
       const entry = controllers.get(callsign) ?? {
         callsign, cid: null, real_name: atc.name ?? null, frequencies: [], sectors: ownPosition(callsign, [])
       };
       entry.cid = atc.cid;
       entry.frequencies = frequencies([...entry.frequencies, atc.frequency, ...(afv.get(callsign) ?? [])]);
-      // The datafeed has their information lines too, for whoever no plugin can see.
-      if (!infoLines.has(callsign)) infoLines.set(callsign, stringArray(atc.text_atis));
+      // The datafeed has their information lines too, for whoever no plugin can see - or whose
+      // lines the plugin that reported them has not been sent, which it reports as none.
+      if (!infoLines.get(callsign)?.length) infoLines.set(callsign, stringArray(atc.text_atis));
       controllers.set(callsign, entry);
     }
   }

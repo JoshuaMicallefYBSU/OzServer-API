@@ -9,7 +9,7 @@ import type { ControllerIdentity } from "./types.js";
 // to ISA. Bounded like the plugin's own tree recursion, against a cyclical grouping in the dataset.
 const MAX_DEPTH = 8;
 
-type Owner = { controller_cid: number; controller_callsign: string };
+type Owner = { controller_cid: number; controller_callsign: string; last_seen_online_at: Date | string | null };
 
 // As in sectors.ts `covered`, only the ownership side of the join is scoped to `server`, and in the
 // join condition: a WHERE filter would drop a parent that is unowned on this server, which is the
@@ -19,8 +19,8 @@ async function findNearestGroupOwner(client: pg.PoolClient, name: string, server
   const seen = new Set(frontier);
 
   for (let depth = 0; depth < MAX_DEPTH && frontier.length > 0; depth++) {
-    const parents = (await client.query<{ name: string; controller_cid: number | null; controller_callsign: string | null }>(
-      `SELECT p.name, o.controller_cid, o.controller_callsign
+    const parents = (await client.query<{ name: string; controller_cid: number | null; controller_callsign: string | null; last_seen_online_at: Date | string | null }>(
+      `SELECT p.name, o.controller_cid, o.controller_callsign, o.last_seen_online_at
          FROM sectors p
          LEFT JOIN sector_ownerships o ON o.sector_id = p.id AND o.server = $2
         WHERE p.responsible_sectors ?| $1::text[]
@@ -31,7 +31,7 @@ async function findNearestGroupOwner(client: pg.PoolClient, name: string, server
     // and a large one should follow the small one.
     const owned = parents.find(parent => parent.controller_cid !== null);
     if (owned) {
-      return { controller_cid: owned.controller_cid!, controller_callsign: owned.controller_callsign! };
+      return { controller_cid: owned.controller_cid!, controller_callsign: owned.controller_callsign!, last_seen_online_at: owned.last_seen_online_at };
     }
 
     frontier = parents.map(parent => parent.name).filter(parentName => !seen.has(parentName));
@@ -65,10 +65,14 @@ export async function reassignFreedSectors(
     const owner = await findNearestGroupOwner(client, sector.name, server);
     if (!owner) continue;
 
+    // As last heard from as the row it follows, not as of now. The group's owner may have dropped
+    // too and be waiting out the same grace period: stamped now, this one row read as a present
+    // controller's, outlived the sweep that took the rest of theirs, and kept the sector with
+    // somebody long gone for another full grace period.
     await client.query(
       `INSERT INTO sector_ownerships (sector_id,controller_cid,controller_callsign,last_seen_online_at,server)
-       VALUES ($1,$2,$3,now(),$4) ON CONFLICT (sector_id, server) DO NOTHING`,
-      [sector.id, owner.controller_cid, owner.controller_callsign, server]);
+       VALUES ($1,$2,$3,COALESCE($5::timestamptz, now()),$4) ON CONFLICT (sector_id, server) DO NOTHING`,
+      [sector.id, owner.controller_cid, owner.controller_callsign, server, owner.last_seen_online_at]);
 
     reassigned.push(sector.name);
   }

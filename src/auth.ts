@@ -11,8 +11,11 @@ export const SERVERS = ["live", "sb1", "sb2"] as const;
 export type Server = typeof SERVERS[number];
 
 const identitySchema = z.object({
-  controller_cid: z.coerce.number().int().positive(),
-  controller_callsign: z.string().trim().min(1).max(32),
+  // Bounded by the integer columns it is stored in, and free of the one character Postgres text
+  // cannot hold: past either, every query naming this controller failed, answered as a fault of
+  // the server's rather than as the bad request it is.
+  controller_cid: z.coerce.number().int().positive().max(2_147_483_647),
+  controller_callsign: z.string().trim().min(1).max(32).refine(value => !value.includes("\u0000")),
   server: z.enum(SERVERS)
 });
 

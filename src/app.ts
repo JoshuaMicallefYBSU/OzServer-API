@@ -5,6 +5,8 @@ import { reportServerError } from "./alerts.js";
 import { pluginAuth } from "./auth.js";
 import { pool } from "./db.js";
 import { publish } from "./events.js";
+import { invalidateExternalHoldings } from "./external-control.js";
+import { notePluginRequest } from "./presence.js";
 import { arrivalRoutes } from "./routes/arrivals.js";
 import { protectedClientLogRoutes, publicClientLogRoutes } from "./routes/client-logs.js";
 import { protectedAtisRoutes, publicAtisRoutes } from "./routes/atis.js";
@@ -20,9 +22,24 @@ import { sectorRoutes } from "./routes/sectors.js";
 // When each plugin client's presence was last written - see the heartbeat hook below.
 const PLUGIN_CLIENT_REFRESH_MS = 2000;
 const pluginClientSeen = new Map<string, number>();
+// A client not heard from for this long has dropped off the list of plugin users
+// (PLUGIN_CLIENT_WINDOW_SECONDS in external-control.ts), so its next call puts it back on.
+const PLUGIN_CLIENT_RETURN_MS = 15_000;
 
 export async function buildApp() {
   const app = Fastify({ logger: true, trustProxy: true, bodyLimit: 2 * 1024 * 1024 });
+  // Before any route or plugin is registered: Fastify gives a route the error handler in force when
+  // the route is added. Set after them, as this was, it applied to none - a fault was answered with
+  // the database's own message, and never reached reportServerError.
+  app.setErrorHandler((error: FastifyError, request, reply) => {
+    app.log.error(error);
+    // A fault of ours rather than a bad request: worth someone seeing as it happens.
+    if (!error.statusCode || error.statusCode >= 500) {
+      reportServerError(`${request.method} ${request.routeOptions?.url ?? request.url.split("?")[0]}`, error);
+    }
+    reply.code(error.statusCode && error.statusCode < 500 ? error.statusCode : 500)
+      .send({ message: error.statusCode && error.statusCode < 500 ? error.message : "Internal server error." });
+  });
   await app.register(cors, { origin: config.WEBSITE_ORIGIN, methods: ["GET"] });
 
   // A fixed ten second window per address, held in memory. No caller is authenticated, so this is
@@ -79,6 +96,9 @@ export async function buildApp() {
     // presence check age a row against. A preHandler so a route's early return cannot skip it; it
     // matches no rows for a controller who owns nothing.
     pluginApi.addHook("preHandler", async request => {
+      // Before the heartbeat is judged by anything: a call arriving after a long silence from every
+      // plugin means this server was out of reach, not that they all left (presence.ts).
+      notePluginRequest();
       try {
         await pool.query(
           "UPDATE sector_ownerships SET last_seen_online_at=now() WHERE controller_cid=$1 AND controller_callsign=$2 AND server=$3",
@@ -91,7 +111,8 @@ export async function buildApp() {
       // several times a second, and the list it feeds is only read against a timeout.
       const key = `${request.controller.server}|${request.controller.callsign}|${request.controller.cid}`;
       const now = Date.now();
-      if ((pluginClientSeen.get(key) ?? 0) > now - PLUGIN_CLIENT_REFRESH_MS) return;
+      const lastSeen = pluginClientSeen.get(key) ?? 0;
+      if (lastSeen > now - PLUGIN_CLIENT_REFRESH_MS) return;
       if (pluginClientSeen.size > 10000) pluginClientSeen.clear();
       pluginClientSeen.set(key, now);
       try {
@@ -99,6 +120,12 @@ export async function buildApp() {
           `INSERT INTO plugin_clients (controller_cid,controller_callsign,server,last_seen_at) VALUES ($1,$2,$3,now())
            ON CONFLICT (server,controller_callsign,controller_cid) DO UPDATE SET last_seen_at=now()`,
           [request.controller.cid, request.controller.callsign, request.controller.server]);
+        // A plugin that has just started changes what counts as held without it: its controller
+        // stops being one of those controllers, and the sector they are logged on as stops being
+        // held against them (external-control.ts). The holdings are cached for a couple of seconds,
+        // and this controller's first claim, of that very sector, arrives sooner than that - it
+        // was refused as somebody else's. Done before the route runs, so it sees the new answer.
+        if (lastSeen < now - PLUGIN_CLIENT_RETURN_MS) invalidateExternalHoldings(request.controller.server);
       } catch (error) {
         pluginClientSeen.delete(key);
         app.log.warn(error, "Could not record plugin client presence.");
@@ -114,6 +141,9 @@ export async function buildApp() {
       if (route.startsWith("/api/v1/sectors") || route.startsWith("/api/v1/sector-requests")) {
         // One signal for both: /sectors/sync returns owned, controlled and requests together, so a
         // subscriber answers either with the same call.
+        // Ownership just changed, and with it what is left for a controller without the plugin to
+        // be holding: the syncs this signal prompts must not be answered from before it.
+        invalidateExternalHoldings(server);
         await publish({ type: "sectors", server });
       } else if (route.startsWith("/api/v1/fdr")) {
         await publish({ type: "fdr", server });
@@ -133,14 +163,5 @@ export async function buildApp() {
     await protectedClientLogRoutes(pluginApi);
     await protectedMessageRoutes(pluginApi);
   }, { prefix: "/api/v1" });
-  app.setErrorHandler((error: FastifyError, request, reply) => {
-    app.log.error(error);
-    // A fault of ours rather than a bad request: worth someone seeing as it happens.
-    if (!error.statusCode || error.statusCode >= 500) {
-      reportServerError(`${request.method} ${request.routeOptions?.url ?? request.url.split("?")[0]}`, error);
-    }
-    reply.code(error.statusCode && error.statusCode < 500 ? error.statusCode : 500)
-      .send({ message: error.statusCode && error.statusCode < 500 ? error.message : "Internal server error." });
-  });
   return app;
 }
