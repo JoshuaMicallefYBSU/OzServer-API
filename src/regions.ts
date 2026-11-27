@@ -3,7 +3,8 @@
 //
 //   australia - the vatSys Australia and Pacific datasets
 //   mexico    - the VATMEX MMFR sector (vatmex/vatmex-mmfr-sector)
-//   new-zealand - the vatSys New Zealand dataset (vatSys/new-zealand-dataset)
+//   new-zealand - the vatSys New Zealand and combined oceanic datasets (vatSys/new-zealand-dataset,
+//                 vatSys/combined-oceanic-dataset)
 //
 // Which dataset fills which region is decided in commands/sync-dataset.ts. Served at /regions so the
 // map builds its toggles from this list rather than keeping its own copy.

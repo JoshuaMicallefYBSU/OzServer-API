@@ -75,10 +75,10 @@ Design points worth knowing before changing anything:
   used only for the public map, never to decide ownership.
 - **Events carry no data.** A signal names an area (`sectors`, `fdr`, `atis`) and a server; clients
   re-read. A missed signal costs latency, not correctness, because clients also poll.
-- **Sectors are static reference data**, synchronised from the vatSys Australia, Pacific and [New Zealand](https://github.com/vatSys/new-zealand-dataset) datasets and the
+- **Sectors are static reference data**, synchronised from the vatSys Australia, Pacific, [New Zealand](https://github.com/vatSys/new-zealand-dataset) and [combined oceanic](https://github.com/vatSys/combined-oceanic-dataset) datasets and the
   [VATMEX MMFR sector](https://github.com/vatmex/vatmex-mmfr-sector) with `npm run dataset:sync`. Ownership, requests, flights and ATIS are scoped per server.
 - **Airspace is grouped into regions** ([`src/regions.ts`](src/regions.ts)): `australia` (the
-  Australia and Pacific datasets), `mexico` and `new-zealand`. Every sector and position records its region, and the
+  Australia and Pacific datasets), `mexico` and `new-zealand` (the New Zealand and combined oceanic datasets). Every sector and position records its region, and the
   map's region toggles are built from `GET /regions`.
 
 ## Getting started

@@ -4,14 +4,18 @@ import type { Region } from "../regions.js";
 
 // Each dataset and the region (map banner - see regions.ts) its sectors and positions belong to.
 // Australia and Pacific share one: they are one airspace, split across two vatSys profiles.
-type Profile = "AUS" | "PAC" | "MEX" | "NZ";
+type Profile = "AUS" | "PAC" | "MEX" | "NZ" | "OCN";
 const datasets: Array<{ profile: Profile; base: string; region: Region }> = [
   { profile: "AUS", base: "https://raw.githubusercontent.com/vatSys/australia-dataset/master/", region: "australia" },
   { profile: "PAC", base: "https://raw.githubusercontent.com/vatSys/pacific-dataset/master/", region: "australia" },
   // VATMEX's own MMFR sector (branch "central"), not vatSys/mexico-dataset, which is far less complete.
   { profile: "MEX", base: "https://raw.githubusercontent.com/vatmex/vatmex-mmfr-sector/central/", region: "mexico" },
   // VATNZ. Its Auckland Oceanic sectors are its own; the Pacific dataset lists NZZO only hidden.
-  { profile: "NZ", base: "https://raw.githubusercontent.com/vatSys/new-zealand-dataset/master/", region: "new-zealand" }
+  { profile: "NZ", base: "https://raw.githubusercontent.com/vatSys/new-zealand-dataset/master/", region: "new-zealand" },
+  // VATNZ's oceanic profile (branch "main"): the Auckland Oceanic, Tahiti and McMurdo FIRs, with
+  // Samoa, Tonga and the Cook Islands. In New Zealand's region, as it borders it: shared edges are
+  // matched only within a region. The Auckland Radio sectors, hidden in the NZ dataset, come from here.
+  { profile: "OCN", base: "https://raw.githubusercontent.com/vatSys/combined-oceanic-dataset/main/", region: "new-zealand" }
 ];
 const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_", trimValues: true });
 const list = <T>(value: T | T[] | undefined): T[] => value === undefined ? [] : Array.isArray(value) ? value : [value];
@@ -151,18 +155,20 @@ for (const [name, sector] of aus.shown) if (!pac.shown.has(name)) keep(aus, sect
 const australianNames = new Set(kept.map(k => String(k.sector["@_Name"])));
 const mexClashes = [...mex.shown.keys()].filter(name => australianNames.has(name));
 for (const [name, sector] of mex.shown) if (!australianNames.has(name)) keep(mex, sector);
-// New Zealand after the rest, the same way: a name already taken is skipped and reported.
-const nz = parsed.find(dataset => dataset.profile === "NZ")!;
-const takenBeforeNz = new Set(kept.map(k => String(k.sector["@_Name"])));
-const nzClashes = [...nz.shown.keys()].filter(name => takenBeforeNz.has(name));
-for (const [name, sector] of nz.shown) if (!takenBeforeNz.has(name)) keep(nz, sector);
+// New Zealand, then its oceanic dataset, after the rest, the same way: a name an earlier dataset
+// already took is skipped and reported.
+const later = parsed.filter(dataset => dataset.profile === "NZ" || dataset.profile === "OCN");
+for (const dataset of later) {
+  const taken = new Set(kept.map(k => String(k.sector["@_Name"])));
+  const clashes = [...dataset.shown.keys()].filter(name => taken.has(name));
+  for (const [name, sector] of dataset.shown) if (!taken.has(name)) keep(dataset, sector);
+  if (clashes.length) console.warn(`Skipped ${dataset.profile} sectors whose names an earlier dataset already uses: ${clashes.join(", ")}`);
+}
 
 const fromPacAlsoInAus = [...pac.shown.keys()].filter(name => aus.shown.has(name));
-console.log(`Sectors: ${kept.filter(k => k.dataset === aus).length} from AUS, ${kept.filter(k => k.dataset === pac).length} from PAC, `
-  + `${kept.filter(k => k.dataset === mex).length} from MEX, ${kept.filter(k => k.dataset === nz).length} from NZ`
+console.log(`Sectors: ${parsed.map(dataset => `${kept.filter(k => k.dataset === dataset).length} from ${dataset.profile}`).join(", ")}`
   + (fromPacAlsoInAus.length ? ` (shown in both, taken from PAC: ${fromPacAlsoInAus.join(", ")})` : ""));
 if (mexClashes.length) console.warn(`Skipped MEX sectors whose names AUS/PAC already use: ${mexClashes.join(", ")}`);
-if (nzClashes.length) console.warn(`Skipped NZ sectors whose names AUS/PAC/MEX already use: ${nzClashes.join(", ")}`);
 
 // Shared edges are matched across only the boundaries that will be drawn - not every boundary
 // either file contains, or a hidden duplicate's corners would be pulled into the real outlines -
@@ -246,5 +252,5 @@ await transaction(async client => {
   await client.query("DELETE FROM positions WHERE NOT (name=ANY($1))", [seenPositions]);
 });
 
-console.log("vatSys Australia, Pacific, Mexico and New Zealand sector datasets synchronized.");
+console.log("vatSys Australia, Pacific, Mexico, New Zealand and combined oceanic sector datasets synchronized.");
 await pool.end();
