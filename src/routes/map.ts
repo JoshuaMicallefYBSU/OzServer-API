@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { pool } from "../db.js";
 import { atisSectionContent, atisTimestamp } from "../network-atis.js";
 import { externalHoldings } from "../external-control.js";
+import { REGIONS } from "../regions.js";
 import { afvTransceivers, vatsimData, type Pilot } from "../vatsim.js";
 
 const visibleTypes = ["TWR", "APP", "DEP", "CTR", "FSS"];
@@ -21,13 +22,21 @@ const fsdFrequency = (value: number | null): string | null =>
 // past 180 degrees, and on -180..180 a ring crossing the antimeridian would wrap the wrong way.
 // With its bounding box: most pilots are nowhere near most sectors, and the box rules a ring out
 // without walking its points.
-type Ring = { points: Array<[number, number]>; minLon: number; maxLon: number; minLat: number; maxLat: number }; // [lon 0-360, lat]
+type Ring = { points: Array<[number, number]>; minLon: number; maxLon: number; minLat: number; maxLat: number; region: string }; // [lon 0-360, lat]
 let ringCache: { expires: number; rings: Ring[] } = { expires: 0, rings: [] };
 const eastLon = (lon: number) => (lon < 0 ? lon + 360 : lon);
 
+// The area /map/pilots serves for each region: a little more than the homepage's chart of it shows.
+// New Zealand's runs past 180 degrees (the Chatham Islands), so its longitudes are read on 0-360.
+const PILOT_BOXES: Record<string, { lat: [number, number]; lon: [number, number]; eastward?: boolean }> = {
+  "australia": { lat: [-50, 0], lon: [100, 170] },
+  "new-zealand": { lat: [-56, -24], lon: [150, 196], eastward: true },
+  "mexico": { lat: [2, 41], lon: [-128, -78] }
+};
+
 async function sectorPolygons(): Promise<Ring[]> {
   if (ringCache.expires > Date.now()) return ringCache.rings;
-  const rows = (await pool.query("SELECT boundary FROM sectors")).rows;
+  const rows = (await pool.query("SELECT boundary,region FROM sectors")).rows;
   const rings: Ring[] = [];
   for (const row of rows) {
     for (const ring of (Array.isArray(row.boundary) ? row.boundary : [])) {
@@ -43,7 +52,7 @@ async function sectorPolygons(): Promise<Ring[]> {
         if (lat < minLat) minLat = lat;
         if (lat > maxLat) maxLat = lat;
       }
-      rings.push({ points, minLon, maxLon, minLat, maxLat });
+      rings.push({ points, minLon, maxLon, minLat, maxLat, region: String(row.region) });
     }
   }
   ringCache = { expires: Date.now() + 10 * 60_000, rings };
@@ -69,14 +78,18 @@ function insideRing(ring: Ring, lat: number, lon: number): boolean {
 // boundary on every one of those calls held the event loop for a fifth of a second at a time -
 // time taken from every controller's heartbeat. Keyed on the feed's own pilot list and the ring
 // list, both of which are replaced, never changed in place, when they are refreshed.
-let trafficCache: { pilots: Pilot[]; rings: Ring[]; inside: string[] } | null = null;
+// Each pilot inside comes with the region of the first boundary found around them.
+type Inside = { callsign: string; region: string };
+let trafficCache: { pilots: Pilot[]; rings: Ring[]; inside: Inside[] } | null = null;
 
-function pilotsInAirspace(pilots: Pilot[], rings: Ring[]): string[] {
+function pilotsInAirspace(pilots: Pilot[], rings: Ring[]): Inside[] {
   if (trafficCache && trafficCache.pilots === pilots && trafficCache.rings === rings) return trafficCache.inside;
-  const inside = pilots
-    .filter(pilot => Number.isFinite(pilot.latitude) && Number.isFinite(pilot.longitude)
-      && rings.some(ring => insideRing(ring, pilot.latitude, pilot.longitude)))
-    .map(pilot => String(pilot.callsign).toUpperCase());
+  const inside: Inside[] = [];
+  for (const pilot of pilots) {
+    if (!Number.isFinite(pilot.latitude) || !Number.isFinite(pilot.longitude)) continue;
+    const ring = rings.find(candidate => insideRing(candidate, pilot.latitude, pilot.longitude));
+    if (ring) inside.push({ callsign: String(pilot.callsign).toUpperCase(), region: ring.region });
+  }
   trafficCache = { pilots, rings, inside };
   return inside;
 }
@@ -121,7 +134,38 @@ function mapAtis(row: AtisMapRow, type: string, frequency: string | null, time: 
   };
 }
 
+// Which region (regions.ts) each sector is in, by name and by callsign, and each callsign prefix
+// ("ML", "NZAA", "MMMX") - for the console's region filter, which places controllers and log lines
+// by these. Static between dataset syncs, so built at most every ten minutes.
+type SectorRegions = { sectors: Record<string, string>; callsigns: Record<string, string>; prefixes: Record<string, string> };
+let sectorRegionsCache: { expires: number; value: SectorRegions | null } = { expires: 0, value: null };
+
+async function sectorRegions(): Promise<SectorRegions> {
+  if (sectorRegionsCache.value && sectorRegionsCache.expires > Date.now()) return sectorRegionsCache.value;
+  const rows = (await pool.query<{ name: string; callsign: string | null; region: string }>(
+    "SELECT name,callsign,region FROM sectors ORDER BY name")).rows;
+  const value: SectorRegions = { sectors: {}, callsigns: {}, prefixes: {} };
+  const prefixRegions = new Map<string, Set<string>>();
+  for (const row of rows) {
+    value.sectors[row.name] = row.region;
+    if (!row.callsign) continue;
+    const callsign = row.callsign.toUpperCase();
+    value.callsigns[callsign] ??= row.region;
+    const prefix = callsign.split(/[-_]/)[0]!;
+    prefixRegions.set(prefix, (prefixRegions.get(prefix) ?? new Set()).add(row.region));
+  }
+  // A prefix used in two regions says nothing, so only those in one are given.
+  for (const [prefix, regions] of prefixRegions) if (regions.size === 1) value.prefixes[prefix] = [...regions][0]!;
+  sectorRegionsCache = { expires: Date.now() + 10 * 60_000, value };
+  return value;
+}
+
 export async function mapRoutes(app: FastifyInstance): Promise<void> {
+  app.get("/map/sector-regions", async (_request, reply) => {
+    reply.header("Cache-Control", "public, max-age=600");
+    return sectorRegions();
+  });
+
   app.get<{ Querystring: { server?: string } }>("/map/sectors", async (request, reply) => {
     const server = parseServer(request.query.server);
     if (!server) return reply.code(400).send({ message: "A valid ?server= query parameter is required." });
@@ -140,7 +184,7 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
         const holding = external.holdings.get(row.name)!;
         return {
           name: row.name, full_name: row.full_name, callsign: row.callsign, frequency: row.frequency,
-          boundary: row.boundary, owner: { cid: holding.cid, callsign: holding.callsign }, online: true, external: true
+          boundary: row.boundary, region: row.region, owner: { cid: holding.cid, callsign: holding.callsign }, online: true, external: true
         };
       });
 
@@ -151,13 +195,13 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
       const online = new Set((await vatsimData())?.controllers?.map(controller => controller.callsign.toUpperCase()) ?? []);
       return [...rows.map(row => ({
         name: row.name, full_name: row.full_name, callsign: row.callsign, frequency: row.frequency,
-        boundary: row.boundary, owner: { cid: row.controller_cid, callsign: row.controller_callsign },
+        boundary: row.boundary, region: row.region, owner: { cid: row.controller_cid, callsign: row.controller_callsign },
         online: online.has(row.callsign?.toUpperCase())
       })), ...externalRows];
     }
     return [...rows.map(row => ({
       name: row.name, full_name: row.full_name, callsign: row.callsign, frequency: row.frequency,
-      boundary: row.boundary, owner: { cid: row.controller_cid, callsign: row.controller_callsign },
+      boundary: row.boundary, region: row.region, owner: { cid: row.controller_cid, callsign: row.controller_callsign },
       online: row.last_seen_online_at !== null
         && Date.now() - new Date(row.last_seen_online_at).getTime() < config.PRESENCE_TIMEOUT_SECONDS * 1000
     })), ...externalRows];
@@ -404,20 +448,34 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     ]);
     const seen = new Set(records.rows.map(row => String(row.callsign).toUpperCase()));
     const inside = pilots ? pilotsInAirspace(pilots, polygons) : [];
+    // And the same two counts for each region (regions.ts), for the homepage's per-region views.
+    const regions: Record<string, { in_firs: number; seen_by_ozserver: number }> =
+      Object.fromEntries(REGIONS.map(region => [region.value, { in_firs: 0, seen_by_ozserver: 0 }]));
+    for (const pilot of inside) {
+      const entry = regions[pilot.region] ??= { in_firs: 0, seen_by_ozserver: 0 };
+      entry.in_firs++;
+      if (seen.has(pilot.callsign)) entry.seen_by_ozserver++;
+    }
     return {
       in_firs: inside.length,
-      seen_by_ozserver: inside.filter(callsign => seen.has(callsign)).length
+      seen_by_ozserver: inside.filter(pilot => seen.has(pilot.callsign)).length,
+      regions
     };
   });
 
-  // Airborne traffic around Australia from VATSIM's datafeed, for the homepage's decorative scope.
-  // Every pilot in the area, OzServer or not, trimmed to what a vatSys label shows: callsign and
-  // wake category, level, requested level, groundspeed, destination - plus the heading the page
-  // dead-reckons with between refreshes.
-  app.get("/map/pilots", async () => {
+  // Airborne traffic around one region from VATSIM's datafeed, for the homepage's decorative scope:
+  // ?region= (regions.ts), Australia when left out. Every pilot in the area, OzServer or not,
+  // trimmed to what a vatSys label shows: callsign and wake category, level, requested level,
+  // groundspeed, destination - plus the heading the page dead-reckons with between refreshes.
+  app.get<{ Querystring: { region?: string } }>("/map/pilots", async (request, reply) => {
+    const box = PILOT_BOXES[request.query.region ?? "australia"];
+    if (!box) return reply.code(400).send({ message: `region must be one of ${Object.keys(PILOT_BOXES).join(", ")}.` });
     const pilots = (await vatsimData())?.pilots ?? [];
     return pilots
-      .filter(pilot => pilot.latitude >= -50 && pilot.latitude <= 0 && pilot.longitude >= 100 && pilot.longitude <= 170)
+      .filter(pilot => {
+        const lon = box.eastward ? eastLon(pilot.longitude) : pilot.longitude;
+        return pilot.latitude >= box.lat[0] && pilot.latitude <= box.lat[1] && lon >= box.lon[0] && lon <= box.lon[1];
+      })
       .filter(pilot => pilot.groundspeed >= 50)
       .map(pilot => ({
         callsign: pilot.callsign,
