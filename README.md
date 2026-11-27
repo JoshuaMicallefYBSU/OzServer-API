@@ -132,6 +132,7 @@ an invalid value stops the process rather than being guessed at.
 | `ATIS_TOKEN` | unset | When set (16+ characters), required to publish with `PUT /vatsim/atis/:icao` |
 | `CONSOLE_TOKEN` | unset | Required (24+ characters, as a bearer token) by `/admin/messages`, which the website's /console sends developer messages through. Unset turns those routes off |
 | `MESSAGE_RETAIN_DAYS` | `14` | Days a console message, with its receipts and replies, is kept after it expires |
+| `PERF_LOG_RETAIN_DAYS` | `14` | Days the plugin's `Perf` client log lines (memory use every 15 minutes) are kept. Every other client log line is kept for one day |
 | `PLUGIN_RELEASE_REPO` | `JoshuaMicallefYBSU/OzServer-Plugin` | Repository whose releases are offered to the plugin's updater |
 | `PLUGIN_RELEASE_MAX_VERSION` | unset | When set, no plugin release newer than this is offered |
 | `DISCORD_WEBHOOK_URL` | unset | When set, errors are relayed to this Discord webhook - see [Error reporting](#error-reporting) |

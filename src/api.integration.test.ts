@@ -321,6 +321,26 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
     expect((await get("/sector-requests", extender)).json().from_me).toEqual([]);
   });
 
+  it("keeps the plugin's Perf log lines for two weeks and every other client log line for a day", async () => {
+    const line = (category: string, message: string, age: string) => db.query(
+      `INSERT INTO client_logs (controller_cid,controller_callsign,category,message,logged_at,created_at)
+       VALUES ($1,$2,$3,$4,now()-$5::interval,now()-$5::interval)`,
+      [extender.cid, extender.callsign, category, message, age]);
+    await line("Perf", "perf an hour ago", "1 hour");
+    await line("Perf", "perf two days ago", "2 days");
+    await line("Perf", "perf thirteen days ago", "13 days");
+    await line("Perf", "perf fifteen days ago", "15 days");
+    await line("Couple", "other an hour ago", "1 hour");
+    await line("Couple", "other two days ago", "2 days");
+    // Only an exact match is kept: a category that merely starts the same is an ordinary line.
+    await line("Performance", "lookalike two days ago", "2 days");
+
+    await runMaintenance();
+
+    const kept = (await db.query("SELECT message FROM client_logs ORDER BY created_at DESC")).rows.map(row => row.message);
+    expect(kept.sort()).toEqual(["other an hour ago", "perf an hour ago", "perf thirteen days ago", "perf two days ago"]);
+  });
+
   it("drops a request nobody is waiting on any more, at the sweep", async () => {
     await post("/sectors/INA/claim", extender);
     const gone: Identity = { cid: 1000015, callsign: "XX-LFT_CTR" };

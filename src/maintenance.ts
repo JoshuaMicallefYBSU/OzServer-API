@@ -109,7 +109,16 @@ export async function runMaintenance(): Promise<void> {
     // Kept for a day: long enough to look into something reported the next morning. Purged by
     // created_at, not logged_at, which is the client's clock (see client-logs.ts) - a client whose
     // clock runs ahead would otherwise write rows this never removes.
-    await client.query("DELETE FROM client_logs WHERE created_at < now()-interval '1 day'");
+    //
+    // Except the plugin's Perf lines, kept for PERF_LOG_RETAIN_DAYS: vatSys's memory and what it is
+    // made of, a handful of lines every 15 minutes from each connected controller. What they are
+    // for is comparing long sessions across controllers and plugin versions, and a day holds one
+    // evening of them.
+    await client.query(
+      `DELETE FROM client_logs
+        WHERE created_at < now()-interval '1 day'
+          AND (category <> 'Perf' OR created_at < now()-($1*interval '1 day'))`,
+      [config.PERF_LOG_RETAIN_DAYS]);
     await client.query("DELETE FROM resume_snapshots WHERE created_at < now()-($1*interval '1 minute')", [config.RESUME_WINDOW_MINUTES]);
     // Console messages, with their receipts and replies (ON DELETE CASCADE), once they have been
     // expired for MESSAGE_RETAIN_DAYS - long enough to read the answers afterwards.

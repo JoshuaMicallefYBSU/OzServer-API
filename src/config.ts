@@ -53,6 +53,9 @@ const schema = z.object({
   // Days a message is kept after it expires, with its receipts and replies, so the console can
   // still show who read and answered it.
   MESSAGE_RETAIN_DAYS: z.coerce.number().positive().default(14),
+  // Days the plugin's Perf log lines are kept; every other client log line is kept for one. Never
+  // less than that one day - see maintenance.ts.
+  PERF_LOG_RETAIN_DAYS: z.coerce.number().min(1).default(14),
   // The GitHub repository (owner/name) whose releases GET /plugin/release offers to the plugin's
   // updater. The plugin only downloads from its own repository, so pointing this elsewhere stops
   // updates being offered rather than redirecting them.
