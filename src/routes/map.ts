@@ -5,7 +5,7 @@ import { pool } from "../db.js";
 import { atisSectionContent, atisTimestamp } from "../network-atis.js";
 import { externalHoldings } from "../external-control.js";
 import { REGIONS } from "../regions.js";
-import { afvTransceivers, vatsimData, type Pilot } from "../vatsim.js";
+import { afvTransceivers, latestVatsimData, VATSIM_FEED_INTERVAL_MS, vatsimData, vatsimDataPulledAt, type Pilot } from "../vatsim.js";
 
 const visibleTypes = ["TWR", "APP", "DEP", "CTR", "FSS"];
 const typePriority: Record<string, number> = { FMP: 0, CTR: 1, FSS: 1, APP: 2, DEP: 2, TWR: 3, GND: 3, DEL: 3 };
@@ -216,6 +216,28 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
     // region (the map banner it is shown under - see regions.ts) is that of the sector it is in, or
     // failing that of a sector its controller holds, or of its departure or destination aerodrome.
     // Null when none of those is known; the map then shows it whatever regions are switched on.
+    //
+    // On live, a record no plugin has updated for VATSIM_FEED_INTERVAL_MS (15 s) - nobody who can
+    // see the aircraft is connected, or their client stopped sending - is placed where VATSIM's
+    // datafeed has it instead: lat, lon, altitude, ground_speed and heading are the feed's, and
+    // datafeed_position_at says when that feed was pulled. last_seen_at stays the plugin's last
+    // update, and nothing is written back: the record itself is still only what a plugin sent.
+    // A completed flight keeps its own data, as does one the feed does not list.
+    // The feed as last pulled, not waited on (a pull can take 20 s); one is started if it is due.
+    const feed = server === "live" ? latestVatsimData().data : null;
+    const pulledAt = feed ? vatsimDataPulledAt() : null;
+    const feedPilots = new Map((feed?.pilots ?? []).map(pilot => [pilot.callsign.toUpperCase(), pilot]));
+    const fromFeed = (row: { callsign: string; last_seen_at: Date | string }, data: Record<string, unknown>) => {
+      if (pulledAt === null || data.state === "STATE_FINISHED") return null;
+      const updated = new Date(row.last_seen_at).getTime();
+      if (!(Date.now() - updated >= VATSIM_FEED_INTERVAL_MS) || pulledAt <= updated) return null;
+      const pilot = feedPilots.get(String(row.callsign).toUpperCase());
+      if (!pilot || !Number.isFinite(pilot.latitude) || !Number.isFinite(pilot.longitude)) return null;
+      // on_ground is dropped rather than carried over from a stale report: the map then reads it
+      // from the feed's altitude and speed.
+      return { lat: pilot.latitude, lon: pilot.longitude, altitude: pilot.altitude, ground_speed: pilot.groundspeed,
+        heading: pilot.heading, on_ground: null, datafeed_position_at: new Date(pulledAt).toISOString() };
+    };
     return (await pool.query(
       `SELECT f.*, COALESCE(cs.region, ctl.region, dep.region, des.region) AS region
          FROM flight_data_records f
@@ -230,7 +252,7 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
         // Routes are served by /map/routes instead: dozens of points per flight would multiply the
         // size of a feed the map re-reads on every FDR signal. has_route lets the map know one exists.
         const { route_points: routePoints, ...data } = (row.data ?? {}) as Record<string, unknown>;
-        return { ...data, callsign: row.callsign, has_route: Array.isArray(routePoints) && routePoints.length > 1,
+        return { ...data, ...fromFeed(row, data), callsign: row.callsign, has_route: Array.isArray(routePoints) && routePoints.length > 1,
           controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
           current_sector: row.current_sector, last_seen_at: row.last_seen_at, region: row.region };
       });

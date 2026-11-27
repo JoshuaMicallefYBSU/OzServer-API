@@ -23,7 +23,10 @@ export type Pilot = {
 type VatsimData = { controllers?: Controller[]; pilots?: Pilot[]; atis?: Array<{ callsign: string }> };
 type TransceiverEntry = { callsign: string; transceivers?: Array<{ frequency: number }> };
 
+// How often the feed is pulled from VATSIM: at most once per window, on demand. Also the age at
+// which /map/aircraft starts placing an FDR from the feed instead (routes/map.ts).
 const CACHE_MS = 15_000;
+export const VATSIM_FEED_INTERVAL_MS = CACHE_MS;
 // How long the last feed that did arrive stands in for one that did not. A single failed fetch
 // used to empty the cache: for the next fifteen seconds no controller known only from the feed
 // held anything (external-control.ts), so their airspace could be claimed unasked, and the map
@@ -77,6 +80,11 @@ export function latestVatsimData(): { data: VatsimData | null; transceivers: Tra
   if (dataCache.expires <= Date.now()) void vatsimData();
   if (transceiverCache.expires <= Date.now()) void afvTransceivers();
   return { data: recentData(), transceivers: transceiverCache.value };
+}
+
+// When the feed vatsimData() answers with was pulled (epoch ms), or null when there is none.
+export function vatsimDataPulledAt(): number | null {
+  return recentData() !== null ? dataCache.fetchedAt : null;
 }
 
 export async function afvTransceivers(): Promise<TransceiverEntry[]> {

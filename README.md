@@ -195,7 +195,7 @@ answers `401`.
 | `GET /map/sector-shapes` | Every sector's static geometry |
 | `GET /map/ops?server=` | Ownership, controllers and pending requests in one read |
 | `GET /map/controllers?server=` | Controllers online and the position each is working |
-| `GET /map/aircraft?server=` · `GET /map/routes?server=` | Current flight records, and their routes |
+| `GET /map/aircraft?server=` · `GET /map/routes?server=` | Current flight records, and their routes. On live, a record no plugin has updated for 15 s is placed from the VATSIM datafeed (pulled every 15 s), marked with `datafeed_position_at` |
 | `GET /map/atis?server=` | Every ATIS that can be placed on the map, with whether its station is still connected |
 | `GET /map/traffic` · `GET /map/pilots` | Network traffic inside OzServer's airspace, from the VATSIM datafeed |
 | `GET /afv/transceivers` | VATSIM's AFV transceiver feed, cached |
