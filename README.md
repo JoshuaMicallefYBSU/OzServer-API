@@ -168,7 +168,7 @@ answers `401`.
 | `POST /sector-requests/accept-batch` · `/reject-batch` | Answer several requests at once |
 | `POST /sector-requests/:id/acknowledge-rejection` | Confirm a rejection was shown to the requester |
 | `POST /fdr` · `POST /fdr/batch` | Upsert flight records (up to 500 per batch); each result reports whether the push was accepted |
-| `GET /fdr/sync` | Every current flight record, without routes |
+| `GET /fdr/sync` | Every current flight record, without routes. `?view=state` also leaves out the flight plan: who holds each flight, its label and its position only |
 | `GET /fdr/:callsign` | One flight record in full |
 | `GET /arrivals/:ades` | An airport's Arrival List: every departed flight record inbound to it with its landing time, type and global ops, in sequence order; how many controllers have it open and who; whether its FMP is online, and whether the caller may reorder |
 | `POST /arrivals/:ades/sequence` | Move a flight in the sequence (`seq_index`, -1 to unsequence); anyone may unless the airport's FMP (`CB_FMP` for YSCB) is online, then only the FMP (403 otherwise) |

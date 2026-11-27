@@ -522,6 +522,51 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
       expect(row).toMatchObject({ callsign: "QFA1", has_route: true });
       expect(row.route_points).toBeUndefined();
     });
+
+    it("serves the poll its state view without the flight plan, and the full record without the parameter", async () => {
+      const plan = {
+        route: "DCT RIVET H65 RAZZI Q29 LIZZI", remarks: "PBN/A1B1C1D1L1O1S2 DOF/261126 REG/VHABC", flight_rules: "I",
+        aircraft_type: "B738", aircraft_wake: "M", aircraft_equip: "SDE3FGHIRWY", aircraft_surv_equip: "LB1",
+        aircraft_count: 1, dep_airport: "YSSY", des_airport: "YMML", dep_lat: -33.9, dep_lon: 151.2, des_lat: -37.7,
+        des_lon: 144.8, rfl: 36000, tas: 450, eet_minutes: 85, text_only: false, receive_only: false,
+        sid_star_string: "RIVET", runway_string: "34L", departure_runway: "34L",
+        altitude: 24000, heading: 230, vertical_rate: 1800,
+        route_points: [{ n: "YSSY", lat: -33.9461, lon: 151.1772 }], route_next_index: 1
+      };
+      // What the plugin's poll reads off the list (LabelStateMirror, FdrResumeActivation).
+      const state = {
+        state: "STATE_CONTROLLED", cfl_lower: 110, cfl_upper: 130, label_op_data: "MIN", global_op_data: "H240",
+        otd_left: 5, otd_right: 0, c_prompt: true, dropped: false, assigned_ssr_code: 1234,
+        etd: "2026-11-26T08:00:00.000Z", atd: "2026-11-26T08:04:00.000Z", authority_sector: "INA",
+        lat: -35.1, lon: 149.2, ground_speed: 440, on_ground: false, tracked_by: "XX-FAR_CTR", coupled: true
+      };
+      await post("/fdr/batch", extender, flight({
+        ...plan, ...state, controlling_cid: extender.cid, controlling_callsign: extender.callsign, current_sector: "INA"
+      }));
+
+      const sync = async (query: string) => (await app.inject({
+        method: "GET",
+        url: `/api/v1/fdr/sync?controller_cid=${extender.cid}&controller_callsign=${extender.callsign}&server=live${query}`,
+        remoteAddress
+      })).json() as Array<Record<string, unknown>>;
+
+      const [slim] = await sync("&view=state");
+      expect(slim).toMatchObject({
+        ...state, callsign: "QFA1", controlling_cid: extender.cid, controlling_callsign: extender.callsign, current_sector: "INA"
+      });
+      expect(slim?.last_seen_at).toBeTruthy();
+      for (const key of Object.keys(plan)) expect(slim, key).not.toHaveProperty(key);
+
+      // Unchanged for a plugin that does not ask: everything but the route's waypoints.
+      const { route_points: _waypoints, ...planWithoutWaypoints } = plan;
+      const [full] = await sync("");
+      expect(full).toMatchObject({ ...planWithoutWaypoints, ...state, callsign: "QFA1" });
+      expect(full).not.toHaveProperty("route_points");
+      // And an unknown view is the full one, not an error.
+      expect((await sync("&view=other"))[0]).toMatchObject(planWithoutWaypoints);
+
+      expect(JSON.stringify(slim).length).toBeLessThan(JSON.stringify(full).length * 0.6);
+    });
   });
 
   describe("arrival lists", () => {

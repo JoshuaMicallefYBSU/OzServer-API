@@ -17,6 +17,20 @@ const flightSchema = z.object({
   authority_sector: z.string().max(32).nullable().optional()
 }).passthrough();
 
+// What GET /fdr/sync?view=state leaves out of each record: the flight plan as filed, its route,
+// and the parts of the position only the map draws. A list of what to drop rather than what to
+// keep, so a field added to the push later is served until somebody decides it is bulk. Whatever
+// the plugin's poll reads must stay off it - LabelStateMirror and FdrResumeActivation in the
+// plugin: the controller, state, cleared level, scratchpad and global ops, deviations, SSR code,
+// ETD/ATD, authority sector, lat/lon, ground speed and on_ground.
+const STATE_VIEW_OMITS = [
+  "route_points", "route_next_index", "route", "sid_star_string", "runway_string", "departure_runway",
+  "remarks", "flight_rules", "aircraft_type", "aircraft_wake", "aircraft_equip", "aircraft_surv_equip",
+  "aircraft_count", "dep_airport", "des_airport", "dep_lat", "dep_lon", "des_lat", "des_lon",
+  "rfl", "tas", "eta", "eet_minutes", "text_only", "receive_only",
+  "altitude", "heading", "vertical_rate"
+];
+
 function hasOwn(value: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
@@ -203,11 +217,17 @@ export async function flightRoutes(app: FastifyInstance): Promise<void> {
   });
   // Every record, without its route. route_points is dozens of waypoints per flight and nothing
   // that reads this list uses it: the plugin polls it every few seconds for label state and for
-  // what to activate on reconnect, and the map reads routes from /map/routes. `data -
-  // 'route_points'` drops the key in Postgres. GET /fdr/:callsign still returns it.
-  app.get("/fdr/sync", async request => (await pool.query(
-    `SELECT callsign,controlling_cid,controlling_callsign,current_sector,last_seen_at,data - 'route_points' AS data
-       FROM flight_data_records WHERE server=$1 ORDER BY callsign`, [request.controller.server])).rows.map(row => ({ ...row.data, callsign: row.callsign,
+  // what to activate on reconnect, and the map reads routes from /map/routes. `data - $2` drops
+  // the keys in Postgres. GET /fdr/:callsign still returns everything.
+  //
+  // ?view=state leaves the flight plan out as well (STATE_VIEW_OMITS): what is left is who holds
+  // each flight, its label and where it is, which is all that poll reads. The rest is most of
+  // each record, fetched by every connected plugin every few seconds and read by none of them.
+  // Without the parameter the answer is as it always was, for plugins released before it.
+  app.get<{ Querystring: { view?: string } }>("/fdr/sync", async request => (await pool.query(
+    `SELECT callsign,controlling_cid,controlling_callsign,current_sector,last_seen_at,data - $2::text[] AS data
+       FROM flight_data_records WHERE server=$1 ORDER BY callsign`,
+    [request.controller.server, request.query.view === "state" ? STATE_VIEW_OMITS : ["route_points"]])).rows.map(row => ({ ...row.data, callsign: row.callsign,
          controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
          current_sector: row.current_sector, last_seen_at: row.last_seen_at })));
   // The controller who owns a flight cancelled its FDR in vatSys (Finish, or Cancel in the flight
