@@ -35,6 +35,34 @@ function hasOwn(value: object, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
+// The times on a route (route_points' ato, est and hold - see the plugin's OzServerRoutePointDto),
+// kept from the stored route when a push leaves them out. A client that never saw an estimate set,
+// or one whose controller has just picked the tag up and not yet read it back from here
+// (RouteTimesRestore), sends the route without it, and would otherwise erase it.
+//
+// - ato: always kept. A point passed stays passed.
+// - est and hold: kept unless the push states them (route_times_known: the tracking controller's
+//   own client, once it has the record's times), since only then is a missing one a cleared one.
+//
+// Points are paired in order by name, so a point the new route no longer has takes nothing with it.
+type RoutePoint = Record<string, unknown> & { n?: unknown };
+function mergeRouteTimes(pushed: unknown[], previous: unknown, stated: boolean): unknown[] {
+  if (!Array.isArray(previous) || previous.length === 0) return pushed;
+  const old = previous.filter((p): p is RoutePoint => !!p && typeof p === "object");
+  let from = 0;
+  return pushed.map(point => {
+    if (!point || typeof point !== "object") return point;
+    const next = point as RoutePoint;
+    const index = old.findIndex((p, i) => i >= from && typeof p.n === "string" && p.n === next.n);
+    if (index < 0) return point;
+    from = index + 1;
+    const kept: RoutePoint = { ...next };
+    const keys = stated ? ["ato"] : ["ato", "est", "hold"];
+    for (const key of keys) if (kept[key] == null && old[index][key] != null) kept[key] = old[index][key];
+    return kept;
+  });
+}
+
 async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: ControllerIdentity) {
   return transaction(async client => {
     const cidsWithSectors = new Set((await client.query("SELECT DISTINCT controller_cid FROM sector_ownerships WHERE server=$1", [identity.server])).rows.map(row => row.controller_cid));
@@ -162,6 +190,9 @@ async function upsert(flights: Array<z.infer<typeof flightSchema>>, identity: Co
       if (keepAwayAuthority) delete data.state;
 
       const previousData = existing?.data ?? {};
+      if (Array.isArray(data.route_points))
+        data.route_points = mergeRouteTimes(data.route_points, previousData.route_points, data.route_times_known === true);
+      delete data.route_times_known;
       const previousState = previousData.state ?? null;
       const nextState = data.state ?? previousState;
       await client.query(

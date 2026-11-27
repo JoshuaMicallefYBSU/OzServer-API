@@ -567,6 +567,25 @@ describe.skipIf(!databaseUrl)("API against Postgres", () => {
 
       expect(JSON.stringify(slim).length).toBeLessThan(JSON.stringify(full).length * 0.6);
     });
+
+    it("keeps a route's times when a push leaves them out, unless the tracking controller states them", async () => {
+      const ato = "2026-11-27T10:00:00Z", est = "2026-11-27T10:20:00Z";
+      const timed = [{ n: "YSSY", lat: -33.9461, lon: 151.1772, ato }, { n: "RIVET", lat: -34.1, lon: 150.6, est, hold: 600 }, { n: "YMML", lat: -37.6733, lon: 144.8433 }];
+      const bare = timed.map(({ n, lat, lon }) => ({ n, lat, lon }));
+      const routes = async () => (await app.inject({ method: "GET", url: "/api/v1/map/routes?server=live" })).json()[0].route_points;
+
+      await post("/fdr/batch", extender, flight({ route_points: timed, route_next_index: 1 }));
+      // A client that never saw them: all kept.
+      await post("/fdr/batch", extender, flight({ route_points: bare }));
+      expect(await routes()).toEqual(timed);
+      const [row] = (await app.inject({ method: "GET", url: "/api/v1/map/aircraft?server=live" })).json();
+      expect(row).toMatchObject({ next_waypoint: "RIVET", route_times: [{ n: "YSSY", ato, est: null, hold: null }, { n: "RIVET", ato: null, est, hold: 600 }] });
+
+      // Stated by the tracking controller: the estimate and hold are cleared, the time over is not.
+      await post("/fdr/batch", extender, flight({ route_points: bare, route_times_known: true }));
+      expect(await routes()).toEqual([{ ...bare[0], ato }, bare[1], bare[2]]);
+      expect((await record()).route_times_known).toBeUndefined();
+    });
   });
 
   describe("arrival lists", () => {

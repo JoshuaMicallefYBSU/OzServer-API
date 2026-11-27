@@ -252,7 +252,17 @@ export async function mapRoutes(app: FastifyInstance): Promise<void> {
         // Routes are served by /map/routes instead: dozens of points per flight would multiply the
         // size of a feed the map re-reads on every FDR signal. has_route lets the map know one exists.
         const { route_points: routePoints, ...data } = (row.data ?? {}) as Record<string, unknown>;
+        // What the flight panel shows of the route without fetching it: the points with a time
+        // vatSys keeps (passed, an estimate set, a hold - see routes/flights.ts mergeRouteTimes),
+        // and the next waypoint to be flown.
+        const points = Array.isArray(routePoints) ? routePoints as Array<Record<string, unknown>> : [];
+        const routeTimes = points
+          .filter(p => p && typeof p.n === "string" && (p.ato != null || p.est != null || p.hold != null))
+          .map(p => ({ n: p.n, ato: p.ato ?? null, est: p.est ?? null, hold: typeof p.hold === "number" ? p.hold : null }));
+        const nextIndex = typeof data.route_next_index === "number" ? data.route_next_index : -1;
+        const nextPoint = points.slice(Math.max(nextIndex, 0)).find(p => p && !p.z && typeof p.n === "string");
         return { ...data, ...fromFeed(row, data), callsign: row.callsign, has_route: Array.isArray(routePoints) && routePoints.length > 1,
+          route_times: routeTimes, next_waypoint: nextIndex >= 0 && nextPoint ? nextPoint.n : null,
           controlling_cid: row.controlling_cid, controlling_callsign: row.controlling_callsign,
           current_sector: row.current_sector, last_seen_at: row.last_seen_at, region: row.region };
       });
