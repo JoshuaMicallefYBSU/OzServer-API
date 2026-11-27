@@ -4,6 +4,7 @@ import { parseServer, SERVERS, tokenMatches, type Server } from "../auth.js";
 import { config } from "../config.js";
 import { pool } from "../db.js";
 import { publish } from "../events.js";
+import { latestVatsimData } from "../vatsim.js";
 
 // Developer messages: notices sent from the website's /console to controllers' plugins, which the
 // controller can answer when the sender allows it.
@@ -234,13 +235,20 @@ export async function adminMessageRoutes(app: FastifyInstance): Promise<void> {
       if (request.query.server && request.query.server !== "all" && server === null) {
         return reply.code(400).send({ message: "server must be live, sb1, sb2 or all." });
       }
+      const vatsimNames = new Map<number, string>();
+      for (const controller of latestVatsimData().data?.controllers ?? []) {
+        if (controller.name) vatsimNames.set(Number(controller.cid), controller.name);
+      }
       return (await pool.query<{ controller_callsign: string; controller_cid: number; server: string; last_seen_at: Date }>(
         `SELECT DISTINCT ON (server, upper(controller_callsign)) controller_callsign,controller_cid,server,last_seen_at
            FROM plugin_clients
           WHERE last_seen_at >= now()-($1*interval '1 minute') AND ($2::text IS NULL OR server = $2)
           ORDER BY server, upper(controller_callsign), last_seen_at DESC`,
         [CONNECTED_MINUTES, server])).rows.map(row => ({
-          callsign: row.controller_callsign, cid: row.controller_cid, server: row.server, last_seen_at: row.last_seen_at
+          callsign: row.controller_callsign, cid: row.controller_cid, server: row.server, last_seen_at: row.last_seen_at,
+          // The name their VATSIM connection shows, from the datafeed as last fetched (not waited
+          // on). Live only: a SweatBox connection is not on the datafeed. Null when not found.
+          real_name: row.server === "live" ? (vatsimNames.get(Number(row.controller_cid)) ?? null) : null
         }));
     });
 
